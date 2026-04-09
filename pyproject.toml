@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opal-studio"
+version = "0.1.0"
+description = "Cross-platform IMC and H&E OME-TIFF image viewer"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6",
+    "tifffile",
+    "zarr",
+    "imagecodecs",
+    "numpy",
+    "scikit-image",
+]
+
+[project.scripts]
+opal-studio = "opal_studio.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["opal_studio*"]

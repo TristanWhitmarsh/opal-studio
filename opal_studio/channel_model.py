@@ -1,0 +1,219 @@
+"""
+Channel data model — drives the left panel and the renderer.
+
+Uses Qt's model/view architecture so the channel list widget can
+bind directly to it and receive automatic updates.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List
+
+from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt, Signal
+from PySide6.QtGui import QColor
+import colorsys
+
+
+def generate_spaced_colors(target_count=100):
+    """
+    Generates a set of visually distinct colors by finding the largest gaps
+    in the hue space and subdividing them.
+    """
+    # Starting colors: Red, Green, Blue (RGB tuples)
+    colors_rgb = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    
+    # We assume Saturation and Value are at 100% (1.0) based on pure red, green, and blue
+    saturation = 1.0
+    value = 1.0
+    
+    while len(colors_rgb) < target_count:
+        hues = []
+        
+        # 1. Convert all current RGB colors to Hue (0-255 scale)
+        for r, g, b in colors_rgb:
+            # colorsys expects inputs in the 0.0 - 1.0 range
+            h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+            hues.append(h * 256.0) # Scale to 256 so it wraps perfectly from 255 to 0
+            
+        # 2. Sort the hues to find the gaps between adjacent colors
+        hues.sort()
+        
+        max_gap = -1
+        best_midpoint = 0
+        
+        # 3. Find the biggest gap, accounting for the circular nature of the hue wheel
+        for i in range(len(hues)):
+            h1 = hues[i]
+            # Next hue (wrap around to the first hue if we are at the end of the list)
+            h2 = hues[(i + 1) % len(hues)]
+            
+            # If we are looking at the gap between the last color and the first color
+            if i == len(hues) - 1:
+                gap = (h2 + 256.0) - h1
+            else:
+                gap = h2 - h1
+                
+            # 4. Save the midpoint of the largest gap
+            if gap > max_gap:
+                max_gap = gap
+                best_midpoint = (h1 + (gap / 2.0)) % 256.0
+                
+        # 5. Convert the new midpoint hue back to an RGB color
+        r_float, g_float, b_float = colorsys.hsv_to_rgb(best_midpoint / 256.0, saturation, value)
+        
+        # Convert back to 0-255 integers and append to our list
+        new_color = (
+            int(round(r_float * 255)), 
+            int(round(g_float * 255)), 
+            int(round(b_float * 255))
+        )
+        colors_rgb.append(new_color)
+        
+    return colors_rgb
+
+
+@dataclass
+class Channel:
+    """One image channel's display state."""
+    name: str
+    color: QColor
+    visible: bool = True
+    range_min: float = 0.0   # normalised 0-1 — maps to alpha 0
+    range_max: float = 1.0   # normalised 0-1 — maps to alpha 1
+    data_min: float = 0.0    # actual intensity minimum in this channel
+    data_max: float = 1.0    # actual intensity maximum in this channel
+    index: int = 0           # channel index in the image
+    is_mask: bool = False
+    is_cell_mask: bool = False
+    is_processed: bool = False
+    processed_data: np.ndarray | None = None
+    mask_data: np.ndarray | None = None
+
+
+class ChannelListModel(QAbstractListModel):
+    """
+    Qt list model wrapping a list of `Channel` objects.
+
+    Emits ``channels_changed`` whenever any display property is altered
+    so the renderer / canvas can update.
+    """
+
+    # Custom signal emitted on any channel-display change
+    channels_changed = Signal()
+
+    NameRole = Qt.UserRole + 1
+    ColorRole = Qt.UserRole + 2
+    VisibleRole = Qt.UserRole + 3
+    RangeMinRole = Qt.UserRole + 4
+    RangeMaxRole = Qt.UserRole + 5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._channels: List[Channel] = []
+        self._brightness: float = 1.0
+
+    # ---- public helpers ------------------------------------------------
+
+    def set_channels(self, channels: List[Channel]) -> None:
+        self.beginResetModel()
+        self._channels = list(channels)
+        self.endResetModel()
+        self.channels_changed.emit()
+
+    @property
+    def brightness(self) -> float:
+        return self._brightness
+
+    @brightness.setter
+    def brightness(self, value: float):
+        if self._brightness != value:
+            self._brightness = value
+            self.channels_changed.emit()
+
+    def set_all_visible(self, visible: bool, include_masks: bool = True):
+        self.beginResetModel()
+        for ch in self._channels:
+            if not include_masks and ch.is_mask:
+                continue
+            ch.visible = visible
+        self.endResetModel()
+        self.channels_changed.emit()
+
+    def channel(self, row: int) -> Channel:
+        return self._channels[row]
+
+    def visible_channels(self) -> List[Channel]:
+        return [c for c in self._channels if c.visible]
+
+    def add_channel(self, channel: Channel):
+        row = len(self._channels)
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._channels.append(channel)
+        self.endInsertRows()
+        self.channels_changed.emit()
+
+    def remove_channel(self, row: int):
+        """Remove a channel by row index and free its data from memory."""
+        if row < 0 or row >= len(self._channels):
+            return
+        self.beginRemoveRows(QModelIndex(), row, row)
+        ch = self._channels.pop(row)
+        # Free heavy data
+        ch.mask_data = None
+        ch.processed_data = None
+        self.endRemoveRows()
+        self.channels_changed.emit()
+
+    # ---- Qt model interface -------------------------------------------
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._channels)
+
+    def data(self, index: QModelIndex, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        ch = self._channels[index.row()]
+        if role == Qt.DisplayRole or role == self.NameRole:
+            return ch.name
+        if role == Qt.UserRole:
+            return ch
+        if role == self.ColorRole:
+            return ch.color
+        if role == self.VisibleRole:
+            return ch.visible
+        if role == self.RangeMinRole:
+            return ch.range_min
+        if role == self.RangeMaxRole:
+            return ch.range_max
+        return None
+
+    def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
+        if not index.isValid():
+            return False
+        ch = self._channels[index.row()]
+        if role == self.VisibleRole:
+            ch.visible = bool(value)
+        elif role == self.RangeMinRole:
+            ch.range_min = float(value)
+        elif role == self.RangeMaxRole:
+            ch.range_max = float(value)
+        elif role == self.ColorRole:
+            ch.color = value
+        else:
+            return False
+        self.dataChanged.emit(index, index, [role])
+        self.channels_changed.emit()
+        return True
+
+    def flags(self, index):
+        return super().flags(index) | Qt.ItemIsEditable
+
+    def roleNames(self):
+        return {
+            self.NameRole: b"name",
+            self.ColorRole: b"color",
+            self.VisibleRole: b"visible",
+            self.RangeMinRole: b"rangeMin",
+            self.RangeMaxRole: b"rangeMax",
+        }

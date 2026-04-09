@@ -1,0 +1,16 @@
+name: opal-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - "numpy<2"
+  - pip
+  - pip:
+    - PySide6
+    - tifffile
+    - zarr
+    - imagecodecs
+    - scikit-image
+    - stardist
+    - "cellpose<4.0"
