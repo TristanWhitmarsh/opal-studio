@@ -4,12 +4,13 @@ colour swatch, name, and dual-handle range slider.
 """
 
 from __future__ import annotations
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
-    QPushButton, QCheckBox, QSizePolicy, QColorDialog, QFrame, QSlider,
+    QPushButton, QSizePolicy, QColorDialog, QFrame, QSlider,
     QTabWidget
 )
 
@@ -43,6 +44,19 @@ class ChannelPanel(QWidget):
         spacer_pixmap = QPixmap(1, 20)
         spacer_pixmap.fill(Qt.GlobalColor.transparent)
         self._spacer_icon = QIcon(spacer_pixmap)
+        
+        # Cache toggle icons
+        self._eye_icon = QIcon(str(Path(__file__).resolve().parent.parent / "icons" / "eye.png"))
+        dash_pix = QPixmap(16, 16)
+        dash_pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(dash_pix)
+        pen = p.pen()
+        pen.setColor(QColor(150, 150, 150))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawLine(3, 8, 13, 8)
+        p.end()
+        self._dash_icon = QIcon(dash_pix)
         
         main_layout.addWidget(self._tabs)
 
@@ -218,11 +232,15 @@ class ChannelPanel(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
 
-        # Visibility toggle
-        vis_cb = QCheckBox()
-        vis_cb.setChecked(ch.visible)
-        vis_cb.toggled.connect(lambda checked, r=row: self._toggle_vis(r, checked))
-        top.addWidget(vis_cb)
+        # Eye toggle
+        eye_btn = QPushButton()
+        eye_btn.setFixedSize(24, 24)
+        eye_btn.setCheckable(True)
+        eye_btn.setChecked(ch.visible)
+        eye_btn.setIcon(self._eye_icon if ch.visible else self._dash_icon)
+        eye_btn.setIconSize(QSize(16, 16))
+        eye_btn.clicked.connect(lambda checked, r=row, b=eye_btn: self._toggle_vis(r, checked, b))
+        top.addWidget(eye_btn)
 
         # Colour swatch
         swatch = QPushButton()
@@ -274,9 +292,10 @@ class ChannelPanel(QWidget):
 
     # ---- callbacks ----------------------------------------------------
 
-    def _toggle_vis(self, row: int, checked: bool):
+    def _toggle_vis(self, row: int, checked: bool, btn: QPushButton):
         idx = self._model.index(row)
         self._model.setData(idx, checked, ChannelListModel.VisibleRole)
+        btn.setIcon(self._eye_icon if checked else self._dash_icon)
 
     def _range_changed(self, row: int, mn: float, mx: float):
         idx = self._model.index(row)
