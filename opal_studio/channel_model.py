@@ -79,6 +79,7 @@ class Channel:
     name: str
     color: QColor
     visible: bool = True
+    selected: bool = False
     range_min: float = 0.0   # normalised 0-1 — maps to alpha 0
     range_max: float = 1.0   # normalised 0-1 — maps to alpha 1
     data_min: float = 0.0    # actual intensity minimum in this channel
@@ -107,11 +108,13 @@ class ChannelListModel(QAbstractListModel):
     VisibleRole = Qt.UserRole + 3
     RangeMinRole = Qt.UserRole + 4
     RangeMaxRole = Qt.UserRole + 5
+    SelectedRole = Qt.UserRole + 6
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._channels: List[Channel] = []
         self._brightness: float = 1.0
+        self._cell_opacity: float = 1.0
 
     # ---- public helpers ------------------------------------------------
 
@@ -131,6 +134,19 @@ class ChannelListModel(QAbstractListModel):
             self._brightness = value
             self.channels_changed.emit()
 
+    @property
+    def cell_opacity(self) -> float:
+        return self._cell_opacity
+
+    @cell_opacity.setter
+    def cell_opacity(self, value: float):
+        if self._cell_opacity != value:
+            self._cell_opacity = value
+            for ch in self._channels:
+                if ch.is_cell_mask:
+                    ch.range_max = value
+            self.channels_changed.emit()
+
     def set_all_visible(self, visible: bool, include_masks: bool = True):
         self.beginResetModel()
         for ch in self._channels:
@@ -146,7 +162,20 @@ class ChannelListModel(QAbstractListModel):
     def visible_channels(self) -> List[Channel]:
         return [c for c in self._channels if c.visible]
 
+    def selected_channel(self) -> Channel | None:
+        for c in self._channels:
+            if c.selected:
+                return c
+        return None
+
     def add_channel(self, channel: Channel):
+        if channel.is_cell_mask:
+            channel.range_max = self._cell_opacity
+            if channel.visible:
+                for ch in self._channels:
+                    if ch.is_cell_mask:
+                        ch.visible = False
+                    
         row = len(self._channels)
         self.beginInsertRows(QModelIndex(), row, row)
         self._channels.append(channel)
@@ -186,6 +215,8 @@ class ChannelListModel(QAbstractListModel):
             return ch.range_min
         if role == self.RangeMaxRole:
             return ch.range_max
+        if role == self.SelectedRole:
+            return ch.selected
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
@@ -193,11 +224,20 @@ class ChannelListModel(QAbstractListModel):
             return False
         ch = self._channels[index.row()]
         if role == self.VisibleRole:
-            ch.visible = bool(value)
+            is_checked = bool(value)
+            if ch.is_cell_mask and is_checked:
+                for i, other in enumerate(self._channels):
+                    if i != index.row() and other.is_cell_mask and other.visible:
+                        other.visible = False
+                        o_idx = self.index(i, 0)
+                        self.dataChanged.emit(o_idx, o_idx, [self.VisibleRole])
+            ch.visible = is_checked
         elif role == self.RangeMinRole:
             ch.range_min = float(value)
         elif role == self.RangeMaxRole:
             ch.range_max = float(value)
+        elif role == self.SelectedRole:
+            ch.selected = bool(value)
         elif role == self.ColorRole:
             ch.color = value
         else:
@@ -216,4 +256,5 @@ class ChannelListModel(QAbstractListModel):
             self.VisibleRole: b"visible",
             self.RangeMinRole: b"rangeMin",
             self.RangeMaxRole: b"rangeMax",
+            self.SelectedRole: b"selected",
         }

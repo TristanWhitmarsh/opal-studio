@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         self.segmentationError.connect(self._on_segmentation_error)
         self.preprocessingResultReady.connect(self._on_preprocessing_complete)
         self.preprocessingError.connect(self._on_segmentation_error)
+        self._canvas.pixelHovered.connect(self._on_pixel_hovered)
 
         # Layout
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -286,7 +287,7 @@ class MainWindow(QMainWindow):
                     spot_sigma = params.get("spot_sigma", 2)
                     outline_sigma = params.get("outline_sigma", 2)
                     threshold = params.get("threshold", 1)
-                    expand = params.get("expand", 2)
+                    min_mean_intensity = params.get("min_mean_intensity", 0)
 
                     # Pre-process: Gaussian blur + Laplacian edge enhancement
                     nuclei_gauss = ndi.gaussian_filter(x, sigma=1.5)
@@ -320,8 +321,18 @@ class MainWindow(QMainWindow):
                         binary_otsu = blurred_outline > threshold * sk_thresh
                         labels = sk_label(binary_otsu)
 
-                    if expand > 0:
-                        labels = expand_labels(labels, distance=expand)
+                    if min_mean_intensity > x.min():
+                        cell_ids = np.unique(labels)
+                        cell_ids = cell_ids[cell_ids > 0]
+                        if len(cell_ids) > 0:
+                            means = ndi.mean(x, labels=labels, index=cell_ids)
+                            if not isinstance(means, (list, np.ndarray)):
+                                means = [means]
+                            mapping = np.zeros(int(labels.max()) + 1, dtype=labels.dtype)
+                            for cid, mean_val in zip(cell_ids, means):
+                                if mean_val >= min_mean_intensity:
+                                    mapping[cid] = cid
+                            labels = mapping[labels]
 
                 self.segmentationResultReady.emit(labels, "", False, None)
             except Exception as e:
@@ -397,24 +408,17 @@ class MainWindow(QMainWindow):
         if labels is None:
             self._ops_panel.stop_loading()
             return
-        if not self._image: return
-        mask_idx = params["mask_index"]
-        original_mask_ch = self._channel_model.channel(mask_idx)
-        labels = original_mask_ch.mask_data
-        if labels is None:
-            self._ops_panel.stop_loading()
-            return
 
         def _run():
             try:
                 import tensorflow as tf
                 from scipy.ndimage import label as cc_label
+                from opal_studio.image_loader import _get_yx
                 
                 print(f"[AI] Starting cell positivity detection for mask: {original_mask_ch.name}")
                 
                 model_path = os.path.join(os.getcwd(), "models", "cellpos", "marker_cnn_epoch_100.h5")
                 if not os.path.exists(model_path):
-                    print(f"[AI] ERROR: Model not found at {model_path}")
                     self.segmentationError.emit(f"Model not found: {model_path}")
                     return
                 
@@ -423,96 +427,108 @@ class MainWindow(QMainWindow):
                 
                 PATCH_SIZE = 64
                 THRESHOLD = 0.5
-                CHUNK_SIZE = 512
+                CHUNK_SIZE = 1024
                 
-                # Get all Standard channels (physical intensity channels)
                 target_channels = []
                 for i in range(self._channel_model.rowCount()):
                     ch = self._channel_model.channel(i)
                     if not ch.is_mask and not ch.is_cell_mask:
                         target_channels.append(ch)
                 
-                print(f"[AI] Found {len(target_channels)} channels to process.")
-                
-                # If mask is binary (0/1), label it to get unique cells
-                unique_labels = np.unique(labels)
-                if len(unique_labels) == 2 and 0 in unique_labels:
-                    print("[AI] Input mask is binary, labeling components...")
-                    labeled_mask, num_cells = cc_label(labels > 0)
-                else:
-                    print("[AI] Input mask is already labeled.")
-                    labeled_mask = labels
-                    num_cells = int(np.max(labeled_mask))
-                
-                print(f"[AI] Processing {num_cells} cells...")
-                if num_cells == 0:
-                    self.segmentationError.emit("No cells found in selected mask.")
-                    return
+                S = len(target_channels)
+                h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
+                markers = np.zeros((h, w, S), dtype=np.float32)
+                for z, ch in enumerate(target_channels):
+                    data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                    dh, dw = data.shape[:2]
+                    copy_h = min(h, dh)
+                    copy_w = min(w, dw)
+                    markers[:copy_h, :copy_w, z] = data[:copy_h, :copy_w]
 
-                for ch_idx, ch in enumerate(target_channels):
-                    print(f"[AI] Processing channel {ch_idx+1}/{len(target_channels)}: {ch.name}")
-                    # Load current channel data
-                    img_curr = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
-                    # For 2D Opal, simulate neighbor slices
-                    img_prev = img_curr
-                    img_next = img_curr
+                def get_neighbor_slices(img_data, curr_z):
+                    Z = img_data.shape[2]
+                    if curr_z == 0:
+                        z_prev = curr_z
+                        z_next = curr_z + 1 if Z > 1 else curr_z
+                    elif curr_z == Z - 1:
+                        z_prev = curr_z - 1
+                        z_next = curr_z
+                    else:
+                        z_prev = curr_z - 1
+                        z_next = curr_z + 1
+                    return img_data[:, :, z_prev], img_data[:, :, curr_z], img_data[:, :, z_next]
+
+                def center_crop_on_mask(img, mask, crop_size=64):
+                    H, W = img.shape[:2]
+                    ys, xs = np.where(mask > 0.5)
+                    if ys.size == 0:
+                        return None, None
+                    cy = int(np.mean(ys))
+                    cx = int(np.mean(xs))
+                    half = crop_size // 2
+                    y0 = max(0, cy - half)
+                    x0 = max(0, cx - half)
+                    y1 = min(H, y0 + crop_size)
+                    x1 = min(W, x0 + crop_size)
+                    if y1 - y0 < crop_size: y0 = max(0, y1 - crop_size)
+                    if x1 - x0 < crop_size: x0 = max(0, x1 - crop_size)
+                    return img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+
+                for z in range(S):
+                    ch = target_channels[z]
+                    print(f"\nProcessing slice/channel {z+1}/{S}")
+                    img_prev, img_curr, img_next = get_neighbor_slices(markers, z)
                     
-                    inference_mask = np.zeros_like(labeled_mask, dtype=np.int32)
+                    cell_region = labels > 0
+                    labeled_slice, num_components = cc_label(cell_region)
+                    
+                    if num_components == 0:
+                        continue
+                        
+                    slice_out = np.zeros_like(labels, dtype=np.int16)
                     patches = []
                     cell_ids = []
                     
-                    for cid in range(1, num_cells + 1):
-                        cell_mask_full = (labeled_mask == cid).astype(np.float32)
+                    def flush_chunk():
+                        if not patches: return
+                        X = np.stack(patches, axis=0).astype(np.float32)
+                        probs = model.predict(X, batch_size=512, verbose=0).reshape(-1)
+                        for cid, p in zip(cell_ids, probs):
+                            label_val = 2 if p >= THRESHOLD else 1
+                            slice_out[labeled_slice == cid] = label_val
+                        patches.clear()
+                        cell_ids.clear()
+                        
+                    for comp_id in range(1, num_components + 1):
+                        cell_mask_full = (labeled_slice == comp_id).astype(np.float32)
+                        img_curr_patch, cell_patch = center_crop_on_mask(img_curr, cell_mask_full, PATCH_SIZE)
+                        if img_curr_patch is None: continue
+                        
                         ys, xs = np.where(cell_mask_full > 0.5)
-                        if ys.size == 0: continue
-                        
-                        cy, cx = int(np.mean(ys)), int(np.mean(xs))
+                        cy = int(np.mean(ys))
+                        cx = int(np.mean(xs))
                         half = PATCH_SIZE // 2
-                        H, W = img_curr.shape
-                        
-                        y0 = max(0, cy - half); x0 = max(0, cx - half)
-                        y1 = min(H, y0 + PATCH_SIZE); x1 = min(W, x0 + PATCH_SIZE)
+                        Hc, Wc = img_curr.shape
+                        y0 = max(0, cy - half)
+                        x0 = max(0, cx - half)
+                        y1 = min(Hc, y0 + PATCH_SIZE)
+                        x1 = min(Wc, x0 + PATCH_SIZE)
                         if y1 - y0 < PATCH_SIZE: y0 = max(0, y1 - PATCH_SIZE)
                         if x1 - x0 < PATCH_SIZE: x0 = max(0, x1 - PATCH_SIZE)
-                        y1 = min(H, y0 + PATCH_SIZE); x1 = min(W, x0 + PATCH_SIZE)
                         
-                        p_curr = img_curr[y0:y1, x0:x1]
-                        p_prev = img_prev[y0:y1, x0:x1]
-                        p_next = img_next[y0:y1, x0:x1]
-                        p_mask = cell_mask_full[y0:y1, x0:x1]
+                        img_prev_patch = img_prev[y0:y1, x0:x1]
+                        img_next_patch = img_next[y0:y1, x0:x1]
                         
-                        # Pad if necessary
-                        if p_curr.shape != (64, 64):
-                            p_curr = np.pad(p_curr, ((0, 64-p_curr.shape[0]), (0, 64-p_curr.shape[1])))
-                            p_prev = np.pad(p_prev, ((0, 64-p_prev.shape[0]), (0, 64-p_prev.shape[1])))
-                            p_next = np.pad(p_next, ((0, 64-p_next.shape[0]), (0, 64-p_next.shape[1])))
-                            p_mask = np.pad(p_mask, ((0, 64-p_mask.shape[0]), (0, 64-p_mask.shape[1])))
-
-                        stacked = np.stack([p_prev, p_curr, p_next, p_mask], axis=-1)
+                        stacked = np.stack([img_prev_patch, img_curr_patch, img_next_patch, cell_patch], axis=-1)
                         patches.append(stacked)
-                        cell_ids.append(cid)
+                        cell_ids.append(comp_id)
                         
                         if len(patches) >= CHUNK_SIZE:
-                            X = np.stack(patches, axis=0)
-                            probs = model.predict(X, batch_size=512, verbose=0).reshape(-1)
-                            for cid_inner, p in zip(cell_ids, probs):
-                                # label_val = 2 if p >= THRESHOLD else 1
-                                label_val = 2 if p >= THRESHOLD else 1
-                                inference_mask[labeled_mask == cid_inner] = label_val
-                            patches = []; cell_ids = []
+                            flush_chunk()
                             
-                    if patches:
-                        X = np.stack(patches, axis=0)
-                        probs = model.predict(X, batch_size=len(patches), verbose=0).reshape(-1)
-                        for cid_inner, p in zip(cell_ids, probs):
-                            label_val = 2 if p >= THRESHOLD else 1
-                            inference_mask[labeled_mask == cid_inner] = label_val
+                    flush_chunk()
                     
-                    print(f"[AI] Raw inference mask for {ch.name}: min={np.min(inference_mask)}, max={np.max(inference_mask)}")
-                    
-                    pos_count = np.count_nonzero(inference_mask)
-                    print(f"[DEBUG-STAT] final binary mask for {ch.name}: min={np.min(inference_mask)}, max={np.max(inference_mask)}, positive_cells={pos_count}")
-                    self.segmentationResultReady.emit(inference_mask, f"{ch.name} Pos Cells", True, ch.color)
+                    self.segmentationResultReady.emit(slice_out, f"{ch.name}", True, ch.color)
 
                 print("[AI] Cell positivity detection complete.")
 
@@ -525,6 +541,42 @@ class MainWindow(QMainWindow):
     def _on_segmentation_error(self, message):
         self._ops_panel.stop_loading()
         QMessageBox.critical(self, "Segmentation Error", message)
+
+    @Slot(int, int)
+    def _on_pixel_hovered(self, x: int, y: int):
+        if not self._image: return
+        axes = self._image.axes
+        from opal_studio.image_loader import _get_yx, get_tile
+        h, w = _get_yx(self._image.base_shape, axes, self._image.is_rgb)
+        
+        ch = self._channel_model.selected_channel()
+        if not ch:
+            self._status.showMessage(f"X: {x}, Y: {y}")
+            return
+            
+        if 0 <= y < h and 0 <= x < w:
+            val = None
+            if ch.is_processed and ch.processed_data is not None:
+                val = ch.processed_data[y, x]
+            elif (ch.is_mask or ch.is_cell_mask) and ch.mask_data is not None:
+                val = ch.mask_data[y, x]
+            elif ch.index >= 0:
+                try:
+                    tile = get_tile(self._image, 0, ch.index, slice(y, y+1), slice(x, x+1))
+                    if tile.size > 0:
+                        if self._image.is_rgb:
+                            val = f"RGB{tuple(tile[0, 0])}"
+                        else:
+                            val = tile[0, 0]
+                except Exception:
+                    pass
+            
+            if val is not None:
+                self._status.showMessage(f"X: {x}, Y: {y} | [{ch.name}] Val: {val}")
+            else:
+                self._status.showMessage(f"X: {x}, Y: {y}")
+        else:
+            self._status.clearMessage()
 
     def closeEvent(self, event):
         super().closeEvent(event)

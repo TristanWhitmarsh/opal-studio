@@ -278,11 +278,12 @@ class WatershedTab(QWidget):
         )
         form.addRow("Threshold:", self._threshold)
 
-        # Expand
-        self._expand = QLineEdit("0")
-        self._expand.setValidator(QIntValidator(0, 100))
-        self._expand.setFixedWidth(80)
-        form.addRow("Expand (px):", self._expand)
+        # Min Mean Intensity
+        self._min_mean_intensity = QLineEdit("0")
+        self._min_mean_intensity.setValidator(QDoubleValidator(-1000000.0, 1000000.0, 4))
+        self._min_mean_intensity.setFixedWidth(80)
+        self._min_mean_intensity.setToolTip("Minimum mean intensity in a cell to keep it.")
+        form.addRow("Min Intensity:", self._min_mean_intensity)
 
         layout.addLayout(form)
 
@@ -320,7 +321,7 @@ class WatershedTab(QWidget):
             "spot_sigma": float(self._spot_sigma.text() or 2),
             "outline_sigma": float(self._outline_sigma.text() or 2),
             "threshold": float(self._threshold.text() or 1),
-            "expand": int(self._expand.text() or 2),
+            "min_mean_intensity": float(self._min_mean_intensity.text() or 0),
         })
 
 

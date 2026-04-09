@@ -6,13 +6,21 @@ colour swatch, name, and dual-handle range slider.
 from __future__ import annotations
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSizePolicy, QColorDialog, QFrame, QSlider,
     QTabWidget
 )
+
+class ClickableFrame(QFrame):
+    clicked = Signal()
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 from opal_studio.channel_model import Channel, ChannelListModel
 from opal_studio.widgets.range_slider import RangeSlider
@@ -47,11 +55,12 @@ class ChannelPanel(QWidget):
         
         # Cache toggle icons
         self._eye_icon = QIcon(str(Path(__file__).resolve().parent.parent / "icons" / "eye.png"))
+        self._delete_icon = QIcon(str(Path(__file__).resolve().parent.parent / "icons" / "delete.png"))
         dash_pix = QPixmap(16, 16)
         dash_pix.fill(Qt.GlobalColor.transparent)
         p = QPainter(dash_pix)
         pen = p.pen()
-        pen.setColor(QColor(150, 150, 150))
+        pen.setColor(QColor(0, 0, 0))
         pen.setWidth(2)
         p.setPen(pen)
         p.drawLine(3, 8, 13, 8)
@@ -100,6 +109,8 @@ class ChannelPanel(QWidget):
         self._channel_tab_layout = QVBoxLayout(self._channel_tab)
         self._channel_tab_layout.setContentsMargins(0, 0, 0, 0)
         
+        self._channel_tab_layout.addWidget(self._header_area)
+
         self._channel_scroll = QScrollArea()
         self._channel_scroll.setWidgetResizable(True)
         self._channel_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -115,9 +126,6 @@ class ChannelPanel(QWidget):
         
         self._channel_tab_layout.addWidget(self._channel_scroll)
         self._tabs.addTab(self._channel_tab, self._spacer_icon, "Channels")
-        
-        self._channel_layout.addWidget(self._header_area)
-        self._channel_layout.addStretch()
 
         # Tab 2: Masks (Standard QWidget containing the scroll area)
         self._mask_tab = QWidget()
@@ -146,6 +154,18 @@ class ChannelPanel(QWidget):
         self._cell_tab_layout = QVBoxLayout(self._cell_tab)
         self._cell_tab_layout.setContentsMargins(0, 0, 0, 0)
 
+        self._cell_header = QWidget()
+        self._cell_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        cell_header_layout = QHBoxLayout(self._cell_header)
+        cell_header_layout.setContentsMargins(8, 8, 8, 8)
+        cell_header_layout.addWidget(QLabel("Opacity"))
+        self._global_cell_opacity = QSlider(Qt.Orientation.Horizontal)
+        self._global_cell_opacity.setRange(0, 100)
+        self._global_cell_opacity.setValue(int(self._model.cell_opacity * 100))
+        self._global_cell_opacity.valueChanged.connect(lambda val: setattr(self._model, 'cell_opacity', val / 100.0))
+        cell_header_layout.addWidget(self._global_cell_opacity)
+        self._cell_tab_layout.addWidget(self._cell_header)
+
         self._cell_scroll = QScrollArea()
         self._cell_scroll.setWidgetResizable(True)
         self._cell_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -169,6 +189,7 @@ class ChannelPanel(QWidget):
         self._model.modelReset.connect(self._rebuild)
         self._model.rowsInserted.connect(lambda: self._rebuild())
         self._model.rowsRemoved.connect(lambda: self._rebuild())
+        self._model.dataChanged.connect(self._on_data_changed)
 
     # ------------------------------------------------------------------
 
@@ -183,11 +204,7 @@ class ChannelPanel(QWidget):
         # Clear layouts
         while self._channel_layout.count():
             item = self._channel_layout.takeAt(0)
-            if item.widget():
-                w = item.widget()
-                if w == self._header_area:
-                    continue # Keep it
-                w.deleteLater()
+            if item.widget(): item.widget().deleteLater()
 
         while self._mask_layout.count():
             item = self._mask_layout.takeAt(0)
@@ -196,9 +213,6 @@ class ChannelPanel(QWidget):
         while self._cell_layout.count():
             item = self._cell_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-
-        # Add header back to top of channel layout
-        self._channel_layout.addWidget(self._header_area)
 
         for row in range(self._model.rowCount()):
             ch = self._model.channel(row)
@@ -216,13 +230,20 @@ class ChannelPanel(QWidget):
         self._cell_layout.addStretch()
 
     def _make_row(self, row: int, ch: Channel) -> QWidget:
-        frame = QFrame()
+        frame = ClickableFrame()
         frame.setFrameShape(QFrame.Shape.StyledPanel)
         frame.setFrameShadow(QFrame.Shadow.Sunken)
         
         # Use the standard 'Window' background role for a native look
         frame.setBackgroundRole(QPalette.ColorRole.Window)
         frame.setAutoFillBackground(True)
+        if ch.selected:
+            pal = frame.palette()
+            color = frame.style().standardPalette().color(QPalette.ColorRole.Window).darker(115)
+            pal.setColor(QPalette.ColorRole.Window, color)
+            frame.setPalette(pal)
+        
+        frame.clicked.connect(lambda r=row: self._select_row(r))
 
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -243,23 +264,26 @@ class ChannelPanel(QWidget):
         top.addWidget(eye_btn)
 
         # Colour swatch
-        swatch = QPushButton()
-        swatch.setFixedSize(20, 20)
-        swatch.setStyleSheet(
-            f"background: {ch.color.name()}; border: 1px solid #555; border-radius: 3px;"
-        )
-        swatch.setCursor(Qt.CursorShape.PointingHandCursor)
-        swatch.clicked.connect(lambda _, r=row, s=swatch: self._pick_color(r, s))
-        top.addWidget(swatch)
+        if not ch.is_cell_mask:
+            swatch = QPushButton()
+            swatch.setFixedSize(20, 20)
+            swatch.setStyleSheet(
+                f"background: {ch.color.name()}; border: 1px solid #555; border-radius: 3px;"
+            )
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.clicked.connect(lambda _, r=row, s=swatch: self._pick_color(r, s))
+            top.addWidget(swatch)
 
         # Name
         name = QLabel(ch.name)
         name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         top.addWidget(name)
 
-        # Delete button for mask / cell rows
-        if ch.is_mask or ch.is_cell_mask:
-            del_btn = QPushButton("🗑")
+        # Delete button for mask
+        if ch.is_mask:
+            del_btn = QPushButton()
+            del_btn.setIcon(self._delete_icon)
+            del_btn.setIconSize(QSize(16, 16))
             del_btn.setFixedSize(24, 24)
             del_btn.setToolTip("Delete this mask")
             del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -269,7 +293,9 @@ class ChannelPanel(QWidget):
         layout.addLayout(top)
 
         # Control area (Window for intensity, Opacity for mask)
-        if ch.is_mask or ch.is_cell_mask:
+        if ch.is_cell_mask:
+            pass # Use the global cell opacity slider
+        elif ch.is_mask:
             trans_layout = QHBoxLayout()
             trans_label = QLabel("Opacity")
             trans_layout.addWidget(trans_label)
@@ -292,10 +318,37 @@ class ChannelPanel(QWidget):
 
     # ---- callbacks ----------------------------------------------------
 
+    def _select_row(self, row: int):
+        for i, frame in enumerate(self._row_widgets):
+            is_target = (i == row)
+            idx = self._model.index(i)
+            was_selected = self._model.data(idx, ChannelListModel.SelectedRole)
+            if was_selected != is_target:
+                self._model.setData(idx, is_target, ChannelListModel.SelectedRole)
+                pal = frame.palette()
+                color = frame.style().standardPalette().color(QPalette.ColorRole.Window)
+                if is_target:
+                    color = color.darker(115)
+                pal.setColor(QPalette.ColorRole.Window, color)
+                frame.setPalette(pal)
+
+    def _on_data_changed(self, top_left, bottom_right, roles):
+        if ChannelListModel.VisibleRole in roles:
+            row = top_left.row()
+            if 0 <= row < len(self._row_widgets):
+                ch = self._model.channel(row)
+                frame = self._row_widgets[row]
+                try:
+                    btn = frame.layout().itemAt(0).layout().itemAt(0).widget()
+                    if isinstance(btn, QPushButton) and btn.isCheckable():
+                        btn.setChecked(ch.visible)
+                        btn.setIcon(self._eye_icon if ch.visible else self._dash_icon)
+                except Exception:
+                    pass
+
     def _toggle_vis(self, row: int, checked: bool, btn: QPushButton):
         idx = self._model.index(row)
         self._model.setData(idx, checked, ChannelListModel.VisibleRole)
-        btn.setIcon(self._eye_icon if checked else self._dash_icon)
 
     def _range_changed(self, row: int, mn: float, mx: float):
         idx = self._model.index(row)

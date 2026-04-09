@@ -149,14 +149,18 @@ def _render_multichannel(
                 
                 random.setstate(state)
         elif ch.is_cell_mask:
-            # Single color overlay for binary cell masks
-            mask_active = raw > 0
-            if np.any(mask_active):
-                print(f"[Renderer] Cell Mask {ch.name}: active_pixels={np.count_nonzero(mask_active)}, min={np.min(raw)}, max={np.max(raw)}")
-                alpha_mask = ch.range_max
-                color_vec = np.array([ch.color.redF(), ch.color.greenF(), ch.color.blueF()], dtype=np.float32)
-                # Blend onto existing canvas
-                canvas[mask_active] = (1.0 - alpha_mask) * canvas[mask_active] + alpha_mask * color_vec
+            # Cell positivity rendering: 1 = green, 2 = red
+            alpha_mask = ch.range_max
+            mask_1 = raw == 1
+            mask_2 = raw == 2
+            
+            if np.any(mask_1):
+                color_green = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                canvas[mask_1] = (1.0 - alpha_mask) * canvas[mask_1] + alpha_mask * color_green
+                
+            if np.any(mask_2):
+                color_red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                canvas[mask_2] = (1.0 - alpha_mask) * canvas[mask_2] + alpha_mask * color_red
         else:
             # Normal intensity channel rendering
             dmin, dmax = ch.data_min, ch.data_max

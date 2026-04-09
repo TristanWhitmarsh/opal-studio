@@ -88,6 +88,7 @@ class ImageCanvas(QWidget):
     """
 
     ZOOM_FACTOR = 1.15  # per wheel step
+    pixelHovered = Signal(int, int)
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
@@ -363,9 +364,15 @@ class ImageCanvas(QWidget):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        spp = self._screen_pixels_per_image_pixel()
+        if spp > 0:
+            mx, my = event.position().x(), event.position().y()
+            img_x = self._viewport.left() + mx / spp
+            img_y = self._viewport.top() + my / spp
+            self.pixelHovered.emit(int(img_x), int(img_y))
+
         if self._panning:
             delta = event.position() - self._pan_start
-            spp = self._screen_pixels_per_image_pixel()
             dx = -delta.x() / spp
             dy = -delta.y() / spp
             self._viewport = QRectF(
