@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
-    QPushButton, QSizePolicy, QColorDialog, QFrame, QSlider,
+    QPushButton, QCheckBox, QSizePolicy, QColorDialog, QFrame, QSlider,
     QTabWidget
 )
 
@@ -218,14 +218,11 @@ class ChannelPanel(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
 
-        # Eye toggle
-        eye_btn = QPushButton()
-        eye_btn.setFixedSize(24, 24)
-        eye_btn.setCheckable(True)
-        eye_btn.setChecked(ch.visible)
-        eye_btn.setText("👁" if ch.visible else "—")
-        eye_btn.clicked.connect(lambda checked, r=row, b=eye_btn: self._toggle_vis(r, checked, b))
-        top.addWidget(eye_btn)
+        # Visibility toggle
+        vis_cb = QCheckBox()
+        vis_cb.setChecked(ch.visible)
+        vis_cb.toggled.connect(lambda checked, r=row: self._toggle_vis(r, checked))
+        top.addWidget(vis_cb)
 
         # Colour swatch
         swatch = QPushButton()
@@ -277,10 +274,9 @@ class ChannelPanel(QWidget):
 
     # ---- callbacks ----------------------------------------------------
 
-    def _toggle_vis(self, row: int, checked: bool, btn: QPushButton):
+    def _toggle_vis(self, row: int, checked: bool):
         idx = self._model.index(row)
         self._model.setData(idx, checked, ChannelListModel.VisibleRole)
-        btn.setText("👁" if checked else "—")
 
     def _range_changed(self, row: int, mn: float, mx: float):
         idx = self._model.index(row)
