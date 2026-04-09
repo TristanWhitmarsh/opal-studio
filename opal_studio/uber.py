@@ -2,7 +2,6 @@ import numpy as np
 from skimage.measure import label, regionprops_table
 from copy import deepcopy
 
-from .labellerdata import LabellerData
 
 
 class UBM:
@@ -380,4 +379,4 @@ class UBM:
             flatsm, cell_ID_ran, toodelete
         )
 
-        return LabellerData(joint_mask).array, LabellerData(method_mask).array
+        return joint_mask, method_mask

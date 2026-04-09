@@ -359,9 +359,45 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _run_mask_expansion(self, params):
-        mask_idx = params["mask_index"]
         tool = params.get("tool", "expansion_watershed")
         
+        if tool == "cell_sampler":
+            mask_indices = params.get("mask_indices", [])
+            labels_list = []
+            for idx in mask_indices:
+                ch = self._channel_model.channel(idx)
+                if ch.mask_data is not None:
+                    labels_list.append(ch.mask_data)
+                    
+            if len(labels_list) < 2:
+                self._ops_panel.stop_loading()
+                return
+
+            def _run_sampler():
+                try:
+                    from opal_studio.uber import UBM
+                    import numpy as np
+                    
+                    carray = np.stack(labels_list)
+                    merit = params.get("merit", "pop")
+                    
+                    joint_mask, method_mask = UBM(carray).form_um(merit=merit, nsize=80)
+                    mask_result = joint_mask.astype(np.int32)
+                    new_name = f"Sampled Mask ({merit})"
+                    
+                    self.segmentationResultReady.emit(mask_result, new_name, False, None)
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    self.segmentationError.emit(str(e))
+
+            threading.Thread(target=_run_sampler, daemon=True).start()
+            return
+
+        mask_idx = params.get("mask_index")
+        if mask_idx is None:
+            self._ops_panel.stop_loading()
+            return
+            
         # In current model, mask_data is stored in .mask_data
         original_mask_ch = self._channel_model.channel(mask_idx)
         labels = original_mask_ch.mask_data
