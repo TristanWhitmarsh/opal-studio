@@ -67,18 +67,28 @@ class ChannelPanel(QWidget):
         p.end()
         self._dash_icon = QIcon(dash_pix)
         
-        main_layout.addWidget(self._tabs)
-
-        # Header & Bulk Controls (Persistent within the Channels tab)
+        main_layout.addWidget(self._tabs)        # Header & Bulk Controls (Persistent within the Channels tab)
         self._header_area = QWidget()
         self._header_area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         header_layout = QVBoxLayout(self._header_area)
         header_layout.setContentsMargins(8, 8, 8, 8)
-        header_layout.setSpacing(8)
+        header_layout.setSpacing(6)
 
+        # 1. Global Brightness (At very top)
+        bright_layout = QHBoxLayout()
+        bright_label = QLabel("Overall brightness")
+        bright_layout.addWidget(bright_label)
+
+        self._bright_slider = QSlider(Qt.Orientation.Horizontal)
+        self._bright_slider.setRange(1, 200) # 0.01 to 2.0
+        self._bright_slider.setValue(100) # 1.0 initial
+        self._bright_slider.valueChanged.connect(self._on_brightness_changed)
+        bright_layout.addWidget(self._bright_slider)
+        header_layout.addLayout(bright_layout)
+
+        # 2. Bulk Controls line
         header_top = QHBoxLayout()
-        header_label = QLabel("Channels")
-        header_top.addWidget(header_label)
+        header_top.addWidget(QLabel("Channels"))
         header_top.addStretch()
 
         btn_all_on = QPushButton("Show all")
@@ -88,19 +98,35 @@ class ChannelPanel(QWidget):
         header_top.addWidget(btn_all_on)
         header_top.addWidget(btn_all_off)
         header_layout.addLayout(header_top)
-
-        # Global Brightness Slider
-        bright_layout = QHBoxLayout()
-        bright_label = QLabel("Brightness")
-        bright_layout.addWidget(bright_label)
-
-        self._bright_slider = QSlider(Qt.Orientation.Horizontal)
-        self._bright_slider.setRange(1, 200) # 0.01 to 2.0
-        self._bright_slider.setValue(100) # 1.0 initial
-        self._bright_slider.valueChanged.connect(self._on_brightness_changed)
-        bright_layout.addWidget(self._bright_slider)
-        header_layout.addLayout(bright_layout)
         
+        # 3. Selected Channel Controls (Alpha & Limits) - Integrated into header
+        self._sel_group = QWidget()
+        self._sel_group.setEnabled(False) # Always visible but disabled if no selection
+        sel_layout = QVBoxLayout(self._sel_group)
+        sel_layout.setContentsMargins(0, 0, 0, 0)
+        sel_layout.setSpacing(6)
+        
+        alpha_layout = QHBoxLayout()
+        alpha_label = QLabel("Alpha")
+        alpha_label.setFixedWidth(40)
+        alpha_layout.addWidget(alpha_label)
+        self._alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self._alpha_slider.setRange(0, 100)
+        self._alpha_slider.valueChanged.connect(self._on_header_alpha_changed)
+        alpha_layout.addWidget(self._alpha_slider)
+        sel_layout.addLayout(alpha_layout)
+        
+        limits_layout = QHBoxLayout()
+        limits_label = QLabel("Limits")
+        limits_label.setFixedWidth(40)
+        limits_layout.addWidget(limits_label)
+        self._limits_slider = RangeSlider()
+        self._limits_slider.rangeChanged.connect(self._on_header_limits_changed)
+        limits_layout.addWidget(self._limits_slider)
+        sel_layout.addLayout(limits_layout)
+        
+        header_layout.addWidget(self._sel_group)
+
         # Manually trigger initial brightness from slider
         self._on_brightness_changed(self._bright_slider.value())
 
@@ -132,6 +158,23 @@ class ChannelPanel(QWidget):
         self._mask_tab_layout = QVBoxLayout(self._mask_tab)
         self._mask_tab_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Mask Header Area
+        self._mask_header = QWidget()
+        m_head_layout = QVBoxLayout(self._mask_header)
+        m_head_layout.setContentsMargins(8, 8, 8, 8)
+        m_head_layout.setSpacing(6)
+        
+        m_op_layout = QHBoxLayout()
+        m_op_layout.addWidget(QLabel("Opacity"))
+        self._mask_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._mask_opacity_slider.setRange(0, 100)
+        self._mask_opacity_slider.setEnabled(False)
+        self._mask_opacity_slider.valueChanged.connect(self._on_header_mask_opacity_changed)
+        m_op_layout.addWidget(self._mask_opacity_slider)
+        m_head_layout.addLayout(m_op_layout)
+        
+        self._mask_tab_layout.addWidget(self._mask_header)
+
         self._mask_scroll = QScrollArea()
         self._mask_scroll.setWidgetResizable(True)
         self._mask_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -159,11 +202,11 @@ class ChannelPanel(QWidget):
         cell_header_layout = QHBoxLayout(self._cell_header)
         cell_header_layout.setContentsMargins(8, 8, 8, 8)
         cell_header_layout.addWidget(QLabel("Opacity"))
-        self._global_cell_opacity = QSlider(Qt.Orientation.Horizontal)
-        self._global_cell_opacity.setRange(0, 100)
-        self._global_cell_opacity.setValue(int(self._model.cell_opacity * 100))
-        self._global_cell_opacity.valueChanged.connect(lambda val: setattr(self._model, 'cell_opacity', val / 100.0))
-        cell_header_layout.addWidget(self._global_cell_opacity)
+        self._cell_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._cell_opacity_slider.setRange(0, 100)
+        self._cell_opacity_slider.setEnabled(False)
+        self._cell_opacity_slider.valueChanged.connect(self._on_header_cell_opacity_changed)
+        cell_header_layout.addWidget(self._cell_opacity_slider)
         self._cell_tab_layout.addWidget(self._cell_header)
 
         self._cell_scroll = QScrollArea()
@@ -267,9 +310,10 @@ class ChannelPanel(QWidget):
         if not ch.is_cell_mask:
             swatch = QPushButton()
             swatch.setFixedSize(20, 20)
-            swatch.setStyleSheet(
-                f"background: {ch.color.name()}; border: 1px solid #555; border-radius: 3px;"
-            )
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(ch.color)
+            swatch.setIcon(QIcon(pixmap))
+            swatch.setIconSize(QSize(16, 16))
             swatch.setCursor(Qt.CursorShape.PointingHandCursor)
             swatch.clicked.connect(lambda _, r=row, s=swatch: self._pick_color(r, s))
             top.addWidget(swatch)
@@ -279,13 +323,13 @@ class ChannelPanel(QWidget):
         name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         top.addWidget(name)
 
-        # Delete button for mask
-        if ch.is_mask:
+        # Delete button for mask or processed channel
+        if ch.is_mask or ch.is_processed:
             del_btn = QPushButton()
             del_btn.setIcon(self._delete_icon)
             del_btn.setIconSize(QSize(16, 16))
             del_btn.setFixedSize(24, 24)
-            del_btn.setToolTip("Delete this mask")
+            del_btn.setToolTip("Delete this channel")
             del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             del_btn.clicked.connect(lambda _, r=row: self._model.remove_channel(r))
             top.addWidget(del_btn)
@@ -296,23 +340,11 @@ class ChannelPanel(QWidget):
         if ch.is_cell_mask:
             pass # Use the global cell opacity slider
         elif ch.is_mask:
-            trans_layout = QHBoxLayout()
-            trans_label = QLabel("Opacity")
-            trans_layout.addWidget(trans_label)
-
-            opacity_slider = QSlider(Qt.Orientation.Horizontal)
-            opacity_slider.setRange(0, 100)
-            opacity_slider.setValue(int(ch.range_max * 100))
-            opacity_slider.valueChanged.connect(lambda val, r=row: self._model.setData(self._model.index(r), val/100.0, ChannelListModel.RangeMaxRole))
-            trans_layout.addWidget(opacity_slider)
-            layout.addLayout(trans_layout)
+            # Opacity slider moved to header
+            pass
         else:
-            # Range slider for intensity window
-            slider = RangeSlider(color=ch.color)
-            slider.set_range(ch.range_min, ch.range_max)# Add this line to force a smaller minimum width!
-            slider.setMinimumWidth(50)
-            slider.rangeChanged.connect(lambda mn, mx, r=row: self._range_changed(r, mn, mx))
-            layout.addWidget(slider)
+            # Sliders moved to header
+            pass
 
         return frame
 
@@ -331,6 +363,38 @@ class ChannelPanel(QWidget):
                     color = color.darker(115)
                 pal.setColor(QPalette.ColorRole.Window, color)
                 frame.setPalette(pal)
+
+        # Update header controls for the newly selected row
+        ch = self._model.channel(row)
+        
+        # Reset all header context-aware controls
+        self._sel_group.setEnabled(False)
+        self._mask_opacity_slider.setEnabled(False)
+        self._cell_opacity_slider.setEnabled(False)
+        
+        if not ch.is_mask and not ch.is_cell_mask:
+            # Traditional Channel tab controls
+            self._sel_group.setEnabled(True)
+            self._alpha_slider.blockSignals(True)
+            self._alpha_slider.setValue(int(ch.alpha * 100))
+            self._alpha_slider.blockSignals(False)
+            self._limits_slider.blockSignals(True)
+            self._limits_slider.set_range(ch.range_min, ch.range_max)
+            self._limits_slider.blockSignals(False)
+            
+        elif ch.is_mask:
+            # Mask tab controls
+            self._mask_opacity_slider.setEnabled(True)
+            self._mask_opacity_slider.blockSignals(True)
+            self._mask_opacity_slider.setValue(int(ch.range_max * 100))
+            self._mask_opacity_slider.blockSignals(False)
+
+        elif ch.is_cell_mask:
+            # Cell tab controls
+            self._cell_opacity_slider.setEnabled(True)
+            self._cell_opacity_slider.blockSignals(True)
+            self._cell_opacity_slider.setValue(int(ch.range_max * 100))
+            self._cell_opacity_slider.blockSignals(False)
 
     def _on_data_changed(self, top_left, bottom_right, roles):
         if ChannelListModel.VisibleRole in roles:
@@ -361,9 +425,34 @@ class ChannelPanel(QWidget):
         if color.isValid():
             idx = self._model.index(row)
             self._model.setData(idx, color, ChannelListModel.ColorRole)
-            swatch.setStyleSheet(
-                f"background: {color.name()}; border: 1px solid #555; border-radius: 3px;"
-            )
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(color)
+            swatch.setIcon(QIcon(pixmap))
 
     def _on_brightness_changed(self, val: int):
         self._model.brightness = val / 100.0
+
+    def _on_header_alpha_changed(self, val: int):
+        ch = self._model.selected_channel()
+        if ch:
+            idx = self._model.index(self._model._channels.index(ch))
+            self._model.setData(idx, val/100.0, ChannelListModel.AlphaRole)
+
+    def _on_header_limits_changed(self, mn: float, mx: float):
+        ch = self._model.selected_channel()
+        if ch:
+            idx = self._model.index(self._model._channels.index(ch))
+            self._model.setData(idx, mn, ChannelListModel.RangeMinRole)
+            self._model.setData(idx, mx, ChannelListModel.RangeMaxRole)
+
+    def _on_header_mask_opacity_changed(self, val: int):
+        ch = self._model.selected_channel()
+        if ch:
+            idx = self._model.index(self._model._channels.index(ch))
+            self._model.setData(idx, val/100.0, ChannelListModel.RangeMaxRole)
+
+    def _on_header_cell_opacity_changed(self, val: int):
+        ch = self._model.selected_channel()
+        if ch:
+            idx = self._model.index(self._model._channels.index(ch))
+            self._model.setData(idx, val/100.0, ChannelListModel.RangeMaxRole)

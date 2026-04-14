@@ -32,12 +32,11 @@ class RangeSlider(QWidget):
     SIDE_MARGIN = 5
     MIN_HEIGHT = 24
 
-    def __init__(self, parent=None, color: QColor = QColor(150, 150, 150)):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self._min_val = 0.0
         self._max_val = 1.0
         self._dragging: str | None = None  # "min", "max", or None
-        self._color = color
         self.setMinimumHeight(self.MIN_HEIGHT)
         self.setMaximumHeight(self.MIN_HEIGHT + 4)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -63,9 +62,6 @@ class RangeSlider(QWidget):
         self._max_val = min(1.0, max(v, self._min_val))
         self.update()
 
-    def set_color(self, c: QColor):
-        self._color = c
-        self.update()
 
     def set_range(self, mn: float, mx: float):
         self._min_val = max(0.0, min(mn, 1.0))
@@ -103,19 +99,13 @@ class RangeSlider(QWidget):
         p.setBrush(track_color)
         p.drawRoundedRect(tr, 3, 3)
 
-        # Active range fill with gradient
+        # Active range fill (neutral highlight color)
         x1 = self._val_to_x(self._min_val)
         x2 = self._val_to_x(self._max_val)
         active = QRect(x1, tr.y(), max(x2 - x1, 1), tr.height())
 
-        gradient = QLinearGradient(active.left(), 0, active.right(), 0)
-        base = QColor(self._color)
-        base.setAlpha(100)
-        gradient.setColorAt(0, base)
-        base2 = QColor(self._color)
-        base2.setAlpha(255)
-        gradient.setColorAt(1, base2)
-        p.setBrush(gradient)
+        fill_color = self.palette().color(QPalette.ColorRole.Highlight)
+        p.setBrush(fill_color)
         p.drawRoundedRect(active, 3, 3)
 
         # Handles

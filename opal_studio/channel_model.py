@@ -90,6 +90,7 @@ class Channel:
     is_processed: bool = False
     processed_data: np.ndarray | None = None
     mask_data: np.ndarray | None = None
+    alpha: float = 1.0
 
 
 class ChannelListModel(QAbstractListModel):
@@ -109,6 +110,7 @@ class ChannelListModel(QAbstractListModel):
     RangeMinRole = Qt.UserRole + 4
     RangeMaxRole = Qt.UserRole + 5
     SelectedRole = Qt.UserRole + 6
+    AlphaRole = Qt.UserRole + 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -217,6 +219,8 @@ class ChannelListModel(QAbstractListModel):
             return ch.range_max
         if role == self.SelectedRole:
             return ch.selected
+        if role == self.AlphaRole:
+            return ch.alpha
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
@@ -240,6 +244,8 @@ class ChannelListModel(QAbstractListModel):
             ch.selected = bool(value)
         elif role == self.ColorRole:
             ch.color = value
+        elif role == self.AlphaRole:
+            ch.alpha = float(value)
         else:
             return False
         self.dataChanged.emit(index, index, [role])
@@ -257,4 +263,5 @@ class ChannelListModel(QAbstractListModel):
             self.RangeMinRole: b"rangeMin",
             self.RangeMaxRole: b"rangeMax",
             self.SelectedRole: b"selected",
+            self.AlphaRole: b"alpha",
         }

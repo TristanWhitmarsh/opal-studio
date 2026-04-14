@@ -177,7 +177,7 @@ def _render_multichannel(
                 alpha = np.where(alpha >= ch.range_max, 1.0, 0.0)
 
             color_vec = np.array([ch.color.redF(), ch.color.greenF(), ch.color.blueF()], dtype=np.float32)
-            color_vec *= scale
+            color_vec *= (scale * ch.alpha)
             
             if np.any(color_vec > 0):
                 canvas += alpha[..., None] * color_vec

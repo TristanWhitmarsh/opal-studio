@@ -399,6 +399,19 @@ class ImageCanvas(QWidget):
         super().closeEvent(event)
 
     def resizeEvent(self, event):
+        old_size = event.oldSize()
+        new_size = event.size()
+
+        if self._img and old_size.width() > 0 and old_size.height() > 0:
+            # Maintain the current image scale (pixels-on-screen per image-pixel)
+            # and keep the center of the view fixed.
+            spp = old_size.width() / max(self._viewport.width(), 0.001)
+            cx, cy = self._viewport.center().x(), self._viewport.center().y()
+            
+            new_vw = new_size.width() / spp
+            new_vh = new_size.height() / spp
+            
+            self._viewport = QRectF(cx - new_vw / 2, cy - new_vh / 2, new_vw, new_vh)
+            self._request_render()
+
         super().resizeEvent(event)
-        if self._img:
-            self._on_channels_changed()

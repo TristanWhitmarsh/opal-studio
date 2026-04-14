@@ -17,6 +17,14 @@ _ICON = _ROOT / "icon.png"
 
 
 def main():
+    import traceback
+    def exception_hook(exctype, value, tb):
+        print("CRITICAL ERROR: Unhandled Exception")
+        traceback.print_exception(exctype, value, tb)
+        sys.exit(1)
+    
+    sys.excepthook = exception_hook
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
@@ -28,11 +36,15 @@ def main():
     font = QFont("Segoe UI", 10)  # Falls back to system default on Linux/macOS
     app.setFont(font)
 
-    window = MainWindow()
-    if _ICON.exists():
-        window.setWindowIcon(QIcon(str(_ICON)))
-    window.show()
-    sys.exit(app.exec())
+    try:
+        window = MainWindow()
+        if _ICON.exists():
+            window.setWindowIcon(QIcon(str(_ICON)))
+        window.show()
+        sys.exit(app.exec())
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -146,3 +146,56 @@ class PhenotypingTab(QWidget):
             item.setText("Neg")
             item.setBackground(QBrush(QColor("#ffcdd2"))) # Muted red
             item.setForeground(QBrush(Qt.GlobalColor.black))
+
+    def save_to_csv(self, path):
+        import csv
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Header: Marker, Type1, Type2, ...
+            header = ["Marker"] + self._cell_types
+            writer.writerow(header)
+            
+            for ch_name in self._channel_names:
+                row = [ch_name]
+                for c_type in self._cell_types:
+                    state = self._cell_states.get((ch_name, c_type), 0)
+                    # Use symbols: + for Pos, - for Neg, empty for None
+                    val = ""
+                    if state == 1: val = "+"
+                    elif state == 2: val = "-"
+                    row.append(val)
+                writer.writerow(row)
+
+    def load_from_csv(self, path):
+        import csv
+        with open(path, 'r') as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            if not header or header[0] != "Marker":
+                raise ValueError("Invalid CSV format. First column must be 'Marker'.")
+            
+            new_types = header[1:]
+            
+            # Read all states from CSV into a temporary map
+            csv_states = {}
+            for row in reader:
+                if not row: continue
+                ch_name = row[0]
+                for i, val in enumerate(row[1:]):
+                    if i >= len(new_types): break
+                    c_type = new_types[i]
+                    state = 0
+                    if val == "+": state = 1
+                    elif val == "-": state = 2
+                    csv_states[(ch_name, c_type)] = state
+            
+            # Update columns
+            self._cell_types = new_types
+            
+            # Update states only for existing markers (already in self._channel_names)
+            # and reset others to 0
+            for ch_name in self._channel_names:
+                for c_type in self._cell_types:
+                    self._cell_states[(ch_name, c_type)] = csv_states.get((ch_name, c_type), 0)
+            
+            self._refresh_table_ui()

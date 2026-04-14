@@ -11,7 +11,9 @@ import threading
 from pathlib import Path
 import random
 import colorsys
+import xml.etree.ElementTree as ET
 import numpy as np
+import tifffile
 from PySide6.QtCore import Qt, Signal, Slot, QTimer, QSize
 from PySide6.QtGui import QAction, QColor, QPixmap, QIcon
 from PySide6.QtWidgets import (
@@ -94,7 +96,6 @@ class MainWindow(QMainWindow):
         self._channel_panel = ChannelPanel(self._channel_model)
         self._canvas = ImageCanvas(self._channel_model)
         self._ops_panel = OperationsPanel(self._channel_model, self)
-
         self._phenotyping_tab = PhenotypingTab(self._channel_model)
 
         # Signals
@@ -130,7 +131,7 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(0, 0) # channel
         self._splitter.setStretchFactor(1, 1) # canvas
         self._splitter.setStretchFactor(2, 0) # operations
-        self._splitter.setSizes([300, 800, 320])
+        self._splitter.setSizes([300, 760, 340])
         self._splitter.setCollapsible(2, False)
         
         self.setCentralWidget(self._splitter)
@@ -147,6 +148,34 @@ class MainWindow(QMainWindow):
         open_act.setShortcut("Ctrl+O")
         open_act.triggered.connect(self._on_open)
         file_menu.addAction(open_act)
+
+        file_menu.addSeparator()
+        
+        load_masks_act = QAction("&Load Masks…", self)
+        load_masks_act.triggered.connect(lambda: self._on_import_masks(target="mask"))
+        file_menu.addAction(load_masks_act)
+
+        load_cells_act = QAction("Load &Cells…", self)
+        load_cells_act.triggered.connect(lambda: self._on_import_masks(target="cell"))
+        file_menu.addAction(load_cells_act)
+
+        load_phenos_act = QAction("Load &Phenotyping…", self)
+        load_phenos_act.triggered.connect(self._on_import_phenotypes)
+        file_menu.addAction(load_phenos_act)
+
+        file_menu.addSeparator()
+
+        save_masks_act = QAction("&Save Masks…", self)
+        save_masks_act.triggered.connect(lambda: self._on_export_masks(target="mask"))
+        file_menu.addAction(save_masks_act)
+
+        save_cells_act = QAction("Save &Cells…", self)
+        save_cells_act.triggered.connect(lambda: self._on_export_masks(target="cell"))
+        file_menu.addAction(save_cells_act)
+
+        save_phenos_act = QAction("Save &Phenotyping…", self)
+        save_phenos_act.triggered.connect(self._on_export_phenotypes)
+        file_menu.addAction(save_phenos_act)
         
         file_menu.addSeparator()
         quit_act = QAction("&Quit", self)
@@ -173,14 +202,158 @@ class MainWindow(QMainWindow):
                     rgb = palette[i]
                     channels.append(Channel(
                         name=name, color=QColor(*rgb),
-                        visible=(i < 6), data_min=float(dmin), data_max=float(dmax), index=i
+                        visible=(i == 0), data_min=float(dmin), data_max=float(dmax), index=i
                     ))
                 self._channel_model.set_channels(channels)
 
             self._canvas.set_image(img)
             self._status.showMessage(f"Loaded: {Path(path).name}", 5000)
         except Exception as e:
+            import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Could not load image: {e}")
+
+    def _on_export_masks(self, target="mask"):
+        if not self._image: return
+        
+        # 1. Collect all matching masks
+        masks = []
+        names = []
+        label = "Masks" if target == "mask" else "Cells"
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            # Filter by target
+            is_match = False
+            if target == "mask" and ch.is_mask and not ch.is_cell_mask:
+                is_match = True
+            elif target == "cell" and ch.is_cell_mask:
+                is_match = True
+                
+            if is_match and ch.mask_data is not None:
+                prefix = "Cell: " if ch.is_cell_mask else "Mask: "
+                masks.append(ch.mask_data)
+                names.append(prefix + ch.name)
+        
+        if not masks:
+            QMessageBox.information(self, "Export", f"No {label.lower()} found to export.")
+            return
+            
+        # 2. Ask for filename
+        path, _ = QFileDialog.getSaveFileName(self, f"Export {label}", "", "OME-TIFF (*.ome.tif *.ome.tiff)")
+        if not path: return
+        if not path.lower().endswith(".ome.tif") and not path.lower().endswith(".ome.tiff"):
+            path += ".ome.tif"
+            
+        # 3. Write OME-TIFF
+        try:
+            data = np.stack(masks) # (C, H, W)
+            # Ensure uint16 or uint32 if labels are large
+            if data.max() < 65535:
+                data = data.astype(np.uint16)
+            else:
+                data = data.astype(np.uint32)
+                
+            tifffile.imwrite(
+                path,
+                data,
+                ome=True,
+                metadata={'axes': 'CYX', 'Channel': {'Name': names}},
+                compression='zlib'
+            )
+            self._status.showMessage(f"Exported {len(masks)} {label.lower()} to {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Export Error", f"Could not export {label.lower()}: {e}")
+
+    def _on_import_masks(self, target="mask"):
+        label = "Masks" if target == "mask" else "Cells"
+        path, _ = QFileDialog.getOpenFileName(self, f"Import {label}", "", "Images (*.ome.tif *.ome.tiff *.tif *.tiff)")
+        if not path: return
+        
+        try:
+            with tifffile.TiffFile(path) as tif:
+                series = tif.series[0]
+                data = series.asarray() # (C, H, W) or (H, W)
+                
+                # Handle single channel case
+                if data.ndim == 2:
+                    data = data[np.newaxis, ...]
+                
+                # Extract names from OME-XML
+                names = []
+                try:
+                    ome_xml = tif.ome_metadata
+                    if ome_xml:
+                        root = ET.fromstring(ome_xml)
+                        ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+                        channels = root.findall(".//ome:Channel", ns)
+                        if not channels:
+                            channels = root.findall(".//{*}Channel")
+                        for ch_xml in channels:
+                            names.append(ch_xml.get("Name") or ch_xml.get("ID"))
+                except:
+                    pass
+                
+                if len(names) < data.shape[0]:
+                    for i in range(len(names), data.shape[0]):
+                        names.append(f"Imported Mask {i}")
+                
+                # Add to model
+                imported_count = 0
+                for i in range(data.shape[0]):
+                    name = names[i]
+                    # Determine if it's a cell mask or normal mask
+                    is_cell = name.startswith("Cell: ")
+                    is_reg_mask = name.startswith("Mask: ")
+                    
+                    # If prefix is missing, use the target requested by the user
+                    final_is_cell = is_cell
+                    if not is_cell and not is_reg_mask:
+                        final_is_cell = (target == "cell")
+                    
+                    # Clean up name
+                    clean_name = name
+                    if is_cell: clean_name = name[len("Cell: "):]
+                    elif is_reg_mask: clean_name = name[len("Mask: "):]
+                    
+                    mask_data = data[i].astype(np.int32)
+                    
+                    new_ch = Channel(
+                        name=clean_name,
+                        color=QColor(255, 255, 255),
+                        visible=True,
+                        is_mask=(not final_is_cell),
+                        is_cell_mask=final_is_cell,
+                        mask_data=mask_data,
+                        index=-1
+                    )
+                    self._channel_model.add_channel(new_ch)
+                    imported_count += 1
+                
+            self._status.showMessage(f"Imported {imported_count} {label.lower()}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Import Error", f"Could not import {label.lower()}: {e}")
+
+    def _on_export_phenotypes(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Phenotypes", "", "CSV Files (*.csv)")
+        if not path: return
+        if not path.lower().endswith(".csv"): path += ".csv"
+        
+        try:
+            self._phenotyping_tab.save_to_csv(path)
+            self._status.showMessage(f"Exported phenotypes to {Path(path).name}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Could not export phenotypes: {e}")
+
+    def _on_import_phenotypes(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Phenotypes", "", "CSV Files (*.csv)")
+        if not path: return
+        
+        try:
+            self._phenotyping_tab.load_from_csv(path)
+            self._status.showMessage(f"Imported phenotypes from {Path(path).name}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Could not import phenotypes: {e}")
 
     @staticmethod
     def _quick_percentile_range(img: ImageData, channel: int) -> tuple[float, float]:
@@ -202,15 +375,46 @@ class MainWindow(QMainWindow):
         if not self._image: return
         def _run():
             try:
-                from skimage import exposure
-                from csbdeep.utils import normalize
                 idx = params["channel_index"]
                 ch = self._channel_model.channel(idx)
                 data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
-                x = normalize(data, params["p_low"], params["p_high"], axis=(0, 1))
-                x = np.clip(x, 0.0, 1.0)
-                if params["apply_clahe"]:
-                    x = exposure.equalize_adapthist(x, kernel_size=params["clahe_kernel"], clip_limit=params["clahe_clip"]).astype(np.float32)
+                
+                if params.get("is_filter"):
+                    import scipy.signal
+                    import cv2
+                    filter_type = params["filter_type"]
+                    filter_value = params["filter_value"]
+                    
+                    if filter_type == 'median':
+                        # Ensure odd size for medfilt2d
+                        size = filter_value if filter_value % 2 != 0 else filter_value + 1
+                        x = scipy.signal.medfilt2d(data, size)
+                    elif filter_type == 'tophat':
+                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (filter_value, filter_value))
+                        tophat_data = cv2.morphologyEx(data, cv2.MORPH_TOPHAT, kernel)
+                        x = data - tophat_data
+                    else:
+                        x = data
+                else:
+                    from csbdeep.utils import normalize
+                    from skimage import exposure
+                    
+                    # 1. Get raw values at percentiles for rescaling
+                    p_low_val = np.percentile(data, params["p_low"])
+                    p_high_val = np.percentile(data, params["p_high"])
+                    diff = p_high_val - p_low_val if p_high_val > p_low_val else 1.0
+                    
+                    # 2. Normalize to [0, 1]
+                    x = (data - p_low_val) / diff
+                    x = np.clip(x, 0.0, 1.0)
+                    
+                    # 3. Apply CLAHE
+                    if params["apply_clahe"]:
+                        x = exposure.equalize_adapthist(x, kernel_size=params["clahe_kernel"], clip_limit=params["clahe_clip"]).astype(np.float32)
+                    
+                    # 4. Rescale back to original intensity range
+                    x = x * diff + p_low_val
+                
                 self.preprocessingResultReady.emit(f"Processed: {ch.name}", x)
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -241,6 +445,7 @@ class MainWindow(QMainWindow):
             try:
                 method = params.get("method", "stardist")
                 indices = params["channel_indices"]
+                override_name = ""
                 x = None
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
@@ -274,6 +479,32 @@ class MainWindow(QMainWindow):
                     channels = [[0, 0]]
                     result = model.eval([x], diameter=params.get("diameter"), channels=channels)
                     labels = result[0][0]
+                elif method == "instanseg":
+                    from instanseg import InstanSeg
+                    import torch
+                    model = InstanSeg(params["model_name"])
+                    x_input = x
+                    if "brightfield" in params["model_name"].lower() and x.ndim == 2:
+                        x_input = np.stack([x]*3, axis=-1)
+                    
+                    out, _ = model.eval_small_image(x_input, params["pixel_size"])
+                    
+                    labels_tensor = out[0]
+                    if hasattr(labels_tensor, 'cpu'):
+                        labels_tensor = labels_tensor.cpu().numpy()
+                    elif hasattr(labels_tensor, 'numpy'):
+                        labels_tensor = labels_tensor.numpy()
+                        
+                    labels_tensor = np.squeeze(labels_tensor)
+                    if labels_tensor.ndim == 3:
+                        # Process extra channels like cells before proceeding with main labels (nuclei)
+                        for c in range(1, labels_tensor.shape[0]):
+                           self.segmentationResultReady.emit(labels_tensor[c], "InstanSeg Cells", True, None)
+                        labels = labels_tensor[0]
+                        override_name = "InstanSeg Nuclei"
+                    else:
+                        labels = labels_tensor
+                        override_name = "InstanSeg Nuclei"
                 elif method == "watershed":
                     from scipy import ndimage as ndi
                     from skimage.filters import gaussian
@@ -334,7 +565,7 @@ class MainWindow(QMainWindow):
                                     mapping[cid] = cid
                             labels = mapping[labels]
 
-                self.segmentationResultReady.emit(labels, "", False, None)
+                self.segmentationResultReady.emit(labels, override_name, False, None)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))

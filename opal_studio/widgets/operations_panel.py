@@ -41,8 +41,8 @@ class CollapsiblePanel(QWidget):
 
         self._content = QWidget()
         self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(10, 10, 10, 10)
-        self._content_layout.setSpacing(10)
+        self._content_layout.setContentsMargins(2, 5, 2, 5)
+        self._content_layout.setSpacing(5)
         self._layout.addWidget(self._content)
         
         self._content.setVisible(self._is_expanded)
@@ -58,6 +58,191 @@ class CollapsiblePanel(QWidget):
     def addLayout(self, layout):
         self._content_layout.addLayout(layout)
 
+class OperationsTabWidget(QTabWidget):
+    """A QTabWidget that adjusts its height to match the current tab's contents."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setElideMode(Qt.TextElideMode.ElideRight)
+        self.setUsesScrollButtons(True)
+        self.setTabBarAutoHide(False)
+        self.tabBar().setExpanding(True)
+        self.currentChanged.connect(self._on_current_changed)
+
+    def _on_current_changed(self, index):
+        self.updateGeometry()
+        # Force parent update if it's a collapsible panel content
+        if self.parent() and self.parent().parent():
+            self.parent().updateGeometry()
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        if self.currentWidget():
+            # Height = current tab height + tab bar height + margin
+            h = self.currentWidget().sizeHint().height() + self.tabBar().sizeHint().height() + 8
+            hint.setHeight(h)
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setHeight(self.sizeHint().height())
+        return hint
+
+class EqualizeTab(QWidget):
+    """Percentile normalization and CLAHE equalization."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+        
+        # Channel Selector
+        self._channel_combo = QComboBox()
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
+        form.addRow("Channel:", self._channel_combo)
+
+        # Percentiles
+        self.p_low = QLineEdit("1.0")
+        self.p_low.setValidator(QDoubleValidator(0, 100, 2))
+        self.p_high = QLineEdit("99.8")
+        self.p_high.setValidator(QDoubleValidator(0, 100, 2))
+        self.p_low.setFixedWidth(50)
+        self.p_high.setFixedWidth(50)
+        
+        p_lay = QHBoxLayout()
+        p_lay.addWidget(self.p_low)
+        p_lay.addWidget(QLabel(" - "))
+        p_lay.addWidget(self.p_high)
+        p_lay.addStretch()
+        form.addRow("Range:", p_lay)
+
+        # CLAHE (Always on, just show parameters)
+        self.clahe_clip = QLineEdit("0.02")
+        self.clahe_clip.setValidator(QDoubleValidator(0.001, 1.0, 3))
+        self.clahe_clip.setFixedWidth(60)
+        form.addRow("Clip:", self.clahe_clip)
+        
+        self.clahe_kernel = QLineEdit("50")
+        self.clahe_kernel.setValidator(QIntValidator(8, 256))
+        self.clahe_kernel.setFixedWidth(60)
+        form.addRow("Kernel:", self.clahe_kernel)
+
+        layout.addLayout(form)
+        
+        self._run_btn = QPushButton("Run Equalize")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+        layout.addStretch()
+
+        self._refresh_channels()
+        self._channel_model.modelReset.connect(self._refresh_channels)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+
+    def _refresh_channels(self):
+        current = self._channel_combo.currentText()
+        self._channel_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.is_mask:
+                self._channel_combo.addItem(ch.name, i)
+        idx = self._channel_combo.findText(current)
+        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
+
+    def _on_run(self):
+        if self._channel_combo.currentIndex() < 0: return
+        self.runRequested.emit({
+            "is_filter": False,
+            "channel_index": self._channel_combo.currentData(),
+            "p_low": float(self.p_low.text() or 1.0),
+            "p_high": float(self.p_high.text() or 99.8),
+            "apply_clahe": True,
+            "clahe_clip": float(self.clahe_clip.text() or 0.02),
+            "clahe_kernel": (int(self.clahe_kernel.text() or 50), int(self.clahe_kernel.text() or 50))
+        })
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._run_btn.setEnabled(enabled)
+
+class FilterTab(QWidget):
+    """Smoothing and morphological filters."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        
+        # Channel Selector
+        self._channel_combo = QComboBox()
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
+        form.addRow("Channel:", self._channel_combo)
+
+        self.filter_type = QComboBox()
+        self.filter_type.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.filter_type.setMinimumWidth(50)
+        self.filter_type.addItems(["Median", "Tophat"])
+        form.addRow("Type:", self.filter_type)
+        
+        self.filter_value = QLineEdit("3")
+        self.filter_value.setValidator(QIntValidator(1, 101))
+        self.filter_value.setFixedWidth(60)
+        form.addRow("Size:", self.filter_value)
+        
+        layout.addLayout(form)
+        
+        self._run_btn = QPushButton("Run Filter")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+        layout.addStretch()
+
+        self._refresh_channels()
+        self._channel_model.modelReset.connect(self._refresh_channels)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+
+    def _refresh_channels(self):
+        current = self._channel_combo.currentText()
+        self._channel_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.is_mask:
+                self._channel_combo.addItem(ch.name, i)
+        idx = self._channel_combo.findText(current)
+        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
+
+    def _on_run(self):
+        if self._channel_combo.currentIndex() < 0: return
+        self.runRequested.emit({
+            "is_filter": True,
+            "channel_index": self._channel_combo.currentData(),
+            "filter_type": self.filter_type.currentText().lower(),
+            "filter_value": int(self.filter_value.text() or 3)
+        })
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._run_btn.setEnabled(enabled)
+
 class StarDistTab(QWidget):
     """Sub-widget for StarDist segmentation parameters."""
     runRequested = Signal(dict)
@@ -66,23 +251,27 @@ class StarDistTab(QWidget):
         super().__init__(parent)
         self._channel_model = channel_model
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 10, 5, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
 
         # Model Parameters
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
 
         # Channel Selector
         self._channel_combo = QComboBox()
-        self._channel_combo.setMinimumWidth(80)
-        self._channel_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
         form.addRow("Channel:", self._channel_combo)
 
         self._model_combo = QComboBox()
-        self._model_combo.setMinimumWidth(80)
-        self._model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._model_combo.setMinimumWidth(50)
         self._model_combo.addItems(["2D_versatile_fluo", "2D_versatile_he", "2D_paper_dsb2018"])
         self._scan_models()
         form.addRow("Model:", self._model_combo)
@@ -93,13 +282,13 @@ class StarDistTab(QWidget):
 
         self._prob_thresh = QLineEdit("0.5")
         self._prob_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
-        self._prob_thresh.setFixedWidth(80)
-        form.addRow("Prob Match:", self._prob_thresh)
+        self._prob_thresh.setFixedWidth(60)
+        form.addRow("Match:", self._prob_thresh)
 
         self._nms_thresh = QLineEdit("0.3")
         self._nms_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
-        self._nms_thresh.setFixedWidth(80)
-        form.addRow("NMS Thresh:", self._nms_thresh)
+        self._nms_thresh.setFixedWidth(60)
+        form.addRow("NMS:", self._nms_thresh)
         
         self._prob_thresh.setEnabled(False)  # checkbox starts checked → field starts disabled
         self._default_thresh_cb.toggled.connect(lambda checked: self._prob_thresh.setEnabled(not checked))
@@ -156,23 +345,27 @@ class CellposeTab(QWidget):
         super().__init__(parent)
         self._channel_model = channel_model
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 10, 5, 10)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
         # Model Parameters
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
 
         # Channel Selector
         self._channel_combo = QComboBox()
-        self._channel_combo.setMinimumWidth(80)
-        self._channel_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
         form.addRow("Channel:", self._channel_combo)
 
         self._model_combo = QComboBox()
-        self._model_combo.setMinimumWidth(80)
-        self._model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._model_combo.setMinimumWidth(50)
         self._model_combo.addItems(["cyto", "nuclei", "cyto2"])
         self._scan_models()
         form.addRow("Model:", self._model_combo)
@@ -180,8 +373,8 @@ class CellposeTab(QWidget):
         self._diameter = QLineEdit()
         self._diameter.setPlaceholderText("Auto")
         self._diameter.setValidator(QDoubleValidator(0.1, 1000.0, 2))
-        self._diameter.setFixedWidth(80)
-        form.addRow("Diameter (px):", self._diameter)
+        self._diameter.setFixedWidth(60)
+        form.addRow("Diam:", self._diameter)
         
         layout.addLayout(form)
 
@@ -225,6 +418,82 @@ class CellposeTab(QWidget):
             "model_path": self._model_combo.currentData(),
             "diameter": diam,
         })
+        
+class InstanSegTab(QWidget):
+    """Sub-widget for InstanSeg segmentation parameters."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # Model Parameters
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+
+        # Channel Selector
+        self._channel_combo = QComboBox()
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
+        form.addRow("Channel:", self._channel_combo)
+
+        # Model Selector
+        self._model_combo = QComboBox()
+        self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._model_combo.setMinimumWidth(50)
+        self._model_combo.setEditable(True)
+        self._model_combo.addItems([
+            "single_channel_nuclei",
+            "fluorescence_nuclei_and_cells",
+            "multi_channel_fluorescence",
+            "brightfield_nuclei"
+        ])
+        form.addRow("Model:", self._model_combo)
+
+        # Pixel Size
+        self._pixel_size = QLineEdit("0.5")
+        self._pixel_size.setValidator(QDoubleValidator(0.001, 100.0, 3))
+        self._pixel_size.setFixedWidth(60)
+        form.addRow("Px Size (\u03bcm):", self._pixel_size)
+        
+        layout.addLayout(form)
+
+        # Run Button
+        self._run_btn = QPushButton("Run InstanSeg")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+
+        self._refresh_channels()
+        self._channel_model.modelReset.connect(self._refresh_channels)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+
+    def _refresh_channels(self):
+        current = self._channel_combo.currentText()
+        self._channel_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.is_mask:
+                self._channel_combo.addItem(ch.name, i)
+        idx = self._channel_combo.findText(current)
+        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
+
+    def _on_run(self):
+        if self._channel_combo.currentIndex() < 0: return
+        self.runRequested.emit({
+            "method": "instanseg",
+            "channel_indices": [self._channel_combo.currentData()],
+            "model_name": self._model_combo.currentText(),
+            "pixel_size": float(self._pixel_size.text() or 0.5),
+        })
 
 class WatershedTab(QWidget):
     """Sub-widget for Watershed segmentation parameters."""
@@ -234,24 +503,28 @@ class WatershedTab(QWidget):
         super().__init__(parent)
         self._channel_model = channel_model
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 10, 5, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
 
         # Model Parameters
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
 
         # Channel Selector
         self._channel_combo = QComboBox()
-        self._channel_combo.setMinimumWidth(80)
-        self._channel_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
         form.addRow("Channel:", self._channel_combo)
 
         # Labeller mode
         self._labeller_combo = QComboBox()
-        self._labeller_combo.setMinimumWidth(80)
-        self._labeller_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._labeller_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._labeller_combo.setMinimumWidth(50)
         self._labeller_combo.addItems(["voronoi", "gauss"])
         self._labeller_combo.currentTextChanged.connect(self._on_labeller_changed)
         form.addRow("Labeller:", self._labeller_combo)
@@ -267,7 +540,7 @@ class WatershedTab(QWidget):
         self._outline_sigma = QLineEdit("2")
         self._outline_sigma.setValidator(QDoubleValidator(0.1, 100.0, 2))
         self._outline_sigma.setFixedWidth(80)
-        form.addRow("Outline Sigma:", self._outline_sigma)
+        form.addRow("Outline:", self._outline_sigma)
 
         # Threshold
         self._threshold = QLineEdit("1")
@@ -279,12 +552,11 @@ class WatershedTab(QWidget):
         )
         form.addRow("Threshold:", self._threshold)
 
-        # Min Mean Intensity
         self._min_mean_intensity = QLineEdit("0")
         self._min_mean_intensity.setValidator(QDoubleValidator(-1000000.0, 1000000.0, 4))
-        self._min_mean_intensity.setFixedWidth(80)
+        self._min_mean_intensity.setFixedWidth(60)
         self._min_mean_intensity.setToolTip("Minimum mean intensity in a cell to keep it.")
-        form.addRow("Min Intensity:", self._min_mean_intensity)
+        form.addRow("Min Int:", self._min_mean_intensity)
 
         layout.addLayout(form)
 
@@ -334,29 +606,32 @@ class MaskFilterSizeTab(QWidget):
         super().__init__(parent)
         self._channel_model = channel_model
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 10, 5, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
 
         # Parameters
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
 
-        # Mask Selector
         self._mask_combo = QComboBox()
-        self._mask_combo.setMinimumWidth(80)
-        self._mask_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
-        form.addRow("Input Mask:", self._mask_combo)
+        self._mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._mask_combo.setMinimumWidth(50)
+        form.addRow("Mask:", self._mask_combo)
         
         self._min_size = QLineEdit("10")
         self._min_size.setValidator(QIntValidator(0, 1000000))
-        self._min_size.setFixedWidth(80)
-        form.addRow("Min Size (px):", self._min_size)
+        self._min_size.setFixedWidth(60)
+        form.addRow("Min:", self._min_size)
 
         self._max_size = QLineEdit("1000")
         self._max_size.setValidator(QIntValidator(0, 1000000))
-        self._max_size.setFixedWidth(80)
-        form.addRow("Max Size (px):", self._max_size)
+        self._max_size.setFixedWidth(60)
+        form.addRow("Max:", self._max_size)
 
         layout.addLayout(form)
 
@@ -402,23 +677,26 @@ class MaskExpansionTab(QWidget):
         super().__init__(parent)
         self._channel_model = channel_model
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 10, 5, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
 
         # Parameters
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
 
-        # Mask Selector
         self._mask_combo = QComboBox()
-        self._mask_combo.setMinimumWidth(80)
-        self._mask_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
-        form.addRow("Input Mask:", self._mask_combo)
+        self._mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._mask_combo.setMinimumWidth(50)
+        form.addRow("Mask:", self._mask_combo)
         self._pixels = QLineEdit("6")
         self._pixels.setValidator(QIntValidator(1, 100))
-        self._pixels.setFixedWidth(80)
-        form.addRow("Expansion (pixels):", self._pixels)
+        self._pixels.setFixedWidth(60)
+        form.addRow("Expand:", self._pixels)
         layout.addLayout(form)
 
         # Run Button
@@ -460,22 +738,28 @@ class CellSamplerTab(QWidget):
         super().__init__(parent)
         self._channel_model = channel_model
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 10, 5, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
 
         # Parameters
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
 
         # Mask Selector (List Widget for multiple selections)
         self._mask_list = QListWidget()
-        self._mask_list.setFixedHeight(80) 
-        form.addRow("Input Masks:", self._mask_list)
+        self._mask_list.setFixedHeight(80)
+        self._mask_list.setMinimumWidth(0)
+        form.addRow("Masks:", self._mask_list)
         
         # Strategy Selector
         self._strategy_combo = QComboBox()
-        self._strategy_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self._strategy_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._strategy_combo.setMinimumWidth(50)
         self._strategy_combo.addItem("Largest cell count (pop)", "pop")
         self._strategy_combo.addItem("Highest Jaccard (j1)", "j1")
         self._strategy_combo.addItem("Min area variance (cstd)", "cstd")
@@ -535,7 +819,7 @@ class CellSamplerTab(QWidget):
 class OperationsPanel(QWidget):
     """Right-side panel with collapsible sections for Pre-processing and Segmentation."""
 
-    WIDTH = 320
+    WIDTH = 340
     runPreprocessingRequested = Signal(dict)
     runSegmentationRequested = Signal(dict)
     runMaskProcessingRequested = Signal(dict)
@@ -549,7 +833,7 @@ class OperationsPanel(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(0, 0, 6, 0)
         main_layout.setSpacing(0)
 
         scroll = QScrollArea()
@@ -587,64 +871,34 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Pre-processing", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        form = QFormLayout()
-        form.setContentsMargins(0, 5, 0, 5)
-        form.setSpacing(8)
-        self._pre_target_combo = QComboBox()
-        self._pre_target_combo.setMinimumWidth(80)
-        self._pre_target_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
-        form.addRow("Channel:", self._pre_target_combo)
-
-        # Percentiles
-        self._p_low = QLineEdit("1.0"); self._p_low.setValidator(QDoubleValidator(0, 100, 2))
-        self._p_high = QLineEdit("99.8"); self._p_high.setValidator(QDoubleValidator(0, 100, 2))
-        self._p_low.setFixedWidth(80); self._p_high.setFixedWidth(80)
+        # Tabs for Equalize vs Filter
+        self._pre_tabs = OperationsTabWidget()
+        self._pre_tabs.setIconSize(QSize(1, 20))
+        self._equalize_tab = EqualizeTab(self._channel_model)
+        self._filter_tab = FilterTab(self._channel_model)
         
-        p_lay = QHBoxLayout()
-        p_lay.addWidget(self._p_low); p_lay.addWidget(QLabel("-")); p_lay.addWidget(self._p_high)
-        p_lay.addStretch()
-        form.addRow("Percentiles:", p_lay)
-
-        # CLAHE
-        self._clahe_cb = QCheckBox("Apply CLAHE")
-        self._clahe_cb.setChecked(True)
-        form.addRow("", self._clahe_cb)
+        self._equalize_tab.runRequested.connect(self._on_run_preprocessing)
+        self._filter_tab.runRequested.connect(self._on_run_preprocessing)
         
-        self._clahe_clip = QLineEdit("0.02")
-        self._clahe_clip.setValidator(QDoubleValidator(0.001, 1.0, 3))
-        self._clahe_clip.setFixedWidth(80)
-        form.addRow("Clip Limit:", self._clahe_clip)
-        
-        self._clahe_kernel = QLineEdit("50")
-        self._clahe_kernel.setValidator(QIntValidator(8, 256))
-        self._clahe_kernel.setFixedWidth(80)
-        form.addRow("Kernel Size:", self._clahe_kernel)
-
-        self._clahe_cb.toggled.connect(lambda chk: [self._clahe_clip.setEnabled(chk), self._clahe_kernel.setEnabled(chk)])
-        panel.addLayout(form)
-
-        self._pre_run_btn = QPushButton("Run Pre-processing")
-        self._pre_run_btn.clicked.connect(self._on_run_preprocessing)
-        panel.addWidget(self._pre_run_btn)
-
-        self._channel_model.modelReset.connect(self._refresh_pre_channels)
-        self._channel_model.rowsInserted.connect(lambda: self._refresh_pre_channels())
-        self._refresh_pre_channels()
+        self._pre_tabs.addTab(self._equalize_tab, self._spacer_icon, "Equalize")
+        self._pre_tabs.addTab(self._filter_tab, self._spacer_icon, "Filter")
+        panel.addWidget(self._pre_tabs)
 
     def _setup_segmentation_section(self):
         panel = CollapsiblePanel("Segmentation", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        self._seg_tabs = QTabWidget()
+        self._seg_tabs = OperationsTabWidget()
         self._seg_tabs.setIconSize(QSize(1, 20))
-        self._seg_tabs.setMinimumWidth(0)
-        self._seg_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self._stardist_tab = StarDistTab(self._channel_model)
         self._stardist_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._stardist_tab, self._spacer_icon, "StarDist")
         self._cellpose_tab = CellposeTab(self._channel_model)
         self._cellpose_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._cellpose_tab, self._spacer_icon, "Cellpose")
+        self._instanseg_tab = InstanSegTab(self._channel_model)
+        self._instanseg_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._instanseg_tab, self._spacer_icon, "InstanSeg")
         self._watershed_tab = WatershedTab(self._channel_model)
         self._watershed_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._watershed_tab, self._spacer_icon, "Watershed")
@@ -654,22 +908,20 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Mask Processing", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        self._mask_tabs = QTabWidget()
+        self._mask_tabs = OperationsTabWidget()
         self._mask_tabs.setIconSize(QSize(1, 20))
-        self._mask_tabs.setMinimumWidth(0)
-        self._mask_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         
         self._filter_size_tab = MaskFilterSizeTab(self._channel_model)
         self._filter_size_tab.runRequested.connect(self._on_run_mask_processing)
-        self._mask_tabs.addTab(self._filter_size_tab, self._spacer_icon, "Filter by Size")
+        self._mask_tabs.addTab(self._filter_size_tab, self._spacer_icon, "Size")
         
         self._cell_sampler_tab = CellSamplerTab(self._channel_model)
         self._cell_sampler_tab.runRequested.connect(self._on_run_mask_processing)
-        self._mask_tabs.addTab(self._cell_sampler_tab, self._spacer_icon, "CellSampler")
+        self._mask_tabs.addTab(self._cell_sampler_tab, self._spacer_icon, "Sampler")
         
         self._expansion_tab = MaskExpansionTab(self._channel_model)
         self._expansion_tab.runRequested.connect(self._on_run_mask_processing)
-        self._mask_tabs.addTab(self._expansion_tab, self._spacer_icon, "Expansion")
+        self._mask_tabs.addTab(self._expansion_tab, self._spacer_icon, "Expand")
         
         panel.addWidget(self._mask_tabs)
 
@@ -677,19 +929,40 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Cell positivity", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        form = QFormLayout()
-        form.setContentsMargins(0, 5, 0, 5)
-        form.setSpacing(8)
-        self._pos_mask_combo = QComboBox()
-        self._pos_mask_combo.setMinimumWidth(80)
-        self._pos_mask_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
-        form.addRow("Input Mask:", self._pos_mask_combo)
+        self._pos_tabs = OperationsTabWidget()
+        
+        # AI Tab
+        ai_tab = QWidget()
+        ai_lay = QVBoxLayout(ai_tab)
+        ai_lay.setContentsMargins(12, 12, 12, 12)
+        ai_lay.setSpacing(6)
 
-        panel.addLayout(form)
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self._pos_mask_combo = QComboBox()
+        self._pos_mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._pos_mask_combo.setMinimumWidth(50)
+        form.addRow("Mask:", self._pos_mask_combo)
+        ai_lay.addLayout(form)
 
         self._pos_run_btn = QPushButton("Detect Cell Positivity")
         self._pos_run_btn.clicked.connect(self._on_run_cell_positivity)
-        panel.addWidget(self._pos_run_btn)
+        ai_lay.addWidget(self._pos_run_btn)
+        ai_lay.addStretch()
+
+        # Thresholds Tab
+        thresh_tab = QWidget()
+        thresh_lay = QVBoxLayout(thresh_tab)
+        thresh_lay.addWidget(QLabel("Threshold parameters coming soon..."))
+        thresh_lay.addStretch()
+
+        self._pos_tabs.addTab(ai_tab, self._spacer_icon, "AI")
+        self._pos_tabs.addTab(thresh_tab, self._spacer_icon, "Thresholds")
+        panel.addWidget(self._pos_tabs)
 
         self._channel_model.modelReset.connect(self._refresh_positivity_combos)
         self._channel_model.rowsInserted.connect(lambda: self._refresh_positivity_combos())
@@ -713,35 +986,39 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Cell identification", collapsed=True)
         self._container_layout.addWidget(panel)
 
+        self._ident_tabs = OperationsTabWidget()
+        
+        # Gating Tab
+        gating_tab = QWidget()
+        gating_lay = QVBoxLayout(gating_tab)
+        gating_lay.setContentsMargins(12, 12, 12, 12)
+        gating_lay.setSpacing(8)
+
         self._ident_run_btn = QPushButton("Identify Cells")
-        panel.addWidget(self._ident_run_btn)
+        gating_lay.addWidget(self._ident_run_btn)
+        gating_lay.addStretch()
 
-    def _refresh_pre_channels(self):
-        current = self._pre_target_combo.currentText()
-        self._pre_target_combo.clear()
-        for i in range(self._channel_model.rowCount()):
-            ch = self._channel_model.channel(i)
-            if not ch.is_mask:
-                self._pre_target_combo.addItem(ch.name, i)
-        idx = self._pre_target_combo.findText(current)
-        if idx >= 0: self._pre_target_combo.setCurrentIndex(idx)
+        # Clustering Tab
+        clustering_tab = QWidget()
+        clustering_lay = QVBoxLayout(clustering_tab)
+        clustering_lay.addWidget(QLabel("Clustering features coming soon..."))
+        clustering_lay.addStretch()
 
-    def _on_run_preprocessing(self):
-        if self._pre_target_combo.currentIndex() < 0: return
-        self._pre_run_btn.setEnabled(False)
+        self._ident_tabs.addTab(gating_tab, self._spacer_icon, "Gating")
+        self._ident_tabs.addTab(clustering_tab, self._spacer_icon, "Clustering")
+        panel.addWidget(self._ident_tabs)
+
+
+    def _on_run_preprocessing(self, params):
+        self._equalize_tab.setEnabled(False)
+        self._filter_tab.setEnabled(False)
         self._progress.setVisible(True); self._progress.setRange(0, 0)
-        self.runPreprocessingRequested.emit({
-            "channel_index": self._pre_target_combo.currentData(),
-            "p_low": float(self._p_low.text() or 1.0),
-            "p_high": float(self._p_high.text() or 99.8),
-            "apply_clahe": self._clahe_cb.isChecked(),
-            "clahe_clip": float(self._clahe_clip.text() or 0.02),
-            "clahe_kernel": (int(self._clahe_kernel.text() or 50), int(self._clahe_kernel.text() or 50))
-        })
+        self.runPreprocessingRequested.emit(params)
 
     def _on_run_segmentation(self, params):
         self._stardist_tab.setEnabled(False)
         self._cellpose_tab.setEnabled(False)
+        self._instanseg_tab.setEnabled(False)
         self._watershed_tab.setEnabled(False)
         self._progress.setVisible(True); self._progress.setRange(0, 0)
         self.runSegmentationRequested.emit(params)
@@ -763,9 +1040,11 @@ class OperationsPanel(QWidget):
         })
 
     def stop_loading(self):
-        self._pre_run_btn.setEnabled(True)
+        self._equalize_tab.setEnabled(True)
+        self._filter_tab.setEnabled(True)
         self._stardist_tab.setEnabled(True)
         self._cellpose_tab.setEnabled(True)
+        self._instanseg_tab.setEnabled(True)
         self._watershed_tab.setEnabled(True)
         self._filter_size_tab.setEnabled(True)
         self._expansion_tab.setEnabled(True)
