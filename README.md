@@ -1,6 +1,7 @@
 # Opal Studio
 
-![Opal Studio Screenshot](screenshot.jpg)
+<img src="screenshot.jpg" width="100%">
+
 
 **Opal Studio** is a high-performance, cross-platform image viewer and analysis application designed for highly multiplexed imaging data, including IMC (Imaging Mass Cytometry) and large OME-TIFF files. 
 
