@@ -118,35 +118,31 @@ def _render_multichannel(
             raw = resize(raw, (h, w), order=0, preserve_range=True)
 
         if ch.is_mask:
-            # 1. Vectorized color assignment via LUT for speed (instant rendering)
             labels = raw.astype(np.int32)
             mask_active = labels > 0
             if np.any(mask_active):
-                import random
-                state = random.getstate()
+                import random as py_random
+                rng = py_random.Random()
+                alpha_mask = ch.range_max
                 
                 # Identify unique cells in this tile
                 unique_ids = np.unique(labels[mask_active])
-                
-                # Pre-calculate colors for these IDs
                 max_id = int(np.max(unique_ids))
-                alpha_mask = ch.range_max
-                if max_id < 1000000: # Standard label range
+                
+                # Vectorized color assignment via LUT
+                if max_id < 2000000:
                     lut = np.zeros((max_id + 1, 3), dtype=np.float32)
                     for lid in unique_ids:
-                        random.seed(int(lid))
-                        lut[lid] = [random.random(), random.random(), random.random()]
+                        rng.seed(int(lid))
+                        lut[lid] = [rng.random(), rng.random(), rng.random()]
                     
-                    # Blend onto existing canvas
                     canvas[mask_active] = (1.0 - alpha_mask) * canvas[mask_active] + alpha_mask * lut[labels[mask_active]]
                 else:
+                    # Fallback for sparse high-value labels
                     for lid in unique_ids:
-                        random.seed(int(lid))
-                        col = np.array([random.random(), random.random(), random.random()], dtype=np.float32)
-                        idx = labels == lid
-                        canvas[idx] = (1.0 - alpha_mask) * canvas[idx] + alpha_mask * col
-                
-                random.setstate(state)
+                        rng.seed(int(lid))
+                        col = np.array([rng.random(), rng.random(), rng.random()], dtype=np.float32)
+                        canvas[labels == lid] = (1.0 - alpha_mask) * canvas[labels == lid] + alpha_mask * col
         elif ch.is_cell_mask:
             # Cell positivity rendering: 1 = green, 2 = red
             alpha_mask = ch.range_max
@@ -211,6 +207,8 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
 def _ndarray_to_qimage(rgba: np.ndarray) -> QImage:
     h, w, _ = rgba.shape
     rgba = np.ascontiguousarray(rgba)
+    # Important: qimg does NOT own the memory of the numpy array rgba.data.
+    # To prevent crashes when passing this across threads, we MUST return a copy
+    # that owns its own memory.
     qimg = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
-    qimg._numpy_data = rgba
-    return qimg
+    return qimg.copy()

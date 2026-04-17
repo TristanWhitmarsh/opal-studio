@@ -114,7 +114,7 @@ class EqualizeTab(QWidget):
         # Percentiles
         self.p_low = QLineEdit("1.0")
         self.p_low.setValidator(QDoubleValidator(0, 100, 2))
-        self.p_high = QLineEdit("99.8")
+        self.p_high = QLineEdit("99.0")
         self.p_high.setValidator(QDoubleValidator(0, 100, 2))
         self.p_low.setFixedWidth(50)
         self.p_high.setFixedWidth(50)
@@ -127,12 +127,12 @@ class EqualizeTab(QWidget):
         form.addRow("Range:", p_lay)
 
         # CLAHE (Always on, just show parameters)
-        self.clahe_clip = QLineEdit("0.02")
+        self.clahe_clip = QLineEdit("0.05")
         self.clahe_clip.setValidator(QDoubleValidator(0.001, 1.0, 3))
         self.clahe_clip.setFixedWidth(60)
         form.addRow("Clip:", self.clahe_clip)
         
-        self.clahe_kernel = QLineEdit("50")
+        self.clahe_kernel = QLineEdit("10")
         self.clahe_kernel.setValidator(QIntValidator(8, 256))
         self.clahe_kernel.setFixedWidth(60)
         form.addRow("Kernel:", self.clahe_kernel)

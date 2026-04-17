@@ -28,6 +28,7 @@ from opal_studio.widgets.image_canvas import ImageCanvas
 from opal_studio.widgets.operations_panel import OperationsPanel
 from opal_studio.widgets.phenotyping_tab import PhenotypingTab
 
+import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt
 from skimage.segmentation import watershed, find_boundaries
 
@@ -380,20 +381,16 @@ class MainWindow(QMainWindow):
                 data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
                 
                 if params.get("is_filter"):
-                    import scipy.signal
                     import cv2
                     filter_type = params["filter_type"]
                     filter_value = params["filter_value"]
                     suffix = f"_{filter_type.capitalize()}"
                     
                     if filter_type == 'median':
-                        # Ensure odd size for medfilt2d
-                        size = filter_value if filter_value % 2 != 0 else filter_value + 1
-                        x = scipy.signal.medfilt2d(data, size)
+                        x = ndi.median_filter(data, size=filter_value, mode='reflect')
                     elif filter_type == 'tophat':
                         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (filter_value, filter_value))
-                        tophat_data = cv2.morphologyEx(data, cv2.MORPH_TOPHAT, kernel)
-                        x = data - tophat_data
+                        x = cv2.morphologyEx(data, cv2.MORPH_TOPHAT, kernel)
                     else:
                         x = data
                 else:
@@ -459,11 +456,13 @@ class MainWindow(QMainWindow):
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
                     if ch.is_processed and ch.processed_data is not None:
-                        data = ch.processed_data
+                        raw = ch.processed_data.astype(np.float32)
                     else:
                         raw = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
-                        p = np.percentile(raw, (1, 99.8))
-                        data = np.clip((raw - p[0]) / (p[1] - p[0] + 1e-6), 0, 1)
+                    
+                    # Normalize for deep learning models to prevent NMS hangs or junk results
+                    p = np.percentile(raw, (1, 99.8))
+                    data = np.clip((raw - p[0]) / (p[1] - p[0] + 1e-6), 0, 1)
                     x = data if x is None else x + data
                 
                 if method == "stardist":
@@ -477,7 +476,14 @@ class MainWindow(QMainWindow):
 
                     kwargs = {"nms_thresh": params["nms_thresh"]}
                     if not params["use_default_thresh"]: kwargs["prob_thresh"] = params["prob_thresh"]
-                    labels, _ = model.predict_instances(x, **kwargs)
+                    
+                    # Automatic tiling for StarDist to prevent hangs/OOM on large images
+                    n_tiles = None
+                    if x.shape[0] > 1024 or x.shape[1] > 1024:
+                        n_tiles = (int(np.ceil(x.shape[0] / 1024)), int(np.ceil(x.shape[1] / 1024)))
+                        print(f"[StarDist] Large image detected ({x.shape}). Using tiling: {n_tiles}")
+                    
+                    labels, _ = model.predict_instances(x, n_tiles=n_tiles, **kwargs)
                 elif method == "cellpose":
                     from cellpose import models
                     if params.get("model_path"):
@@ -513,7 +519,6 @@ class MainWindow(QMainWindow):
                     else:
                         labels = labels_tensor
                 elif method == "watershed":
-                    from scipy import ndimage as ndi
                     from skimage.filters import gaussian
                     from skimage.filters import threshold_local as sk_threshold_local
                     from skimage.filters import threshold_otsu as sk_threshold_otsu
@@ -572,7 +577,10 @@ class MainWindow(QMainWindow):
                                     mapping[cid] = cid
                             labels = mapping[labels]
 
+                    print(f"[StarDist] Inference finished. Result shape: {labels.shape}")
+                    
                 self.segmentationResultReady.emit(labels, override_name, False, None)
+                print(f"[Segmentation] Result emitted.")
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))

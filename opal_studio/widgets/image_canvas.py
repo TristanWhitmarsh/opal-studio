@@ -272,41 +272,46 @@ class ImageCanvas(QWidget):
     # ------------------------------------------------------------------
 
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        # NEAREST NEIGHBOR EVERYTHING — NO SMEARING
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-        p.fillRect(self.rect(), QColor(17, 17, 17))
-
-        if not self._img:
-            p.setPen(QColor(80, 80, 80))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No image loaded")
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            # NEAREST NEIGHBOR EVERYTHING — NO SMEARING
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            p.fillRect(self.rect(), QColor(17, 17, 17))
+    
+            if not self._img:
+                p.setPen(QColor(80, 80, 80))
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No image loaded")
+                p.end()
+                return
+    
+            spp = self._screen_pixels_per_image_pixel()
+    
+            # 1. Background layer: Overview
+            if self._overview:
+                ih, iw = _get_yx(self._img.base_shape, self._img.axes, self._img.is_rgb)
+                # Map whole image to screen space
+                dst_x = -self._viewport.left() * spp
+                dst_y = -self._viewport.top() * spp
+                dst_w = iw * spp
+                dst_h = ih * spp
+                p.drawImage(QRectF(dst_x, dst_y, dst_w, dst_h), self._overview)
+    
+            # 2. Foreground layer: High-res tile
+            if self._display_image and not self._display_viewport.isEmpty():
+                vpt = self._display_viewport
+                dst_x = (vpt.left() - self._viewport.left()) * spp
+                dst_y = (vpt.top() - self._viewport.top()) * spp
+                dst_w = vpt.width() * spp
+                dst_h = vpt.height() * spp
+                # Draw on top
+                p.drawImage(QRectF(dst_x, dst_y, dst_w, dst_h), self._display_image)
+    
             p.end()
-            return
-
-        spp = self._screen_pixels_per_image_pixel()
-
-        # 1. Background layer: Overview
-        if self._overview:
-            ih, iw = _get_yx(self._img.base_shape, self._img.axes, self._img.is_rgb)
-            # Map whole image to screen space
-            dst_x = -self._viewport.left() * spp
-            dst_y = -self._viewport.top() * spp
-            dst_w = iw * spp
-            dst_h = ih * spp
-            p.drawImage(QRectF(dst_x, dst_y, dst_w, dst_h), self._overview)
-
-        # 2. Foreground layer: High-res tile
-        if self._display_image and not self._display_viewport.isEmpty():
-            vpt = self._display_viewport
-            dst_x = (vpt.left() - self._viewport.left()) * spp
-            dst_y = (vpt.top() - self._viewport.top()) * spp
-            dst_w = vpt.width() * spp
-            dst_h = vpt.height() * spp
-            # Draw on top
-            p.drawImage(QRectF(dst_x, dst_y, dst_w, dst_h), self._display_image)
-
-        p.end()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"ERROR: paintEvent failed: {e}")
 
     # ------------------------------------------------------------------
     # Zoom (QuPath style — around cursor)
