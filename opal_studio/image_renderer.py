@@ -140,7 +140,6 @@ def _render_multichannel(
                     # Blend onto existing canvas
                     canvas[mask_active] = (1.0 - alpha_mask) * canvas[mask_active] + alpha_mask * lut[labels[mask_active]]
                 else:
-                    # Fallback for extremely sparse/high label IDs
                     for lid in unique_ids:
                         random.seed(int(lid))
                         col = np.array([random.random(), random.random(), random.random()], dtype=np.float32)

@@ -307,7 +307,7 @@ class ChannelPanel(QWidget):
         top.addWidget(eye_btn)
 
         # Colour swatch
-        if not ch.is_cell_mask:
+        if not ch.is_cell_mask and not ch.is_mask:
             swatch = QPushButton()
             swatch.setFixedSize(20, 20)
             pixmap = QPixmap(16, 16)

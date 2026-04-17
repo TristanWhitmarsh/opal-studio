@@ -58,3 +58,6 @@ models/
 
 # Gemini AI assistant files
 .gemini/
+
+# Project specific
+requirements2.txt

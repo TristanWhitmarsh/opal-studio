@@ -184,6 +184,21 @@ class ChannelListModel(QAbstractListModel):
         self.endInsertRows()
         self.channels_changed.emit()
 
+    def get_unique_name(self, base_name: str) -> str:
+        """Find the next available name by appending an incrementing number."""
+        existing_names = {c.name for c in self._channels}
+        
+        # If the base name doesn't exist at all, we can use it? 
+        # But user wants "DNA_Equal1" even if "DNA_Equal" doesn't exist.
+        # Let's assume the base_name passed in is "DNA_Equal" or "DNA_Median".
+        
+        i = 1
+        while True:
+            candidate = f"{base_name}{i}"
+            if candidate not in existing_names:
+                return candidate
+            i += 1
+
     def remove_channel(self, row: int):
         """Remove a channel by row index and free its data from memory."""
         if row < 0 or row >= len(self._channels):

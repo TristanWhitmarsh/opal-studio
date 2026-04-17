@@ -276,22 +276,17 @@ class StarDistTab(QWidget):
         self._scan_models()
         form.addRow("Model:", self._model_combo)
 
-        self._default_thresh_cb = QCheckBox("Use Default Prob")
-        self._default_thresh_cb.setChecked(True)
-        form.addRow("", self._default_thresh_cb)
-
-        self._prob_thresh = QLineEdit("0.5")
+        self._prob_thresh = QLineEdit()
+        self._prob_thresh.setPlaceholderText("Auto")
         self._prob_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
         self._prob_thresh.setFixedWidth(60)
-        form.addRow("Match:", self._prob_thresh)
+        form.addRow("prob_thresh:", self._prob_thresh)
 
         self._nms_thresh = QLineEdit("0.3")
         self._nms_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
         self._nms_thresh.setFixedWidth(60)
-        form.addRow("NMS:", self._nms_thresh)
+        form.addRow("nms_thresh:", self._nms_thresh)
         
-        self._prob_thresh.setEnabled(False)  # checkbox starts checked → field starts disabled
-        self._default_thresh_cb.toggled.connect(lambda checked: self._prob_thresh.setEnabled(not checked))
         layout.addLayout(form)
 
         # Run Button
@@ -327,13 +322,18 @@ class StarDistTab(QWidget):
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
+        
+        prob_text = self._prob_thresh.text()
+        use_default = not prob_text
+        prob_val = float(prob_text) if prob_text else 0.5
+
         self.runRequested.emit({
             "method": "stardist",
             "channel_indices": [self._channel_combo.currentData()],
             "model_name": self._model_combo.currentText(),
             "model_folder": self._model_combo.currentData() or self._model_combo.currentText(),
-            "use_default_thresh": self._default_thresh_cb.isChecked(),
-            "prob_thresh": float(self._prob_thresh.text() or 0.5),
+            "use_default_thresh": use_default,
+            "prob_thresh": prob_val,
             "nms_thresh": float(self._nms_thresh.text() or 0.3),
         })
 
@@ -374,7 +374,7 @@ class CellposeTab(QWidget):
         self._diameter.setPlaceholderText("Auto")
         self._diameter.setValidator(QDoubleValidator(0.1, 1000.0, 2))
         self._diameter.setFixedWidth(60)
-        form.addRow("Diam:", self._diameter)
+        form.addRow("Diameter:", self._diameter)
         
         layout.addLayout(form)
 
@@ -459,10 +459,10 @@ class InstanSegTab(QWidget):
         form.addRow("Model:", self._model_combo)
 
         # Pixel Size
-        self._pixel_size = QLineEdit("0.5")
-        self._pixel_size.setValidator(QDoubleValidator(0.001, 100.0, 3))
+        self._pixel_size = QLineEdit("1.0")
+        self._pixel_size.setValidator(QDoubleValidator(0.001, 1000.0, 3))
         self._pixel_size.setFixedWidth(60)
-        form.addRow("Px Size (\u03bcm):", self._pixel_size)
+        form.addRow("Pixel Size (\u03bcm):", self._pixel_size)
         
         layout.addLayout(form)
 
@@ -492,7 +492,7 @@ class InstanSegTab(QWidget):
             "method": "instanseg",
             "channel_indices": [self._channel_combo.currentData()],
             "model_name": self._model_combo.currentText(),
-            "pixel_size": float(self._pixel_size.text() or 0.5),
+            "pixel_size": float(self._pixel_size.text() or 1.0),
         })
 
 class WatershedTab(QWidget):
@@ -554,9 +554,9 @@ class WatershedTab(QWidget):
 
         self._min_mean_intensity = QLineEdit("0")
         self._min_mean_intensity.setValidator(QDoubleValidator(-1000000.0, 1000000.0, 4))
-        self._min_mean_intensity.setFixedWidth(60)
+        self._min_mean_intensity.setFixedWidth(80)
         self._min_mean_intensity.setToolTip("Minimum mean intensity in a cell to keep it.")
-        form.addRow("Min Int:", self._min_mean_intensity)
+        form.addRow("Intensity Threshold:", self._min_mean_intensity)
 
         layout.addLayout(form)
 
@@ -1045,6 +1045,12 @@ class OperationsPanel(QWidget):
         self._stardist_tab.setEnabled(True)
         self._cellpose_tab.setEnabled(True)
         self._instanseg_tab.setEnabled(True)
+        self._watershed_tab.setEnabled(True)
+        self._filter_size_tab.setEnabled(True)
+        self._expansion_tab.setEnabled(True)
+        self._cell_sampler_tab.setEnabled(True)
+        self._pos_run_btn.setEnabled(True)
+        self._progress.setVisible(False)
         self._watershed_tab.setEnabled(True)
         self._filter_size_tab.setEnabled(True)
         self._expansion_tab.setEnabled(True)

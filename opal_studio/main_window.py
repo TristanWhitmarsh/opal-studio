@@ -79,7 +79,7 @@ class MainWindow(QMainWindow):
     # Signals for cross-thread communication
     segmentationResultReady = Signal(object, str, bool, object) # labels, name, is_cell_mask, color
     segmentationError = Signal(str)
-    preprocessingResultReady = Signal(str, object)
+    preprocessingResultReady = Signal(str, str, object) # original_name, suffix, data
     preprocessingError = Signal(str)
 
     def __init__(self):
@@ -384,6 +384,7 @@ class MainWindow(QMainWindow):
                     import cv2
                     filter_type = params["filter_type"]
                     filter_value = params["filter_value"]
+                    suffix = f"_{filter_type.capitalize()}"
                     
                     if filter_type == 'median':
                         # Ensure odd size for medfilt2d
@@ -398,6 +399,7 @@ class MainWindow(QMainWindow):
                 else:
                     from csbdeep.utils import normalize
                     from skimage import exposure
+                    suffix = "_Equal"
                     
                     # 1. Get raw values at percentiles for rescaling
                     p_low_val = np.percentile(data, params["p_low"])
@@ -415,21 +417,22 @@ class MainWindow(QMainWindow):
                     # 4. Rescale back to original intensity range
                     x = x * diff + p_low_val
                 
-                self.preprocessingResultReady.emit(f"Processed: {ch.name}", x)
+                self.preprocessingResultReady.emit(ch.name, suffix, x)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.preprocessingError.emit(str(e))
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_preprocessing_complete(self, name, data):
+    def _on_preprocessing_complete(self, original_name, suffix, data):
         self._ops_panel.stop_loading()
+        new_name = self._channel_model.get_unique_name(f"{original_name}{suffix}")
         new_ch = Channel(
-            name=name, color=QColor(255, 255, 255), visible=True,
+            name=new_name, color=QColor(255, 255, 255), visible=True,
             data_min=float(np.min(data)), data_max=float(np.max(data)),
             is_processed=True, processed_data=data, index=-1
         )
         self._channel_model.add_channel(new_ch)
-        self._status.showMessage(f"Generated: {name}", 3000)
+        self._status.showMessage(f"Generated: {new_name}", 3000)
 
     # ------------------------------------------------------------------
     # Segmentation
@@ -445,7 +448,13 @@ class MainWindow(QMainWindow):
             try:
                 method = params.get("method", "stardist")
                 indices = params["channel_indices"]
-                override_name = ""
+                method_names = {
+                    "stardist": "StarDist",
+                    "cellpose": "Cellpose",
+                    "instanseg": "InstanSeg",
+                    "watershed": "Watershed"
+                }
+                override_name = method_names.get(method, "Mask")
                 x = None
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
@@ -487,7 +496,7 @@ class MainWindow(QMainWindow):
                     if "brightfield" in params["model_name"].lower() and x.ndim == 2:
                         x_input = np.stack([x]*3, axis=-1)
                     
-                    out, _ = model.eval_small_image(x_input, params["pixel_size"])
+                    out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
                     
                     labels_tensor = out[0]
                     if hasattr(labels_tensor, 'cpu'):
@@ -499,12 +508,10 @@ class MainWindow(QMainWindow):
                     if labels_tensor.ndim == 3:
                         # Process extra channels like cells before proceeding with main labels (nuclei)
                         for c in range(1, labels_tensor.shape[0]):
-                           self.segmentationResultReady.emit(labels_tensor[c], "InstanSeg Cells", True, None)
+                           self.segmentationResultReady.emit(labels_tensor[c], override_name, True, None)
                         labels = labels_tensor[0]
-                        override_name = "InstanSeg Nuclei"
                     else:
                         labels = labels_tensor
-                        override_name = "InstanSeg Nuclei"
                 elif method == "watershed":
                     from scipy import ndimage as ndi
                     from skimage.filters import gaussian
@@ -575,7 +582,8 @@ class MainWindow(QMainWindow):
 
     def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None):
         self._ops_panel.stop_loading()
-        mask_name = name if name else f"Mask {self._channel_model.rowCount() + 1}"
+        base_name = name if name else "Mask"
+        mask_name = self._channel_model.get_unique_name(base_name)
         row_color = color if color else QColor(255, 255, 255)
         
         print(f"[DEBUG-STAT] RECEIVED MASK: name={mask_name}, is_cell_mask={is_cell_mask}, min={np.min(labels)}, max={np.max(labels)}")
