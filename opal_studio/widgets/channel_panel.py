@@ -6,7 +6,7 @@ colour swatch, name, and dual-handle range slider.
 from __future__ import annotations
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
 
 from PySide6.QtWidgets import (

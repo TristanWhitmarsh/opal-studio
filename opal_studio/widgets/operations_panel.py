@@ -453,8 +453,8 @@ class InstanSegTab(QWidget):
         self._model_combo.addItems([
             "single_channel_nuclei",
             "fluorescence_nuclei_and_cells",
-            "multi_channel_fluorescence",
-            "brightfield_nuclei"
+            "brightfield_nuclei",
+            "multi_channel_fluorescence"
         ])
         form.addRow("Model:", self._model_combo)
 
@@ -492,6 +492,92 @@ class InstanSegTab(QWidget):
             "method": "instanseg",
             "channel_indices": [self._channel_combo.currentData()],
             "model_name": self._model_combo.currentText(),
+            "pixel_size": float(self._pixel_size.text() or 1.0),
+        })
+
+class MesmerTab(QWidget):
+    """Sub-widget for Mesmer (DeepCell) segmentation parameters."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # Model Parameters
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+
+        # Nuclear Channel
+        self._nuclear_combo = QComboBox()
+        self._nuclear_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._nuclear_combo.setMinimumWidth(50)
+        form.addRow("Nuclear:", self._nuclear_combo)
+
+        # Membrane Channel
+        self._membrane_combo = QComboBox()
+        self._membrane_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._membrane_combo.setMinimumWidth(50)
+        form.addRow("Membrane:", self._membrane_combo)
+
+        # API Key
+        self._api_key = QLineEdit("0eJIjCpR.fYenvVnMb4ZAKCjxYnjZ1R2V6kvLdq5V")
+        self._api_key.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        form.addRow("API Key:", self._api_key)
+
+        # Pixel Size
+        self._pixel_size = QLineEdit("1.0")
+        self._pixel_size.setValidator(QDoubleValidator(0.001, 1000.0, 3))
+        self._pixel_size.setFixedWidth(60)
+        form.addRow("Pixel Size (\u03bcm):", self._pixel_size)
+        
+        layout.addLayout(form)
+
+        # Run Button
+        self._run_btn = QPushButton("Run Mesmer")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+
+        self._refresh_channels()
+        self._channel_model.modelReset.connect(self._refresh_channels)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+
+    def _refresh_channels(self):
+        n_current = self._nuclear_combo.currentText()
+        m_current = self._membrane_combo.currentText()
+        self._nuclear_combo.clear()
+        self._membrane_combo.clear()
+        self._membrane_combo.addItem("None", -1)
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.is_mask:
+                self._nuclear_combo.addItem(ch.name, i)
+                self._membrane_combo.addItem(ch.name, i)
+        
+        ni = self._nuclear_combo.findText(n_current)
+        if ni >= 0: self._nuclear_combo.setCurrentIndex(ni)
+        mi = self._membrane_combo.findText(m_current)
+        if mi >= 0: self._membrane_combo.setCurrentIndex(mi)
+
+    def _on_run(self):
+        if self._nuclear_combo.currentIndex() < 0: return
+        
+        indices = [self._nuclear_combo.currentData()]
+        if self._membrane_combo.currentData() != -1:
+            indices.append(self._membrane_combo.currentData())
+            
+        self.runRequested.emit({
+            "method": "mesmer",
+            "channel_indices": indices,
+            "api_key": self._api_key.text(),
             "pixel_size": float(self._pixel_size.text() or 1.0),
         })
 
@@ -819,7 +905,7 @@ class CellSamplerTab(QWidget):
 class OperationsPanel(QWidget):
     """Right-side panel with collapsible sections for Pre-processing and Segmentation."""
 
-    WIDTH = 340
+    WIDTH = 420
     runPreprocessingRequested = Signal(dict)
     runSegmentationRequested = Signal(dict)
     runMaskProcessingRequested = Signal(dict)
@@ -900,6 +986,9 @@ class OperationsPanel(QWidget):
         self._instanseg_tab = InstanSegTab(self._channel_model)
         self._instanseg_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._instanseg_tab, self._spacer_icon, "InstanSeg")
+        self._mesmer_tab = MesmerTab(self._channel_model)
+        self._mesmer_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._mesmer_tab, self._spacer_icon, "Mesmer")
         self._watershed_tab = WatershedTab(self._channel_model)
         self._watershed_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._watershed_tab, self._spacer_icon, "Watershed")

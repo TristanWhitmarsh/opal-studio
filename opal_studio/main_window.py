@@ -141,7 +141,7 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(0, 0) # channel
         self._splitter.setStretchFactor(1, 1) # canvas
         self._splitter.setStretchFactor(2, 0) # operations
-        self._splitter.setSizes([300, 760, 340])
+        self._splitter.setSizes([300, 680, 420])
         self._splitter.setCollapsible(2, False)
         
         self.setCentralWidget(self._splitter)
@@ -473,6 +473,7 @@ class MainWindow(QMainWindow):
                 override_name = method_names.get(method, "Mask")
                 x = None
                 contour_data = None
+                input_channels_data = []
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
                     if ch.is_processed and ch.processed_data is not None:
@@ -483,9 +484,49 @@ class MainWindow(QMainWindow):
                     # Normalize for deep learning models to prevent NMS hangs or junk results
                     p = np.percentile(raw, (1, 99.8))
                     data = np.clip((raw - p[0]) / (p[1] - p[0] + 1e-6), 0, 1)
+                    input_channels_data.append(data)
                     x = data if x is None else x + data
                 
-                if method == "stardist":
+                if method == "mesmer":
+                    from deepcell.applications import Mesmer
+                    
+                    # Set API key for authentication
+                    if params.get("api_key"):
+                        os.environ["DEEPCELL_ACCESS_TOKEN"] = params["api_key"]
+                    
+                    app = Mesmer()
+                    
+                    # Mesmer expects [nuclear, membrane]
+                    n_data = input_channels_data[0]
+                    if len(input_channels_data) > 1:
+                        m_data = input_channels_data[1]
+                    else:
+                        m_data = np.zeros_like(n_data)
+                        
+                    # Prepare input: (Batch, H, W, 2)
+                    input_stack = np.stack([n_data, m_data], axis=-1)
+                    input_stack = np.expand_dims(input_stack, axis=0) # add batch dim
+                    
+                    # Predict: returns (Batch, H, W, 2) where 0=cell, 1=nuclei
+                    labeled_combined = app.predict(input_stack, image_mpp=params.get("pixel_size", 1.0))
+                    
+                    if labeled_combined.shape[-1] >= 2:
+                        cell_labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
+                        nuc_labels = np.squeeze(labeled_combined[0, ..., 1]).astype(np.int32)
+                        
+                        # Emit cell labels as a side result if they exist
+                        if cell_labels.max() > 0:
+                            cell_contour = self._get_contour_data(cell_labels)
+                            self.segmentationResultReady.emit(cell_labels, "Mesmer Cells", True, None, cell_contour, "", False)
+                        
+                        labels = nuc_labels
+                        override_name = "Mesmer Nuclei"
+                    else:
+                        # Only one channel returned
+                        labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
+                        override_name = "Mesmer Mask"
+
+                elif method == "stardist":
                     from stardist.models import StarDist2D
                     model_folder = params.get("model_folder", params["model_name"])
                     model_path = os.path.join(os.getcwd(), "models", model_folder)
@@ -517,7 +558,15 @@ class MainWindow(QMainWindow):
                 elif method == "instanseg":
                     from instanseg import InstanSeg
                     import torch
-                    model = InstanSeg(params["model_name"])
+                    
+                    model_name = params["model_name"]
+                    # Use local pre-downloaded model directory if available
+                    local_model_dir = os.path.join(os.getcwd(), "models", "instanseg", model_name)
+                    if os.path.exists(os.path.join(local_model_dir, "instanseg.pt")):
+                        model_name = local_model_dir
+                        print(f"[InstanSeg] Using local model directory: {model_name}")
+                    
+                    model = InstanSeg(model_name)
                     x_input = x
                     if "brightfield" in params["model_name"].lower() and x.ndim == 2:
                         x_input = np.stack([x]*3, axis=-1)
@@ -637,6 +686,11 @@ class MainWindow(QMainWindow):
         )
         self._channel_model.add_channel(new_ch)
         self._status.showMessage(f"Task Complete: {mask_name}", 5000)
+
+    @Slot(str)
+    def _on_segmentation_error(self, message):
+        self._ops_panel.stop_loading()
+        QMessageBox.critical(self, "Task Error", message)
 
     @Slot(dict)
     def _run_mask_expansion(self, params):
