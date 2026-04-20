@@ -796,7 +796,7 @@ class MainWindow(QMainWindow):
                     return
                 
                 print(f"[AI] Loading model: {model_path}")
-                model = tf.keras.models.load_model(model_path)
+                model = tf.keras.models.load_model(model_path, compile=False)
                 
                 PATCH_SIZE = 64
                 THRESHOLD = 0.5
