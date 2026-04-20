@@ -127,11 +127,11 @@ class MainWindow(QMainWindow):
         self._center_tabs = QTabWidget()
         
         # Inject an invisible native icon to force the tab bar to draw taller, preventing cut-off text
-        spacer_pixmap = QPixmap(1, 20)
+        spacer_pixmap = QPixmap(1, 24)
         spacer_pixmap.fill(Qt.GlobalColor.transparent)
         spacer_icon = QIcon(spacer_pixmap)
         
-        self._center_tabs.setIconSize(QSize(1, 20))
+        self._center_tabs.setIconSize(QSize(1, 24))
         self._center_tabs.addTab(self._canvas, spacer_icon, "Image")
         self._center_tabs.addTab(self._phenotyping_tab, spacer_icon, "Phenotyping")
         self._splitter.addWidget(self._center_tabs)
@@ -387,53 +387,79 @@ class MainWindow(QMainWindow):
         if not self._image: return
         def _run():
             try:
-                idx = params["channel_index"]
-                ch = self._channel_model.channel(idx)
-                
-                # Check if we should use memory-cached data or disk data
-                if ch.is_processed and ch.processed_data is not None:
-                    data = ch.processed_data.astype(np.float32)
-                else:
-                    data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
-                
-                if params.get("is_filter"):
-                    import cv2
-                    filter_type = params["filter_type"]
-                    filter_value = params["filter_value"]
-                    suffix = f"_{filter_type.capitalize()}"
+                if params.get("is_merge"):
+                    idx1 = params["channel1_index"]
+                    idx2 = params["channel2_index"]
+                    ch1 = self._channel_model.channel(idx1)
+                    ch2 = self._channel_model.channel(idx2)
                     
-                    if filter_type == 'median':
-                        # Use a disk/elliptical footprint for smoother results
-                        footprint = disk(max(1, filter_value // 2))
-                        x = ndi.median_filter(data, footprint=footprint, mode='reflect')
-                    elif filter_type == 'opening':
-                        # The user expects this filter to perform noise removal (subtraction).
-                        # Mathematically, this is an Opening operation.
-                        x = opening(data, footprint=disk(max(1, filter_value // 2)))
+                    if ch1.is_processed and ch1.processed_data is not None:
+                        data1 = ch1.processed_data.astype(np.float32)
                     else:
-                        x = data
+                        data1 = self._image.get_full_channel_data(ch1.index, level=0).astype(np.float32)
+                        
+                    if ch2.is_processed and ch2.processed_data is not None:
+                        data2 = ch2.processed_data.astype(np.float32)
+                    else:
+                        data2 = self._image.get_full_channel_data(ch2.index, level=0).astype(np.float32)
+                        
+                    x = (data1 + data2) / 2.0
+                    suffix = "_Merge"
+                    original_name = f"{ch1.name}_{ch2.name}"
                 else:
-                    from csbdeep.utils import normalize
-                    from skimage import exposure
-                    suffix = "_Equal"
+                    idx = params["channel_index"]
+                    ch = self._channel_model.channel(idx)
+                    original_name = ch.name
                     
-                    # 1. Get raw values at percentiles for rescaling
-                    p_low_val = np.percentile(data, params["p_low"])
-                    p_high_val = np.percentile(data, params["p_high"])
-                    diff = p_high_val - p_low_val if p_high_val > p_low_val else 1.0
+                    # Check if we should use memory-cached data or disk data
+                    if ch.is_processed and ch.processed_data is not None:
+                        data = ch.processed_data.astype(np.float32)
+                    else:
+                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
                     
-                    # 2. Normalize to [0, 1]
-                    x = (data - p_low_val) / diff
-                    x = np.clip(x, 0.0, 1.0)
-                    
-                    # 3. Apply CLAHE
-                    if params["apply_clahe"]:
-                        x = exposure.equalize_adapthist(x, kernel_size=params["clahe_kernel"], clip_limit=params["clahe_clip"]).astype(np.float32)
-                    
-                    # 4. Rescale back to original intensity range
-                    x = x * diff + p_low_val
+                    if params.get("is_filter"):
+                        import cv2
+                        filter_type = params["filter_type"]
+                        filter_value = params["filter_value"]
+                        
+                        if filter_type == 'median':
+                            suffix = "_Median"
+                            # Use a disk/elliptical footprint for smoother results
+                            footprint = disk(max(1, filter_value // 2))
+                            x = ndi.median_filter(data, footprint=footprint, mode='reflect')
+                        elif filter_type == 'opening':
+                            suffix = "_Open"
+                            # The user expects this filter to perform noise removal (subtraction).
+                            # Mathematically, this is an Opening operation.
+                            x = opening(data, footprint=disk(max(1, filter_value // 2)))
+                        else:
+                            suffix = f"_{filter_type.capitalize()}"
+                            x = data
+                    else:
+                        from csbdeep.utils import normalize
+                        from skimage import exposure
+                        suffix = "_Equal"
+                        
+                        # 1. Get raw values at percentiles for rescaling
+                        p_low_val = np.percentile(data, params["p_low"])
+                        p_high_val = np.percentile(data, params["p_high"])
+                        diff = p_high_val - p_low_val if p_high_val > p_low_val else 1.0
+                        
+                        # 2. Normalize to [0, 1]
+                        x = (data - p_low_val) / diff
+                        x = np.clip(x, 0.0, 1.0)
+                        
+                        # 3. Apply CLAHE
+                        if params["apply_clahe"]:
+                            x = exposure.equalize_adapthist(x, kernel_size=params["clahe_kernel"], clip_limit=params["clahe_clip"]).astype(np.float32)
+                        
+                        # 4. Rescale back to original intensity range
+                        x = x * diff + p_low_val
                 
-                self.preprocessingResultReady.emit(ch.name, suffix, x, ch.data_min, ch.data_max)
+                # Use full range for pre-processed image rendering
+                data_min, data_max = float(np.min(x)), float(np.max(x))
+                
+                self.preprocessingResultReady.emit(original_name, suffix, x, data_min, data_max)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.preprocessingError.emit(str(e))
@@ -715,10 +741,12 @@ class MainWindow(QMainWindow):
                     
                     carray = np.stack(labels_list)
                     merit = params.get("merit", "pop")
-                    
                     joint_mask, method_mask = UBM(carray).form_um(merit=merit, nsize=80)
                     mask_result = joint_mask.astype(np.int32)
-                    new_name = f"Sampled Mask ({merit})"
+                    
+                    merit_suffixes = {"pop": "_Count", "j1": "_Jac", "cstd": "_Var"}
+                    suffix = merit_suffixes.get(merit, f"_{merit}")
+                    new_name = f"Sampled{suffix}"
                     
                     contour_data = self._get_contour_data(mask_result)
                     self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False)
@@ -747,7 +775,7 @@ class MainWindow(QMainWindow):
                     expansion_pixels = params["expansion_pixels"]
                     expanded = expand_labels_watershed(labels, expansion_pixels)
                     mask_result = expanded.astype(np.int32)
-                    new_name = f"{original_mask_ch.name} +Exp{expansion_pixels}"
+                    new_name = f"{original_mask_ch.name}_Expand"
                 elif tool == "filter_size":
                     min_size = params["min_size"]
                     max_size = params["max_size"]
@@ -762,7 +790,7 @@ class MainWindow(QMainWindow):
                     mapper[valid_labels] = valid_labels
                     mask_result = mapper[labels]
                     
-                    new_name = f"{original_mask_ch.name} Filtered"
+                    new_name = f"{original_mask_ch.name}_Filter"
                 
                 contour_data = self._get_contour_data(mask_result)
                 self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask)

@@ -243,6 +243,77 @@ class FilterTab(QWidget):
         super().setEnabled(enabled)
         self._run_btn.setEnabled(enabled)
 
+class MergeTab(QWidget):
+    """Averaging two channels."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+        
+        # Channel 1 Selector
+        self._channel1_combo = QComboBox()
+        self._channel1_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel1_combo.setMinimumWidth(50)
+        form.addRow("Channel 1:", self._channel1_combo)
+
+        # Channel 2 Selector
+        self._channel2_combo = QComboBox()
+        self._channel2_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel2_combo.setMinimumWidth(50)
+        form.addRow("Channel 2:", self._channel2_combo)
+
+        layout.addLayout(form)
+        
+        self._run_btn = QPushButton("Run Merge")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+        layout.addStretch()
+
+        self._refresh_channels()
+        self._channel_model.modelReset.connect(self._refresh_channels)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+
+    def _refresh_channels(self):
+        c1_current = self._channel1_combo.currentText()
+        c2_current = self._channel2_combo.currentText()
+        self._channel1_combo.clear()
+        self._channel2_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.is_mask:
+                self._channel1_combo.addItem(ch.name, i)
+                self._channel2_combo.addItem(ch.name, i)
+        
+        idx1 = self._channel1_combo.findText(c1_current)
+        if idx1 >= 0: self._channel1_combo.setCurrentIndex(idx1)
+        
+        idx2 = self._channel2_combo.findText(c2_current)
+        if idx2 >= 0: self._channel2_combo.setCurrentIndex(idx2)
+
+    def _on_run(self):
+        if self._channel1_combo.currentIndex() < 0: return
+        if self._channel2_combo.currentIndex() < 0: return
+        self.runRequested.emit({
+            "is_merge": True,
+            "channel1_index": self._channel1_combo.currentData(),
+            "channel2_index": self._channel2_combo.currentData(),
+        })
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._run_btn.setEnabled(enabled)
+
 class StarDistTab(QWidget):
     """Sub-widget for StarDist segmentation parameters."""
     runRequested = Signal(dict)
@@ -712,12 +783,12 @@ class MaskFilterSizeTab(QWidget):
         self._min_size = QLineEdit("10")
         self._min_size.setValidator(QIntValidator(0, 1000000))
         self._min_size.setFixedWidth(60)
-        form.addRow("Min:", self._min_size)
+        form.addRow("Min size:", self._min_size)
 
         self._max_size = QLineEdit("1000")
         self._max_size.setValidator(QIntValidator(0, 1000000))
         self._max_size.setFixedWidth(60)
-        form.addRow("Max:", self._max_size)
+        form.addRow("Max size:", self._max_size)
 
         layout.addLayout(form)
 
@@ -846,9 +917,9 @@ class CellSamplerTab(QWidget):
         self._strategy_combo = QComboBox()
         self._strategy_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._strategy_combo.setMinimumWidth(50)
-        self._strategy_combo.addItem("Largest cell count (pop)", "pop")
-        self._strategy_combo.addItem("Highest Jaccard (j1)", "j1")
-        self._strategy_combo.addItem("Min area variance (cstd)", "cstd")
+        self._strategy_combo.addItem("Largest cell count", "pop")
+        self._strategy_combo.addItem("Highest Jaccard", "j1")
+        self._strategy_combo.addItem("Min area variance", "cstd")
         form.addRow("Strategy:", self._strategy_combo)
 
         layout.addLayout(form)
@@ -934,7 +1005,7 @@ class OperationsPanel(QWidget):
         self._container_layout.setSpacing(0)
         
         # Inject an invisible native icon to force the tab bar to draw taller, preventing cut-off text
-        spacer_pixmap = QPixmap(1, 20)
+        spacer_pixmap = QPixmap(1, 24)
         spacer_pixmap.fill(Qt.GlobalColor.transparent)
         self._spacer_icon = QIcon(spacer_pixmap)
 
@@ -958,17 +1029,20 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Pre-processing", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        # Tabs for Equalize vs Filter
+        # Tabs for Equalize vs Filter vs Merge
         self._pre_tabs = OperationsTabWidget()
-        self._pre_tabs.setIconSize(QSize(1, 20))
+        self._pre_tabs.setIconSize(QSize(1, 24))
         self._equalize_tab = EqualizeTab(self._channel_model)
         self._filter_tab = FilterTab(self._channel_model)
+        self._merge_tab = MergeTab(self._channel_model)
         
         self._equalize_tab.runRequested.connect(self._on_run_preprocessing)
         self._filter_tab.runRequested.connect(self._on_run_preprocessing)
+        self._merge_tab.runRequested.connect(self._on_run_preprocessing)
         
         self._pre_tabs.addTab(self._equalize_tab, self._spacer_icon, "Equalize")
         self._pre_tabs.addTab(self._filter_tab, self._spacer_icon, "Filter")
+        self._pre_tabs.addTab(self._merge_tab, self._spacer_icon, "Merge")
         panel.addWidget(self._pre_tabs)
 
     def _setup_segmentation_section(self):
@@ -976,7 +1050,7 @@ class OperationsPanel(QWidget):
         self._container_layout.addWidget(panel)
 
         self._seg_tabs = OperationsTabWidget()
-        self._seg_tabs.setIconSize(QSize(1, 20))
+        self._seg_tabs.setIconSize(QSize(1, 24))
         self._stardist_tab = StarDistTab(self._channel_model)
         self._stardist_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._stardist_tab, self._spacer_icon, "StarDist")
@@ -999,11 +1073,11 @@ class OperationsPanel(QWidget):
         self._container_layout.addWidget(panel)
 
         self._mask_tabs = OperationsTabWidget()
-        self._mask_tabs.setIconSize(QSize(1, 20))
+        self._mask_tabs.setIconSize(QSize(1, 24))
         
         self._filter_size_tab = MaskFilterSizeTab(self._channel_model)
         self._filter_size_tab.runRequested.connect(self._on_run_mask_processing)
-        self._mask_tabs.addTab(self._filter_size_tab, self._spacer_icon, "Size")
+        self._mask_tabs.addTab(self._filter_size_tab, self._spacer_icon, "Filter")
         
         self._cell_sampler_tab = CellSamplerTab(self._channel_model)
         self._cell_sampler_tab.runRequested.connect(self._on_run_mask_processing)
@@ -1020,6 +1094,7 @@ class OperationsPanel(QWidget):
         self._container_layout.addWidget(panel)
 
         self._pos_tabs = OperationsTabWidget()
+        self._pos_tabs.setIconSize(QSize(1, 24))
         
         # AI Tab
         ai_tab = QWidget()
@@ -1077,6 +1152,7 @@ class OperationsPanel(QWidget):
         self._container_layout.addWidget(panel)
 
         self._ident_tabs = OperationsTabWidget()
+        self._ident_tabs.setIconSize(QSize(1, 24))
         
         # Gating Tab
         gating_tab = QWidget()

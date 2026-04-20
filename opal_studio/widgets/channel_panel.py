@@ -46,10 +46,10 @@ class ChannelPanel(QWidget):
 
         # Tabbed interface
         self._tabs = QTabWidget()
-        self._tabs.setIconSize(QSize(1, 20))
+        self._tabs.setIconSize(QSize(1, 24))
         
         # Inject an invisible native icon to force the tab bar to draw taller, preventing cut-off text
-        spacer_pixmap = QPixmap(1, 20)
+        spacer_pixmap = QPixmap(1, 24)
         spacer_pixmap.fill(Qt.GlobalColor.transparent)
         self._spacer_icon = QIcon(spacer_pixmap)
         
