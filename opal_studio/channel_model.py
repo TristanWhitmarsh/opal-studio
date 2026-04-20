@@ -13,6 +13,7 @@ from typing import List
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QColor
 import colorsys
+import numpy as np
 
 
 def generate_spaced_colors(target_count=100):
@@ -90,7 +91,9 @@ class Channel:
     is_processed: bool = False
     processed_data: np.ndarray | None = None
     mask_data: np.ndarray | None = None
+    contour_data: np.ndarray | None = None
     alpha: float = 1.0
+    contour_visible: bool = False
 
 
 class ChannelListModel(QAbstractListModel):
@@ -111,6 +114,7 @@ class ChannelListModel(QAbstractListModel):
     RangeMaxRole = Qt.UserRole + 5
     SelectedRole = Qt.UserRole + 6
     AlphaRole = Qt.UserRole + 7
+    ContourVisibleRole = Qt.UserRole + 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -162,7 +166,7 @@ class ChannelListModel(QAbstractListModel):
         return self._channels[row]
 
     def visible_channels(self) -> List[Channel]:
-        return [c for c in self._channels if c.visible]
+        return [c for c in self._channels if c.visible or c.contour_visible]
 
     def selected_channel(self) -> Channel | None:
         for c in self._channels:
@@ -207,6 +211,7 @@ class ChannelListModel(QAbstractListModel):
         ch = self._channels.pop(row)
         # Free heavy data
         ch.mask_data = None
+        ch.contour_data = None
         ch.processed_data = None
         self.endRemoveRows()
         self.channels_changed.emit()
@@ -236,6 +241,8 @@ class ChannelListModel(QAbstractListModel):
             return ch.selected
         if role == self.AlphaRole:
             return ch.alpha
+        if role == self.ContourVisibleRole:
+            return ch.contour_visible
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
@@ -261,6 +268,8 @@ class ChannelListModel(QAbstractListModel):
             ch.color = value
         elif role == self.AlphaRole:
             ch.alpha = float(value)
+        elif role == self.ContourVisibleRole:
+            ch.contour_visible = bool(value)
         else:
             return False
         self.dataChanged.emit(index, index, [role])
@@ -279,4 +288,5 @@ class ChannelListModel(QAbstractListModel):
             self.RangeMaxRole: b"rangeMax",
             self.SelectedRole: b"selected",
             self.AlphaRole: b"alpha",
+            self.ContourVisibleRole: b"contourVisible",
         }

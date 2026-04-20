@@ -117,45 +117,39 @@ def _render_multichannel(
         if raw.shape[:2] != (h, w):
             raw = resize(raw, (h, w), order=0, preserve_range=True)
 
-        if ch.is_mask:
-            labels = raw.astype(np.int32)
-            mask_active = labels > 0
-            if np.any(mask_active):
-                import random as py_random
-                rng = py_random.Random()
-                alpha_mask = ch.range_max
-                
-                # Identify unique cells in this tile
-                unique_ids = np.unique(labels[mask_active])
-                max_id = int(np.max(unique_ids))
-                
-                # Vectorized color assignment via LUT
-                if max_id < 2000000:
-                    lut = np.zeros((max_id + 1, 3), dtype=np.float32)
-                    for lid in unique_ids:
-                        rng.seed(int(lid))
-                        lut[lid] = [rng.random(), rng.random(), rng.random()]
-                    
-                    canvas[mask_active] = (1.0 - alpha_mask) * canvas[mask_active] + alpha_mask * lut[labels[mask_active]]
-                else:
-                    # Fallback for sparse high-value labels
-                    for lid in unique_ids:
-                        rng.seed(int(lid))
-                        col = np.array([rng.random(), rng.random(), rng.random()], dtype=np.float32)
-                        canvas[labels == lid] = (1.0 - alpha_mask) * canvas[labels == lid] + alpha_mask * col
-        elif ch.is_cell_mask:
-            # Cell positivity rendering: 1 = green, 2 = red
-            alpha_mask = ch.range_max
-            mask_1 = raw == 1
-            mask_2 = raw == 2
-            
-            if np.any(mask_1):
-                color_green = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                canvas[mask_1] = (1.0 - alpha_mask) * canvas[mask_1] + alpha_mask * color_green
-                
-            if np.any(mask_2):
-                color_red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-                canvas[mask_2] = (1.0 - alpha_mask) * canvas[mask_2] + alpha_mask * color_red
+        if ch.is_mask or ch.is_cell_mask:
+            # 1. Handle Mask Fill
+            if ch.visible and ch.mask_data is not None:
+                labels = raw.astype(np.int32)
+                mask_active = labels > 0
+                if np.any(mask_active):
+                    alpha_mask = ch.range_max
+                    if ch.is_mask:
+                        import random as py_random
+                        rng = py_random.Random()
+                        unique_ids = np.unique(labels[mask_active])
+                        max_id = int(np.max(unique_ids))
+                        
+                        if max_id < 2000000:
+                            lut = np.zeros((max_id + 1, 3), dtype=np.float32)
+                            for lid in unique_ids:
+                                rng.seed(int(lid))
+                                lut[lid] = [rng.random(), rng.random(), rng.random()]
+                            canvas[mask_active] = (1.0 - alpha_mask) * canvas[mask_active] + alpha_mask * lut[labels[mask_active]]
+                        else:
+                            for lid in unique_ids:
+                                rng.seed(int(lid))
+                                col = np.array([rng.random(), rng.random(), rng.random()], dtype=np.float32)
+                                canvas[labels == lid] = (1.0 - alpha_mask) * canvas[labels == lid] + alpha_mask * col
+                    else: # is_cell_mask
+                        mask_1 = labels == 1
+                        mask_2 = labels == 2
+                        if np.any(mask_1):
+                            color_green = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                            canvas[mask_1] = (1.0 - alpha_mask) * canvas[mask_1] + alpha_mask * color_green
+                        if np.any(mask_2):
+                            color_red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                            canvas[mask_2] = (1.0 - alpha_mask) * canvas[mask_2] + alpha_mask * color_red
         else:
             # Normal intensity channel rendering
             dmin, dmax = ch.data_min, ch.data_max

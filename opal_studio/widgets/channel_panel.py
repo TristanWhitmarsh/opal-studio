@@ -54,8 +54,13 @@ class ChannelPanel(QWidget):
         self._spacer_icon = QIcon(spacer_pixmap)
         
         # Cache toggle icons
-        self._eye_icon = QIcon(str(Path(__file__).resolve().parent.parent / "icons" / "eye.png"))
-        self._delete_icon = QIcon(str(Path(__file__).resolve().parent.parent / "icons" / "delete.png"))
+        icons_dir = Path(__file__).resolve().parent.parent / "icons"
+        self._eye_open_icon = QIcon(str(icons_dir / "eye_open.png"))
+        self._eye_closed_icon = QIcon(str(icons_dir / "eye_closed.png"))
+        self._contour_open_icon = QIcon(str(icons_dir / "eye_open_contour.png"))
+        self._contour_closed_icon = QIcon(str(icons_dir / "eye_closed_contour.png"))
+        self._delete_icon = QIcon(str(icons_dir / "delete.png"))
+        
         dash_pix = QPixmap(16, 16)
         dash_pix.fill(Qt.GlobalColor.transparent)
         p = QPainter(dash_pix)
@@ -301,10 +306,26 @@ class ChannelPanel(QWidget):
         eye_btn.setFixedSize(24, 24)
         eye_btn.setCheckable(True)
         eye_btn.setChecked(ch.visible)
-        eye_btn.setIcon(self._eye_icon if ch.visible else self._dash_icon)
+        
+        if ch.is_mask or ch.is_cell_mask:
+            eye_btn.setIcon(self._eye_open_icon if ch.visible else self._eye_closed_icon)
+        else:
+            eye_btn.setIcon(self._eye_open_icon if ch.visible else self._dash_icon)
+            
         eye_btn.setIconSize(QSize(16, 16))
-        eye_btn.clicked.connect(lambda checked, r=row, b=eye_btn: self._toggle_vis(r, checked, b))
+        eye_btn.clicked.connect(lambda checked, r=row: self._toggle_vis(r, checked))
         top.addWidget(eye_btn)
+
+        # Contour toggle (only for masks)
+        if ch.is_mask or ch.is_cell_mask:
+            contour_btn = QPushButton()
+            contour_btn.setFixedSize(24, 24)
+            contour_btn.setCheckable(True)
+            contour_btn.setChecked(ch.contour_visible)
+            contour_btn.setIcon(self._contour_open_icon if ch.contour_visible else self._contour_closed_icon)
+            contour_btn.setIconSize(QSize(16, 16))
+            contour_btn.clicked.connect(lambda checked, r=row: self._toggle_contour_vis(r, checked))
+            top.addWidget(contour_btn)
 
         # Colour swatch
         if not ch.is_cell_mask and not ch.is_mask:
@@ -397,22 +418,39 @@ class ChannelPanel(QWidget):
             self._cell_opacity_slider.blockSignals(False)
 
     def _on_data_changed(self, top_left, bottom_right, roles):
-        if ChannelListModel.VisibleRole in roles:
-            row = top_left.row()
+        row = top_left.row()
+        if ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles:
             if 0 <= row < len(self._row_widgets):
                 ch = self._model.channel(row)
                 frame = self._row_widgets[row]
                 try:
-                    btn = frame.layout().itemAt(0).layout().itemAt(0).widget()
-                    if isinstance(btn, QPushButton) and btn.isCheckable():
-                        btn.setChecked(ch.visible)
-                        btn.setIcon(self._eye_icon if ch.visible else self._dash_icon)
+                    top_layout = frame.layout().itemAt(0).layout()
+                    
+                    # 1. Update Eye Toggle
+                    eye_btn = top_layout.itemAt(0).widget()
+                    if isinstance(eye_btn, QPushButton):
+                        eye_btn.setChecked(ch.visible)
+                        if ch.is_mask or ch.is_cell_mask:
+                            eye_btn.setIcon(self._eye_open_icon if ch.visible else self._eye_closed_icon)
+                        else:
+                            eye_btn.setIcon(self._eye_open_icon if ch.visible else self._dash_icon)
+                    
+                    # 2. Update Contour Toggle
+                    if ch.is_mask or ch.is_cell_mask:
+                        contour_btn = top_layout.itemAt(1).widget()
+                        if isinstance(contour_btn, QPushButton):
+                            contour_btn.setChecked(ch.contour_visible)
+                            contour_btn.setIcon(self._contour_open_icon if ch.contour_visible else self._contour_closed_icon)
                 except Exception:
                     pass
 
-    def _toggle_vis(self, row: int, checked: bool, btn: QPushButton):
+    def _toggle_vis(self, row: int, checked: bool):
         idx = self._model.index(row)
         self._model.setData(idx, checked, ChannelListModel.VisibleRole)
+
+    def _toggle_contour_vis(self, row: int, checked: bool):
+        idx = self._model.index(row)
+        self._model.setData(idx, checked, ChannelListModel.ContourVisibleRole)
 
     def _range_changed(self, row: int, mn: float, mx: float):
         idx = self._model.index(row)

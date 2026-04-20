@@ -14,8 +14,10 @@ import colorsys
 import xml.etree.ElementTree as ET
 import numpy as np
 import tifffile
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QSize
-from PySide6.QtGui import QAction, QColor, QPixmap, QIcon
+from PySide6.QtCore import Qt, Slot, QPoint, QSize, Signal, QPointF, QTimer
+from PySide6.QtGui import (
+     QImage, QPainter, QPixmap, QColor, QIcon, QPolygonF, QAction
+)
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QSplitter, QWidget,
     QHBoxLayout, QStatusBar, QMessageBox, QTabWidget
@@ -29,8 +31,9 @@ from opal_studio.widgets.operations_panel import OperationsPanel
 from opal_studio.widgets.phenotyping_tab import PhenotypingTab
 
 import scipy.ndimage as ndi
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, find_objects
 from skimage.segmentation import watershed, find_boundaries
+from skimage.measure import find_contours
 
 def expand_labels_watershed(labels, expansion_pixels=6):
     """
@@ -78,7 +81,7 @@ class MainWindow(QMainWindow):
     """Top-level window for Opal Studio."""
 
     # Signals for cross-thread communication
-    segmentationResultReady = Signal(object, str, bool, object) # labels, name, is_cell_mask, color
+    segmentationResultReady = Signal(object, str, bool, object, object) # labels, name, is_cell_mask, color, contour_data
     segmentationError = Signal(str)
     preprocessingResultReady = Signal(str, str, object) # original_name, suffix, data
     preprocessingError = Signal(str)
@@ -317,6 +320,7 @@ class MainWindow(QMainWindow):
                     elif is_reg_mask: clean_name = name[len("Mask: "):]
                     
                     mask_data = data[i].astype(np.int32)
+                    contour_data = self._get_contour_data(mask_data)
                     
                     new_ch = Channel(
                         name=clean_name,
@@ -325,6 +329,7 @@ class MainWindow(QMainWindow):
                         is_mask=(not final_is_cell),
                         is_cell_mask=final_is_cell,
                         mask_data=mask_data,
+                        contour_data=contour_data,
                         index=-1
                     )
                     self._channel_model.add_channel(new_ch)
@@ -579,7 +584,10 @@ class MainWindow(QMainWindow):
 
                     print(f"[StarDist] Inference finished. Result shape: {labels.shape}")
                     
-                self.segmentationResultReady.emit(labels, override_name, False, None)
+                    # Pre-calculate contours in worker thread
+                    contour_data = self._get_contour_data(labels.astype(np.int32))
+                    
+                self.segmentationResultReady.emit(labels, override_name, False, None, contour_data)
                 print(f"[Segmentation] Result emitted.")
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -588,7 +596,7 @@ class MainWindow(QMainWindow):
         self._segmentation_thread = threading.Thread(target=_run, daemon=True)
         self._segmentation_thread.start()
 
-    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None):
+    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None, contour_data=None):
         self._ops_panel.stop_loading()
         base_name = name if name else "Mask"
         mask_name = self._channel_model.get_unique_name(base_name)
@@ -596,10 +604,16 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG-STAT] RECEIVED MASK: name={mask_name}, is_cell_mask={is_cell_mask}, min={np.min(labels)}, max={np.max(labels)}")
         
+        mask_data = labels.astype(np.int32)
+        if contour_data is None:
+            contour_data = self._get_contour_data(mask_data)
+
         new_ch = Channel(
             name=mask_name, color=row_color, visible=True,
             is_mask=(not is_cell_mask), is_cell_mask=is_cell_mask,
-            mask_data=labels.astype(np.int32), index=-1
+            mask_data=mask_data,
+            contour_data=contour_data,
+            index=-1
         )
         self._channel_model.add_channel(new_ch)
         self._status.showMessage(f"Task Complete: {mask_name}", 5000)
@@ -632,7 +646,8 @@ class MainWindow(QMainWindow):
                     mask_result = joint_mask.astype(np.int32)
                     new_name = f"Sampled Mask ({merit})"
                     
-                    self.segmentationResultReady.emit(mask_result, new_name, False, None)
+                    contour_data = self._get_contour_data(mask_result)
+                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data)
                 except Exception as e:
                     import traceback; traceback.print_exc()
                     self.segmentationError.emit(str(e))
@@ -675,7 +690,8 @@ class MainWindow(QMainWindow):
                     
                     new_name = f"{original_mask_ch.name} Filtered"
                 
-                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color)
+                contour_data = self._get_contour_data(mask_result)
+                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))
@@ -863,3 +879,41 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         super().closeEvent(event)
+
+    def _get_contour_data(self, labels: np.ndarray) -> dict:
+        """Generate vector contours from a label image (Pre-cached as QPolygonF)."""
+        try:
+            objs = find_objects(labels)
+            contour_data = {}
+            
+            for i, loc in enumerate(objs):
+                if loc is None: continue
+                label_id = i + 1
+                
+                crop = labels[loc]
+                binary_crop = (crop == label_id).astype(np.uint8)
+                binary_crop = np.pad(binary_crop, 1, mode='constant', constant_values=0)
+                
+                objs_contours = find_contours(binary_crop, level=0.5)
+                if not objs_contours: continue
+                
+                polygons = []
+                for c in objs_contours:
+                    qpoly = QPolygonF()
+                    for py, px in c:
+                        # Offset back to original image space + 0.5px shift
+                        oy = loc[0].start - 1 + py + 0.5
+                        ox = loc[1].start - 1 + px + 0.5
+                        qpoly.append(QPointF(ox, oy))
+                    polygons.append(qpoly)
+                
+                contour_data[label_id] = {
+                    "polygons": polygons,
+                    "bbox": [loc[0].start, loc[1].start, loc[0].stop, loc[1].stop] # [y0, x0, y1, x1]
+                }
+            
+            return contour_data
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"Error generating vector contours: {e}")
+            return {}

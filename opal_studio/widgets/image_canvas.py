@@ -18,7 +18,7 @@ import numpy as np
 from PySide6.QtCore import (
     Qt, QPointF, QRectF, QThread, Signal, QObject, Slot, QTimer,
 )
-from PySide6.QtGui import QImage, QPainter, QWheelEvent, QMouseEvent, QColor
+from PySide6.QtGui import QImage, QPainter, QWheelEvent, QMouseEvent, QColor, QPolygonF
 from PySide6.QtWidgets import QWidget, QSizePolicy
 
 from opal_studio.channel_model import ChannelListModel
@@ -307,6 +307,44 @@ class ImageCanvas(QWidget):
                 # Draw on top
                 p.drawImage(QRectF(dst_x, dst_y, dst_w, dst_h), self._display_image)
     
+            # 3. Vector layer: Mask Contours
+            p.save()
+            # Map image space to screen space
+            p.translate(-self._viewport.left() * spp, -self._viewport.top() * spp)
+            p.scale(spp, spp)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            
+            import random as py_random
+            rng = py_random.Random()
+
+            for ch in self._model.visible_channels():
+                if (ch.is_mask or ch.is_cell_mask) and ch.contour_visible and ch.contour_data:
+                    pen = p.pen()
+                    # A cosmetic pen keeps its width (3px) constant regardless of painter scale.
+                    pen.setWidth(3)
+                    pen.setCosmetic(True)
+                    
+                    visible_vpt = self._viewport
+                    
+                    for lid, data in ch.contour_data.items():
+                        bbox = data["bbox"] # [y0, x0, y1, x1]
+                        # Fast viewport intersection check
+                        if (bbox[2] < visible_vpt.top() or bbox[0] > visible_vpt.bottom() or
+                            bbox[3] < visible_vpt.left() or bbox[1] > visible_vpt.right()):
+                            continue
+                            
+                        if ch.is_mask:
+                            rng.seed(int(lid))
+                            col = QColor.fromRgbF(rng.random(), rng.random(), rng.random())
+                        else:
+                            col = QColor(0, 255, 0) if lid == 1 else QColor(255, 0, 0)
+                            
+                        pen.setColor(col)
+                        p.setPen(pen)
+                        for qpoly in data["polygons"]:
+                            p.drawPolyline(qpoly)
+            
+            p.restore()
             p.end()
         except Exception as e:
             import traceback
