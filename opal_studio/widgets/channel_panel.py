@@ -231,12 +231,65 @@ class ChannelPanel(QWidget):
         self._tabs.addTab(self._cell_tab, self._spacer_icon, "Cells")
         self._cell_layout.addStretch()
 
+        # Tab 4: Types
+        self._type_tab = QWidget()
+        self._type_tab_layout = QVBoxLayout(self._type_tab)
+        self._type_tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._type_header = QWidget()
+        self._type_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        type_header_layout = QVBoxLayout(self._type_header)
+        type_header_layout.setContentsMargins(8, 8, 8, 8)
+        
+        type_top = QHBoxLayout()
+        btn_type_on = QPushButton("Show all")
+        btn_type_off = QPushButton("Hide all")
+        btn_type_on.clicked.connect(lambda: self._model.set_category_visible("type", True))
+        btn_type_off.clicked.connect(lambda: self._model.set_category_visible("type", False))
+        type_top.addWidget(btn_type_on)
+        type_top.addWidget(btn_type_off)
+        type_header_layout.addLayout(type_top)
+
+        opacity_layout = QHBoxLayout()
+        opacity_layout.addWidget(QLabel("Opacity"))
+        self._type_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._type_opacity_slider.setRange(0, 100)
+        self._type_opacity_slider.setEnabled(False)
+        self._type_opacity_slider.valueChanged.connect(self._on_header_type_opacity_changed)
+        opacity_layout.addWidget(self._type_opacity_slider)
+        type_header_layout.addLayout(opacity_layout)
+        
+        self._type_tab_layout.addWidget(self._type_header)
+
+        self._type_scroll = QScrollArea()
+        self._type_scroll.setWidgetResizable(True)
+        self._type_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._type_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        self._type_container = QWidget()
+        self._type_container.setBackgroundRole(QPalette.ColorRole.Base)
+        self._type_container.setAutoFillBackground(True)
+        self._type_layout = QVBoxLayout(self._type_container)
+        self._type_layout.setContentsMargins(6, 6, 6, 6)
+        self._type_layout.setSpacing(6)
+        self._type_scroll.setWidget(self._type_container)
+        
+        self._type_tab_layout.addWidget(self._type_scroll)
+        self._tabs.addTab(self._type_tab, self._spacer_icon, "Types")
+        self._type_layout.addStretch()
+
         self._row_widgets: list[QWidget] = []
 
+        # Debounced rebuild timer to prevent UI thrashing during batch updates
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(50)
+        self._rebuild_timer.timeout.connect(self._rebuild)
+
         # React to model changes
-        self._model.modelReset.connect(self._rebuild)
-        self._model.rowsInserted.connect(lambda: self._rebuild())
-        self._model.rowsRemoved.connect(lambda: self._rebuild())
+        self._model.modelReset.connect(self._rebuild_timer.start)
+        self._model.rowsInserted.connect(self._rebuild_timer.start)
+        self._model.rowsRemoved.connect(self._rebuild_timer.start)
         self._model.dataChanged.connect(self._on_data_changed)
 
     # ------------------------------------------------------------------
@@ -262,10 +315,16 @@ class ChannelPanel(QWidget):
             item = self._cell_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
 
+        while self._type_layout.count():
+            item = self._type_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
         for row in range(self._model.rowCount()):
             ch = self._model.channel(row)
             widget = self._make_row(row, ch)
-            if ch.is_cell_mask:
+            if ch.is_type_mask:
+                self._type_layout.addWidget(widget)
+            elif ch.is_cell_mask:
                 self._cell_layout.addWidget(widget)
             elif ch.is_mask:
                 self._mask_layout.addWidget(widget)
@@ -276,6 +335,7 @@ class ChannelPanel(QWidget):
         self._channel_layout.addStretch()
         self._mask_layout.addStretch()
         self._cell_layout.addStretch()
+        self._type_layout.addStretch()
 
     def _make_row(self, row: int, ch: Channel) -> QWidget:
         frame = ClickableFrame()
@@ -391,9 +451,9 @@ class ChannelPanel(QWidget):
         # Reset all header context-aware controls
         self._sel_group.setEnabled(False)
         self._mask_opacity_slider.setEnabled(False)
-        self._cell_opacity_slider.setEnabled(False)
+        self._type_opacity_slider.setEnabled(False)
         
-        if not ch.is_mask and not ch.is_cell_mask:
+        if not ch.is_mask and not ch.is_cell_mask and not ch.is_type_mask:
             # Traditional Channel tab controls
             self._sel_group.setEnabled(True)
             self._alpha_slider.blockSignals(True)
@@ -416,6 +476,13 @@ class ChannelPanel(QWidget):
             self._cell_opacity_slider.blockSignals(True)
             self._cell_opacity_slider.setValue(int(ch.range_max * 100))
             self._cell_opacity_slider.blockSignals(False)
+
+        elif ch.is_type_mask:
+            # Type tab controls
+            self._type_opacity_slider.setEnabled(True)
+            self._type_opacity_slider.blockSignals(True)
+            self._type_opacity_slider.setValue(int(ch.range_max * 100))
+            self._type_opacity_slider.blockSignals(False)
 
     def _on_data_changed(self, top_left, bottom_right, roles):
         row = top_left.row()
@@ -490,6 +557,12 @@ class ChannelPanel(QWidget):
             self._model.setData(idx, val/100.0, ChannelListModel.RangeMaxRole)
 
     def _on_header_cell_opacity_changed(self, val: int):
+        ch = self._model.selected_channel()
+        if ch:
+            idx = self._model.index(self._model._channels.index(ch))
+            self._model.setData(idx, val/100.0, ChannelListModel.RangeMaxRole)
+
+    def _on_header_type_opacity_changed(self, val: int):
         ch = self._model.selected_channel()
         if ch:
             idx = self._model.index(self._model._channels.index(ch))

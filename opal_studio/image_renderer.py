@@ -94,7 +94,7 @@ def _render_multichannel(
 
     for ch in channels:
         # 1. Fetch raw data (either from disk page or resident mask)
-        if (ch.is_mask or ch.is_cell_mask) and ch.mask_data is not None:
+        if (ch.is_mask or ch.is_cell_mask or ch.is_type_mask) and ch.mask_data is not None:
             # Slicing resident data (always base resolution)
             down = img.levels[level_idx].downsample
             sy = slice(int(vy.start * down), int(vy.stop * down))
@@ -117,7 +117,7 @@ def _render_multichannel(
         if raw.shape[:2] != (h, w):
             raw = resize(raw, (h, w), order=0, preserve_range=True)
 
-        if ch.is_mask or ch.is_cell_mask:
+        if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
             # 1. Handle Mask Fill
             if ch.visible and ch.mask_data is not None:
                 labels = raw.astype(np.int32)
@@ -141,7 +141,7 @@ def _render_multichannel(
                                 rng.seed(int(lid))
                                 col = np.array([rng.random(), rng.random(), rng.random()], dtype=np.float32)
                                 canvas[labels == lid] = (1.0 - alpha_mask) * canvas[labels == lid] + alpha_mask * col
-                    else: # is_cell_mask
+                    elif ch.is_cell_mask:
                         mask_1 = labels == 1
                         mask_2 = labels == 2
                         if np.any(mask_1):
@@ -150,6 +150,10 @@ def _render_multichannel(
                         if np.any(mask_2):
                             color_red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
                             canvas[mask_2] = (1.0 - alpha_mask) * canvas[mask_2] + alpha_mask * color_red
+                    elif ch.is_type_mask:
+                        # Use the channel's assigned color for all positive pixels
+                        type_color = np.array([ch.color.redF(), ch.color.greenF(), ch.color.blueF()], dtype=np.float32)
+                        canvas[mask_active] = (1.0 - alpha_mask) * canvas[mask_active] + alpha_mask * type_color
         else:
             # Normal intensity channel rendering
             dmin, dmax = ch.data_min, ch.data_max

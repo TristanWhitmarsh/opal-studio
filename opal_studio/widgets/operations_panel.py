@@ -200,7 +200,7 @@ class FilterTab(QWidget):
         self.filter_type = QComboBox()
         self.filter_type.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.filter_type.setMinimumWidth(50)
-        self.filter_type.addItems(["Median", "Tophat"])
+        self.filter_type.addItems(["Median", "Opening"])
         form.addRow("Type:", self.filter_type)
         
         self.filter_value = QLineEdit("3")
@@ -824,6 +824,7 @@ class OperationsPanel(QWidget):
     runSegmentationRequested = Signal(dict)
     runMaskProcessingRequested = Signal(dict)
     runCellPositivityRequested = Signal(dict)
+    runCellIdentificationRequested = Signal()
     segmentationFinished = Signal(object)
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
@@ -995,6 +996,7 @@ class OperationsPanel(QWidget):
         gating_lay.setSpacing(8)
 
         self._ident_run_btn = QPushButton("Identify Cells")
+        self._ident_run_btn.clicked.connect(self._on_run_cell_identification)
         gating_lay.addWidget(self._ident_run_btn)
         gating_lay.addStretch()
 
@@ -1039,6 +1041,11 @@ class OperationsPanel(QWidget):
             "mask_index": self._pos_mask_combo.currentData()
         })
 
+    def _on_run_cell_identification(self):
+        self._ident_run_btn.setEnabled(False)
+        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self.runCellIdentificationRequested.emit()
+
     def stop_loading(self):
         self._equalize_tab.setEnabled(True)
         self._filter_tab.setEnabled(True)
@@ -1056,4 +1063,10 @@ class OperationsPanel(QWidget):
         self._expansion_tab.setEnabled(True)
         self._cell_sampler_tab.setEnabled(True)
         self._pos_run_btn.setEnabled(True)
+        self._ident_run_btn.setEnabled(True)
         self._progress.setVisible(False)
+
+    @Slot(int, int)
+    def set_progress_info(self, val, total):
+        self._progress.setRange(0, total)
+        self._progress.setValue(val)

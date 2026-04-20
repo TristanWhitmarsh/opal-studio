@@ -199,3 +199,18 @@ class PhenotypingTab(QWidget):
                     self._cell_states[(ch_name, c_type)] = csv_states.get((ch_name, c_type), 0)
             
             self._refresh_table_ui()
+
+    def get_phenotype_definitions(self) -> dict:
+        """
+        Returns a mapping from cell_type -> dict(marker_name -> state).
+        States are 1 for Pos, 2 for Neg. 0 is ignored.
+        """
+        definitions = {}
+        for c_type in self._cell_types:
+            criteria = {}
+            for ch_name in self._channel_names:
+                state = self._cell_states.get((ch_name, c_type), 0)
+                if state != 0:
+                    criteria[ch_name] = state
+            definitions[c_type] = criteria
+        return definitions

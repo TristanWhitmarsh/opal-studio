@@ -20,7 +20,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QSplitter, QWidget,
-    QHBoxLayout, QStatusBar, QMessageBox, QTabWidget
+    QHBoxLayout, QStatusBar, QMessageBox, QTabWidget, QApplication
 )
 
 from opal_studio.channel_model import Channel, ChannelListModel
@@ -34,6 +34,7 @@ import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt, find_objects
 from skimage.segmentation import watershed, find_boundaries
 from skimage.measure import find_contours
+from skimage.morphology import white_tophat, opening, closing, disk
 
 def expand_labels_watershed(labels, expansion_pixels=6):
     """
@@ -81,10 +82,12 @@ class MainWindow(QMainWindow):
     """Top-level window for Opal Studio."""
 
     # Signals for cross-thread communication
-    segmentationResultReady = Signal(object, str, bool, object, object) # labels, name, is_cell_mask, color, contour_data
+    segmentationResultReady = Signal(object, str, bool, object, object, str, bool) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask
     segmentationError = Signal(str)
-    preprocessingResultReady = Signal(str, str, object) # original_name, suffix, data
+    preprocessingResultReady = Signal(str, str, object, float, float) # original_name, suffix, data, min, max
     preprocessingError = Signal(str)
+    operationProgress = Signal(int, int)
+    operationFinished = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -107,6 +110,9 @@ class MainWindow(QMainWindow):
         self._ops_panel.runPreprocessingRequested.connect(self._run_preprocessing)
         self._ops_panel.runMaskProcessingRequested.connect(self._run_mask_expansion)
         self._ops_panel.runCellPositivityRequested.connect(self._run_cell_positivity)
+        self._ops_panel.runCellIdentificationRequested.connect(self._run_cell_identification)
+        self.operationProgress.connect(self._ops_panel.set_progress_info)
+        self.operationFinished.connect(self._on_operation_complete)
         
         self.segmentationResultReady.connect(self._on_segmentation_complete)
         self.segmentationError.connect(self._on_segmentation_error)
@@ -383,7 +389,12 @@ class MainWindow(QMainWindow):
             try:
                 idx = params["channel_index"]
                 ch = self._channel_model.channel(idx)
-                data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                
+                # Check if we should use memory-cached data or disk data
+                if ch.is_processed and ch.processed_data is not None:
+                    data = ch.processed_data.astype(np.float32)
+                else:
+                    data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
                 
                 if params.get("is_filter"):
                     import cv2
@@ -392,10 +403,13 @@ class MainWindow(QMainWindow):
                     suffix = f"_{filter_type.capitalize()}"
                     
                     if filter_type == 'median':
-                        x = ndi.median_filter(data, size=filter_value, mode='reflect')
-                    elif filter_type == 'tophat':
-                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (filter_value, filter_value))
-                        x = cv2.morphologyEx(data, cv2.MORPH_TOPHAT, kernel)
+                        # Use a disk/elliptical footprint for smoother results
+                        footprint = disk(max(1, filter_value // 2))
+                        x = ndi.median_filter(data, footprint=footprint, mode='reflect')
+                    elif filter_type == 'opening':
+                        # The user expects this filter to perform noise removal (subtraction).
+                        # Mathematically, this is an Opening operation.
+                        x = opening(data, footprint=disk(max(1, filter_value // 2)))
                     else:
                         x = data
                 else:
@@ -419,18 +433,18 @@ class MainWindow(QMainWindow):
                     # 4. Rescale back to original intensity range
                     x = x * diff + p_low_val
                 
-                self.preprocessingResultReady.emit(ch.name, suffix, x)
+                self.preprocessingResultReady.emit(ch.name, suffix, x, ch.data_min, ch.data_max)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.preprocessingError.emit(str(e))
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_preprocessing_complete(self, original_name, suffix, data):
+    def _on_preprocessing_complete(self, original_name, suffix, data, data_min, data_max):
         self._ops_panel.stop_loading()
         new_name = self._channel_model.get_unique_name(f"{original_name}{suffix}")
         new_ch = Channel(
             name=new_name, color=QColor(255, 255, 255), visible=True,
-            data_min=float(np.min(data)), data_max=float(np.max(data)),
+            data_min=data_min, data_max=data_max,
             is_processed=True, processed_data=data, index=-1
         )
         self._channel_model.add_channel(new_ch)
@@ -458,6 +472,7 @@ class MainWindow(QMainWindow):
                 }
                 override_name = method_names.get(method, "Mask")
                 x = None
+                contour_data = None
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
                     if ch.is_processed and ch.processed_data is not None:
@@ -519,7 +534,10 @@ class MainWindow(QMainWindow):
                     if labels_tensor.ndim == 3:
                         # Process extra channels like cells before proceeding with main labels (nuclei)
                         for c in range(1, labels_tensor.shape[0]):
-                           self.segmentationResultReady.emit(labels_tensor[c], override_name, True, None)
+                           # For side-channels from InstanSeg, we also pre-calculate contours
+                           side_labels = labels_tensor[c].astype(np.int32)
+                           side_contour = self._get_contour_data(side_labels)
+                           self.segmentationResultReady.emit(side_labels, override_name, True, None, side_contour, "", False)
                         labels = labels_tensor[0]
                     else:
                         labels = labels_tensor
@@ -582,12 +600,11 @@ class MainWindow(QMainWindow):
                                     mapping[cid] = cid
                             labels = mapping[labels]
 
-                    print(f"[StarDist] Inference finished. Result shape: {labels.shape}")
-                    
-                    # Pre-calculate contours in worker thread
+                # Pre-calculate contours once for the final resulting labels
+                if labels is not None:
                     contour_data = self._get_contour_data(labels.astype(np.int32))
                     
-                self.segmentationResultReady.emit(labels, override_name, False, None, contour_data)
+                self.segmentationResultReady.emit(labels, override_name, False, None, contour_data, "", False)
                 print(f"[Segmentation] Result emitted.")
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -596,7 +613,7 @@ class MainWindow(QMainWindow):
         self._segmentation_thread = threading.Thread(target=_run, daemon=True)
         self._segmentation_thread.start()
 
-    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None, contour_data=None):
+    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None, contour_data=None, source_marker="", is_type_mask=False):
         self._ops_panel.stop_loading()
         base_name = name if name else "Mask"
         mask_name = self._channel_model.get_unique_name(base_name)
@@ -610,9 +627,12 @@ class MainWindow(QMainWindow):
 
         new_ch = Channel(
             name=mask_name, color=row_color, visible=True,
-            is_mask=(not is_cell_mask), is_cell_mask=is_cell_mask,
+            is_mask=(not is_cell_mask and not is_type_mask), 
+            is_cell_mask=is_cell_mask,
+            is_type_mask=is_type_mask,
             mask_data=mask_data,
             contour_data=contour_data,
+            source_marker=source_marker,
             index=-1
         )
         self._channel_model.add_channel(new_ch)
@@ -647,7 +667,7 @@ class MainWindow(QMainWindow):
                     new_name = f"Sampled Mask ({merit})"
                     
                     contour_data = self._get_contour_data(mask_result)
-                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data)
+                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False)
                 except Exception as e:
                     import traceback; traceback.print_exc()
                     self.segmentationError.emit(str(e))
@@ -691,7 +711,7 @@ class MainWindow(QMainWindow):
                     new_name = f"{original_mask_ch.name} Filtered"
                 
                 contour_data = self._get_contour_data(mask_result)
-                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data)
+                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))
@@ -726,7 +746,7 @@ class MainWindow(QMainWindow):
                 
                 PATCH_SIZE = 64
                 THRESHOLD = 0.5
-                CHUNK_SIZE = 1024
+                CHUNK_SIZE = 500
                 
                 target_channels = []
                 for i in range(self._channel_model.rowCount()):
@@ -738,7 +758,11 @@ class MainWindow(QMainWindow):
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
                 markers = np.zeros((h, w, S), dtype=np.float32)
                 for z, ch in enumerate(target_channels):
-                    data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                    if ch.is_processed and ch.processed_data is not None:
+                        data = ch.processed_data.astype(np.float32)
+                    else:
+                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                        
                     dh, dw = data.shape[:2]
                     copy_h = min(h, dh)
                     copy_w = min(w, dw)
@@ -772,6 +796,8 @@ class MainWindow(QMainWindow):
                     if y1 - y0 < crop_size: y0 = max(0, y1 - crop_size)
                     if x1 - x0 < crop_size: x0 = max(0, x1 - crop_size)
                     return img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+
+                self.operationProgress.emit(0, S)
 
                 for z in range(S):
                     ch = target_channels[z]
@@ -827,15 +853,95 @@ class MainWindow(QMainWindow):
                             
                     flush_chunk()
                     
-                    self.segmentationResultReady.emit(slice_out, f"{ch.name}", True, ch.color)
+                    self.segmentationResultReady.emit(slice_out, f"{ch.name}", True, ch.color, None, ch.name, False)
+                    self.operationProgress.emit(z + 1, S)
 
                 print("[AI] Cell positivity detection complete.")
+                self.operationFinished.emit(S)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _run_cell_identification(self):
+        """Perform logical gating based on phenotyping definitions in a background thread."""
+        if not self._image: return
+
+        definitions = self._phenotyping_tab.get_phenotype_definitions()
+        if not definitions:
+            self._ops_panel.stop_loading()
+            self.statusBar().showMessage("No cell types defined in the Phenotyping tab.", 5000)
+            return
+
+        cell_masks = {}
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_cell_mask:
+                key = ch.source_marker if ch.source_marker else ch.name
+                cell_masks[key] = ch.mask_data
+
+        if not cell_masks:
+            self._ops_panel.stop_loading()
+            self.statusBar().showMessage("No cell positivity masks found. Detect marker positivity first.", 5000)
+            return
+
+        def _run():
+            try:
+                some_mask = next(iter(cell_masks.values()))
+                h, w = some_mask.shape
+                
+                from opal_studio.channel_model import generate_spaced_colors
+                colors = generate_spaced_colors(len(definitions) + 10)
+
+                total_types = len(definitions)
+                identified_count = 0
+
+                for i, (type_name, criteria) in enumerate(definitions.items()):
+                    if not criteria:
+                        self.operationProgress.emit(i+1, total_types)
+                        continue
+                        
+                    valid_mask = np.ones((h, w), dtype=bool)
+                    criteria_met = True
+                    for marker_name, required_state in criteria.items():
+                        if marker_name in cell_masks:
+                            target_val = 2 if required_state == 1 else 1
+                            valid_mask &= (cell_masks[marker_name] == target_val)
+                        else:
+                            criteria_met = False
+                            break
+                    
+                    if criteria_met and np.any(valid_mask):
+                        type_data = np.zeros((h, w), dtype=np.uint8)
+                        type_data[valid_mask] = 1 # Binary mask for this type
+                        
+                        color_rgb = colors[i % len(colors)]
+                        row_color = QColor(*color_rgb)
+                        
+                        # We use the existing result handler to handle thread-safe model addition
+                        # We pass is_cell_mask=False and use source_marker="" for types.
+                        # Wait, we need it to be is_type_mask. 
+                        # I'll update _on_segmentation_complete once more to handle this.
+                        # Signal compatibility: is_cell_mask=False, source_marker="", is_type_mask=True
+                        self.segmentationResultReady.emit(type_data, type_name, False, row_color, None, "", True)
+                        identified_count += 1
+                    
+                    self.operationProgress.emit(i+1, total_types)
+
+                self.operationFinished.emit(identified_count)
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.segmentationError.emit(f"Identification Error: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_operation_complete(self, count):
+        self._ops_panel.stop_loading()
+        # count might be total markers or total types
+        self.statusBar().showMessage(f"Task complete. Processed {count} items.", 5000)
 
     def _on_segmentation_error(self, message):
         self._ops_panel.stop_loading()

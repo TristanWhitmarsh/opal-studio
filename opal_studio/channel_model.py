@@ -94,6 +94,8 @@ class Channel:
     contour_data: np.ndarray | None = None
     alpha: float = 1.0
     contour_visible: bool = False
+    is_type_mask: bool = False
+    source_marker: str = ""
 
 
 class ChannelListModel(QAbstractListModel):
@@ -115,12 +117,14 @@ class ChannelListModel(QAbstractListModel):
     SelectedRole = Qt.UserRole + 6
     AlphaRole = Qt.UserRole + 7
     ContourVisibleRole = Qt.UserRole + 8
+    TypeRole = Qt.UserRole + 9
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._channels: List[Channel] = []
         self._brightness: float = 1.0
         self._cell_opacity: float = 1.0
+        self._type_opacity: float = 1.0
 
     # ---- public helpers ------------------------------------------------
 
@@ -153,12 +157,38 @@ class ChannelListModel(QAbstractListModel):
                     ch.range_max = value
             self.channels_changed.emit()
 
+    @property
+    def type_opacity(self) -> float:
+        return self._type_opacity
+
+    @type_opacity.setter
+    def type_opacity(self, value: float):
+        if self._type_opacity != value:
+            self._type_opacity = value
+            for ch in self._channels:
+                if ch.is_type_mask:
+                    ch.range_max = value
+            self.channels_changed.emit()
+
     def set_all_visible(self, visible: bool, include_masks: bool = True):
         self.beginResetModel()
         for ch in self._channels:
-            if not include_masks and ch.is_mask:
+            if not include_masks and (ch.is_mask or ch.is_cell_mask or ch.is_type_mask):
                 continue
             ch.visible = visible
+        self.endResetModel()
+        self.channels_changed.emit()
+
+    def set_category_visible(self, category: str, visible: bool):
+        """category can be 'mask', 'cell', or 'type'."""
+        self.beginResetModel()
+        for ch in self._channels:
+            if category == "mask" and ch.is_mask and not ch.is_cell_mask and not ch.is_type_mask:
+                ch.visible = visible
+            elif category == "cell" and ch.is_cell_mask:
+                ch.visible = visible
+            elif category == "type" and ch.is_type_mask:
+                ch.visible = visible
         self.endResetModel()
         self.channels_changed.emit()
 
@@ -181,6 +211,9 @@ class ChannelListModel(QAbstractListModel):
                 for ch in self._channels:
                     if ch.is_cell_mask:
                         ch.visible = False
+        
+        if channel.is_type_mask:
+            channel.range_max = self._type_opacity
                     
         row = len(self._channels)
         self.beginInsertRows(QModelIndex(), row, row)
