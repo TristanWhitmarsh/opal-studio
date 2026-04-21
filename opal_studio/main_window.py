@@ -183,13 +183,13 @@ class MainWindow(QMainWindow):
         save_cells_act.triggered.connect(lambda: self._on_export_masks(target="cell"))
         file_menu.addAction(save_cells_act)
 
-        save_phenos_act = QAction("Save &Phenotyping…", self)
-        save_phenos_act.triggered.connect(self._on_export_phenotypes)
-        file_menu.addAction(save_phenos_act)
-        
         save_contours_act = QAction("Save Con&tours (GeoJSON)…", self)
         save_contours_act.triggered.connect(self._on_export_contours)
         file_menu.addAction(save_contours_act)
+
+        save_phenos_act = QAction("Save &Phenotyping…", self)
+        save_phenos_act.triggered.connect(self._on_export_phenotypes)
+        file_menu.addAction(save_phenos_act)
         
         file_menu.addSeparator()
         quit_act = QAction("&Quit", self)
@@ -579,6 +579,22 @@ class MainWindow(QMainWindow):
                 x = None
                 contour_data = None
                 input_channels_data = []
+                print(f"[Segmentation] Model: {method} | Region: {region_mode} | Target: {target_mode}")
+                
+                # Setup logging/progress for specific models
+                if method in ["mesmer", "stardist"]:
+                    try:
+                        import tensorflow as tf
+                        gpus = tf.config.list_physical_devices('GPU')
+                        if gpus:
+                            for gpu in gpus:
+                                tf.config.experimental.set_memory_growth(gpu, True)
+                    except Exception: 
+                        pass # Ignore if already set or no GPU
+                
+                if method == "cellpose":
+                    from cellpose import io
+                    io.logger_setup()
                 
                 v_top, v_bottom, v_left, v_right = 0, 0, 0, 0
                 full_shape = None
@@ -632,7 +648,7 @@ class MainWindow(QMainWindow):
                     input_stack = np.expand_dims(input_stack, axis=0) # add batch dim
                     
                     # Predict: returns (Batch, H, W, 2) where 0=cell, 1=nuclei
-                    labeled_combined = app.predict(input_stack, image_mpp=params.get("pixel_size", 1.0), batch_size=64)
+                    labeled_combined = app.predict(input_stack, image_mpp=params.get("pixel_size", 1.0), batch_size=16)
                     
                     if labeled_combined.shape[-1] >= 2:
                         cell_labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
@@ -702,6 +718,10 @@ class MainWindow(QMainWindow):
                         # Only one channel returned
                         labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
                         override_name = "Mesmer Mask"
+                    
+                    # Force release of session memory to prevent OOM in subsequent PyTorch calls
+                    import tensorflow as tf
+                    tf.keras.backend.clear_session()
 
                 elif method == "stardist":
                     from stardist.models import StarDist2D
@@ -733,7 +753,8 @@ class MainWindow(QMainWindow):
                         model = models.Cellpose(model_type=params["model_name"], gpu=use_gpu)
                     
                     channels = [[0, 0]]
-                    result = model.eval([x], diameter=params.get("diameter"), channels=channels, batch_size=64)
+                    # progress=True enables the tqdm bar in the console
+                    result = model.eval([x], diameter=params.get("diameter"), channels=channels, batch_size=64, progress=True)
                     labels = result[0][0]
                 elif method == "instanseg":
                     from instanseg import InstanSeg
@@ -754,7 +775,7 @@ class MainWindow(QMainWindow):
                         x_input = np.stack([x]*3, axis=-1)
                     
                     if max(x.shape[0], x.shape[1]) > 512:
-                        out, _ = model.eval_medium_image(x_input, params.get("pixel_size", 1.0), tile_size=512, batch_size=16)
+                        out, _ = model.eval_medium_image(x_input, params.get("pixel_size", 1.0), tile_size=512, batch_size=16, show_progress=True)
                     else:
                         out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
                     
