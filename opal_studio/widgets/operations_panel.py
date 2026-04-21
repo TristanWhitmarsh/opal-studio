@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal, Slot, QSize
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QFrame, QSizePolicy,
     QComboBox, QLineEdit, QPushButton, QProgressBar,
-    QFormLayout, QMessageBox, QCheckBox,
+    QFormLayout, QMessageBox, QCheckBox, QRadioButton, QButtonGroup,
     QHBoxLayout, QScrollArea, QTabWidget, QToolButton,
     QListWidget, QListWidgetItem, QAbstractItemView
 )
@@ -437,7 +437,7 @@ class CellposeTab(QWidget):
         self._model_combo = QComboBox()
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._model_combo.setMinimumWidth(50)
-        self._model_combo.addItems(["cyto", "nuclei", "cyto2"])
+        self._model_combo.addItems(["nuclei", "cyto", "cyto2"])
         self._scan_models()
         form.addRow("Model:", self._model_combo)
 
@@ -1049,6 +1049,38 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Segmentation", collapsed=True)
         self._container_layout.addWidget(panel)
 
+        # Region mode toggle
+        region_lay = QHBoxLayout()
+        region_lay.setContentsMargins(12, 5, 12, 5)
+        self._radio_full = QRadioButton("Full image")
+        self._radio_visible = QRadioButton("Visible region only")
+        self._radio_full.setChecked(True)
+        
+        self._region_group = QButtonGroup(self)
+        self._region_group.addButton(self._radio_full)
+        self._region_group.addButton(self._radio_visible)
+        
+        region_lay.addWidget(self._radio_full)
+        region_lay.addWidget(self._radio_visible)
+        region_lay.addStretch()
+        panel.addLayout(region_lay)
+
+        # Target mask toggle
+        target_lay = QHBoxLayout()
+        target_lay.setContentsMargins(12, 0, 12, 5)
+        self._radio_new_mask = QRadioButton("New mask")
+        self._radio_overwrite = QRadioButton("Overwrite selected mask")
+        self._radio_new_mask.setChecked(True)
+        
+        self._target_group = QButtonGroup(self)
+        self._target_group.addButton(self._radio_new_mask)
+        self._target_group.addButton(self._radio_overwrite)
+        
+        target_lay.addWidget(self._radio_new_mask)
+        target_lay.addWidget(self._radio_overwrite)
+        target_lay.addStretch()
+        panel.addLayout(target_lay)
+
         self._seg_tabs = OperationsTabWidget()
         self._seg_tabs.setIconSize(QSize(1, 24))
         self._stardist_tab = StarDistTab(self._channel_model)
@@ -1183,10 +1215,22 @@ class OperationsPanel(QWidget):
         self.runPreprocessingRequested.emit(params)
 
     def _on_run_segmentation(self, params):
+        target_mode = "new" if self._radio_new_mask.isChecked() else "overwrite"
+        params["region_mode"] = "full" if self._radio_full.isChecked() else "visible"
+        params["target_mode"] = target_mode
+        
+        if target_mode == "overwrite":
+            sel_ch = self._channel_model.selected_channel()
+            if not sel_ch or not (sel_ch.is_mask or sel_ch.is_cell_mask or sel_ch.is_type_mask):
+                QMessageBox.warning(self, "No mask selected", "Please select a mask channel to overwrite.")
+                return
+            params["target_mask_index"] = self._channel_model._channels.index(sel_ch)
+
         self._stardist_tab.setEnabled(False)
         self._cellpose_tab.setEnabled(False)
         self._instanseg_tab.setEnabled(False)
         self._watershed_tab.setEnabled(False)
+        self._mesmer_tab.setEnabled(False)
         self._progress.setVisible(True); self._progress.setRange(0, 0)
         self.runSegmentationRequested.emit(params)
 
@@ -1217,12 +1261,7 @@ class OperationsPanel(QWidget):
         self._stardist_tab.setEnabled(True)
         self._cellpose_tab.setEnabled(True)
         self._instanseg_tab.setEnabled(True)
-        self._watershed_tab.setEnabled(True)
-        self._filter_size_tab.setEnabled(True)
-        self._expansion_tab.setEnabled(True)
-        self._cell_sampler_tab.setEnabled(True)
-        self._pos_run_btn.setEnabled(True)
-        self._progress.setVisible(False)
+        self._mesmer_tab.setEnabled(True)
         self._watershed_tab.setEnabled(True)
         self._filter_size_tab.setEnabled(True)
         self._expansion_tab.setEnabled(True)

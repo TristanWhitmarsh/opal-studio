@@ -82,7 +82,7 @@ class MainWindow(QMainWindow):
     """Top-level window for Opal Studio."""
 
     # Signals for cross-thread communication
-    segmentationResultReady = Signal(object, str, bool, object, object, str, bool) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask
+    segmentationResultReady = Signal(object, str, bool, object, object, str, bool, int) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx
     segmentationError = Signal(str)
     preprocessingResultReady = Signal(str, str, object, float, float) # original_name, suffix, data, min, max
     preprocessingError = Signal(str)
@@ -186,6 +186,10 @@ class MainWindow(QMainWindow):
         save_phenos_act = QAction("Save &Phenotyping…", self)
         save_phenos_act.triggered.connect(self._on_export_phenotypes)
         file_menu.addAction(save_phenos_act)
+        
+        save_contours_act = QAction("Save Con&tours (GeoJSON)…", self)
+        save_contours_act.triggered.connect(self._on_export_contours)
+        file_menu.addAction(save_contours_act)
         
         file_menu.addSeparator()
         quit_act = QAction("&Quit", self)
@@ -367,6 +371,77 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Import Error", f"Could not import phenotypes: {e}")
 
+    def _on_export_contours(self):
+        if not self._image: return
+        
+        ch = self._channel_model.selected_channel()
+        if not ch or not ch.contour_data:
+            QMessageBox.warning(self, "Export Contours", "Please select a computed mask or cell channel with contours.")
+            return
+            
+        path, _ = QFileDialog.getSaveFileName(self, "Export Contours", f"{ch.name}_contours.geojson", "GeoJSON (*.geojson)")
+        if not path: return
+        if not path.endswith(".geojson"): path += ".geojson"
+        
+        try:
+            import json
+            features = []
+            
+            for label_id, data in ch.contour_data.items():
+                polygons = data.get("polygons", [])
+                if not polygons: continue
+                
+                coordinates = []
+                for poly in polygons:
+                    ring = []
+                    # QPolygonF contains QPointF points
+                    for i in range(poly.count()):
+                        pt = poly.at(i)
+                        ring.append([pt.x(), pt.y()])
+                        
+                    # GeoJSON rings must be closed (first and last coordinate identical)
+                    if ring and ring[0] != ring[-1]:
+                        ring.append(ring[0])
+                        
+                    if len(ring) >= 4: # Minimum 4 points for a valid closed polygon (triangle: a, b, c, a)
+                        coordinates.append(ring)
+                        
+                if not coordinates: continue
+                
+                # QuPath standard expects "detection" or "annotation". "detection" is standard for cells.
+                feature = {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": coordinates
+                    },
+                    "properties": {
+                        "objectType": "detection",
+                        "name": f"{label_id}"
+                    }
+                }
+                
+                if len(coordinates) > 1:
+                    # If multiple disconnected parts, represent as MultiPolygon
+                    feature["geometry"]["type"] = "MultiPolygon"
+                    feature["geometry"]["coordinates"] = [[ring] for ring in coordinates]
+                    
+                features.append(feature)
+                
+            geojson_col = {
+                "type": "FeatureCollection",
+                "features": features
+            }
+            
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(geojson_col, f)
+                
+            self._status.showMessage(f"Exported contours to {Path(path).name}", 5000)
+            
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Export Error", f"Could not export contours: {e}")
+
     @staticmethod
     def _quick_percentile_range(img: ImageData, channel: int) -> tuple[float, float]:
         if not img.levels: return 0.0, 1.0
@@ -490,16 +565,24 @@ class MainWindow(QMainWindow):
             try:
                 method = params.get("method", "stardist")
                 indices = params["channel_indices"]
+                region_mode = params.get("region_mode", "full")
+                target_mode = params.get("target_mode", "new")
+                target_mask_index = params.get("target_mask_index", None)
                 method_names = {
                     "stardist": "StarDist",
                     "cellpose": "Cellpose",
                     "instanseg": "InstanSeg",
-                    "watershed": "Watershed"
+                    "watershed": "Watershed",
+                    "mesmer": "Mesmer"
                 }
                 override_name = method_names.get(method, "Mask")
                 x = None
                 contour_data = None
                 input_channels_data = []
+                
+                v_top, v_bottom, v_left, v_right = 0, 0, 0, 0
+                full_shape = None
+                
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
                     if ch.is_processed and ch.processed_data is not None:
@@ -507,6 +590,16 @@ class MainWindow(QMainWindow):
                     else:
                         raw = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
                     
+                    full_shape = raw.shape
+                    if region_mode == "visible":
+                        v_top = int(max(0, self._canvas._viewport.top()))
+                        v_left = int(max(0, self._canvas._viewport.left()))
+                        v_bottom = int(min(full_shape[0], self._canvas._viewport.bottom()))
+                        v_right = int(min(full_shape[1], self._canvas._viewport.right()))
+                        if v_top >= v_bottom or v_left >= v_right:
+                            raise ValueError("Visible region is completely outside the image.")
+                        raw = raw[v_top:v_bottom, v_left:v_right]
+
                     # Normalize for deep learning models to prevent NMS hangs or junk results
                     p = np.percentile(raw, (1, 99.8))
                     data = np.clip((raw - p[0]) / (p[1] - p[0] + 1e-6), 0, 1)
@@ -540,10 +633,63 @@ class MainWindow(QMainWindow):
                         cell_labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
                         nuc_labels = np.squeeze(labeled_combined[0, ..., 1]).astype(np.int32)
                         
+                        def process_and_emit(out_labels, out_name, out_is_cell):
+                            if out_labels is None: return
+                            target_idx = -1
+                            if target_mode == "overwrite" and target_mask_index is not None:
+                                tgt_ch = self._channel_model.channel(target_mask_index)
+                                if getattr(tgt_ch, 'is_cell_mask', False) == out_is_cell:
+                                    target_idx = target_mask_index
+
+                            existing_labels = None
+                            if target_idx != -1:
+                                target_ch = self._channel_model.channel(target_idx)
+                                existing_labels = target_ch.mask_data.copy() if target_ch.mask_data is not None else None
+
+                            if region_mode == "visible":
+                                from skimage.segmentation import clear_border
+                                if out_labels.max() > 0:
+                                    out_labels = clear_border(out_labels)
+
+                                if existing_labels is not None:
+                                    # 1. remove cells in existing_labels that are inside the viewport but don't touch viewport bounds
+                                    viewport_ext = existing_labels[v_top:v_bottom, v_left:v_right]
+                                    if viewport_ext.shape[0] > 0 and viewport_ext.shape[1] > 0:
+                                        top_b = viewport_ext[0, :]
+                                        bot_b = viewport_ext[-1, :]
+                                        left_b = viewport_ext[:, 0]
+                                        right_b = viewport_ext[:, -1]
+                                        border_ids = np.unique(np.concatenate([top_b, bot_b, left_b, right_b]))
+                                        all_ids = np.unique(viewport_ext)
+                                        ids_to_remove = np.setdiff1d(all_ids, border_ids)
+                                        ids_to_remove = ids_to_remove[ids_to_remove > 0]
+                                        if len(ids_to_remove) > 0:
+                                            mask_to_remove = np.isin(existing_labels, ids_to_remove)
+                                            existing_labels[mask_to_remove] = 0
+
+                                    # 2. Add out_labels into existing_labels offsetting IDs
+                                    if out_labels.max() > 0:
+                                        max_id = existing_labels.max()
+                                        mask_new = out_labels > 0
+                                        existing_labels[v_top:v_bottom, v_left:v_right][mask_new] = out_labels[mask_new] + max_id
+                                    final_labels = existing_labels
+                                else:
+                                    # New mask, apply zeros outside
+                                    full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
+                                    full_labels[v_top:v_bottom, v_left:v_right] = out_labels
+                                    final_labels = full_labels
+                            else:
+                                if existing_labels is not None:
+                                    final_labels = out_labels
+                                else:
+                                    final_labels = out_labels
+
+                            contour_data = self._get_contour_data(final_labels.astype(np.int32))
+                            self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
+
                         # Emit cell labels as a side result if they exist
                         if cell_labels.max() > 0:
-                            cell_contour = self._get_contour_data(cell_labels)
-                            self.segmentationResultReady.emit(cell_labels, "Mesmer Cells", True, None, cell_contour, "", False)
+                            process_and_emit(cell_labels, "Mesmer Cells", True)
                         
                         labels = nuc_labels
                         override_name = "Mesmer Nuclei"
@@ -611,8 +757,7 @@ class MainWindow(QMainWindow):
                         for c in range(1, labels_tensor.shape[0]):
                            # For side-channels from InstanSeg, we also pre-calculate contours
                            side_labels = labels_tensor[c].astype(np.int32)
-                           side_contour = self._get_contour_data(side_labels)
-                           self.segmentationResultReady.emit(side_labels, override_name, True, None, side_contour, "", False)
+                           process_and_emit(side_labels, override_name, True)
                         labels = labels_tensor[0]
                     else:
                         labels = labels_tensor
@@ -675,11 +820,63 @@ class MainWindow(QMainWindow):
                                     mapping[cid] = cid
                             labels = mapping[labels]
 
-                # Pre-calculate contours once for the final resulting labels
+                # Process and emit final resulting labels
                 if labels is not None:
-                    contour_data = self._get_contour_data(labels.astype(np.int32))
-                    
-                self.segmentationResultReady.emit(labels, override_name, False, None, contour_data, "", False)
+                    try:
+                        # ensure process_and_emit exists (if not defined, fall back, e.g. single channel fallback)
+                        process_and_emit
+                    except NameError:
+                        def process_and_emit(out_labels, out_name, out_is_cell):
+                            if out_labels is None: return
+                            target_idx = -1
+                            if target_mode == "overwrite" and target_mask_index is not None:
+                                tgt_ch = self._channel_model.channel(target_mask_index)
+                                if getattr(tgt_ch, 'is_cell_mask', False) == out_is_cell:
+                                    target_idx = target_mask_index
+
+                            existing_labels = None
+                            if target_idx != -1:
+                                target_ch = self._channel_model.channel(target_idx)
+                                existing_labels = target_ch.mask_data.copy() if target_ch.mask_data is not None else None
+
+                            if region_mode == "visible":
+                                from skimage.segmentation import clear_border
+                                if out_labels.max() > 0:
+                                    out_labels = clear_border(out_labels)
+
+                                if existing_labels is not None:
+                                    viewport_ext = existing_labels[v_top:v_bottom, v_left:v_right]
+                                    if viewport_ext.shape[0] > 0 and viewport_ext.shape[1] > 0:
+                                        top_b = viewport_ext[0, :]
+                                        bot_b = viewport_ext[-1, :]
+                                        left_b = viewport_ext[:, 0]
+                                        right_b = viewport_ext[:, -1]
+                                        border_ids = np.unique(np.concatenate([top_b, bot_b, left_b, right_b]))
+                                        all_ids = np.unique(viewport_ext)
+                                        ids_to_remove = np.setdiff1d(all_ids, border_ids)
+                                        ids_to_remove = ids_to_remove[ids_to_remove > 0]
+                                        if len(ids_to_remove) > 0:
+                                            mask_to_remove = np.isin(existing_labels, ids_to_remove)
+                                            existing_labels[mask_to_remove] = 0
+
+                                    if out_labels.max() > 0:
+                                        max_id = existing_labels.max()
+                                        mask_new = out_labels > 0
+                                        existing_labels[v_top:v_bottom, v_left:v_right][mask_new] = out_labels[mask_new] + max_id
+                                    final_labels = existing_labels
+                                else:
+                                    full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
+                                    full_labels[v_top:v_bottom, v_left:v_right] = out_labels
+                                    final_labels = full_labels
+                            else:
+                                if existing_labels is not None:
+                                    final_labels = out_labels
+                                else:
+                                    final_labels = out_labels
+
+                            contour_data = self._get_contour_data(final_labels.astype(np.int32))
+                            self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
+                    process_and_emit(labels, override_name, False)
                 print(f"[Segmentation] Result emitted.")
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -688,30 +885,45 @@ class MainWindow(QMainWindow):
         self._segmentation_thread = threading.Thread(target=_run, daemon=True)
         self._segmentation_thread.start()
 
-    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None, contour_data=None, source_marker="", is_type_mask=False):
+    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None, contour_data=None, source_marker="", is_type_mask=False, target_idx=-1):
         self._ops_panel.stop_loading()
-        base_name = name if name else "Mask"
-        mask_name = self._channel_model.get_unique_name(base_name)
-        row_color = color if color else QColor(255, 255, 255)
-        
-        print(f"[DEBUG-STAT] RECEIVED MASK: name={mask_name}, is_cell_mask={is_cell_mask}, min={np.min(labels)}, max={np.max(labels)}")
-        
         mask_data = labels.astype(np.int32)
         if contour_data is None:
             contour_data = self._get_contour_data(mask_data)
 
-        new_ch = Channel(
-            name=mask_name, color=row_color, visible=True,
-            is_mask=(not is_cell_mask and not is_type_mask), 
-            is_cell_mask=is_cell_mask,
-            is_type_mask=is_type_mask,
-            mask_data=mask_data,
-            contour_data=contour_data,
-            source_marker=source_marker,
-            index=-1
-        )
-        self._channel_model.add_channel(new_ch)
-        self._status.showMessage(f"Task Complete: {mask_name}", 5000)
+        if target_idx != -1:
+            ch = self._channel_model.channel(target_idx)
+            ch.mask_data = mask_data
+            ch.contour_data = contour_data
+            idx_qt = self._channel_model.index(target_idx)
+            self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+            self._channel_model.channels_changed.emit()
+            self._status.showMessage(f"Updated: {ch.name}", 5000)
+        else:
+            base_name = name if name else "Mask"
+            mask_name = self._channel_model.get_unique_name(base_name)
+            row_color = color if color else QColor(255, 255, 255)
+            
+            print(f"[DEBUG-STAT] RECEIVED MASK: name={mask_name}, is_cell_mask={is_cell_mask}, min={np.min(labels)}, max={np.max(labels)}")
+            
+            new_ch = Channel(
+                name=mask_name, color=row_color, visible=True,
+                is_mask=(not is_cell_mask and not is_type_mask), 
+                is_cell_mask=is_cell_mask,
+                is_type_mask=is_type_mask,
+                mask_data=mask_data,
+                contour_data=contour_data,
+                source_marker=source_marker,
+                index=-1
+            )
+            self._channel_model.add_channel(new_ch)
+            
+            # Select it!
+            new_idx = self._channel_model.rowCount() - 1
+            idx_qt = self._channel_model.index(new_idx)
+            self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
+
+            self._status.showMessage(f"Task Complete: {mask_name}", 5000)
 
     @Slot(str)
     def _on_segmentation_error(self, message):
@@ -749,7 +961,7 @@ class MainWindow(QMainWindow):
                     new_name = f"Sampled{suffix}"
                     
                     contour_data = self._get_contour_data(mask_result)
-                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False)
+                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False, -1)
                 except Exception as e:
                     import traceback; traceback.print_exc()
                     self.segmentationError.emit(str(e))
@@ -793,7 +1005,7 @@ class MainWindow(QMainWindow):
                     new_name = f"{original_mask_ch.name}_Filter"
                 
                 contour_data = self._get_contour_data(mask_result)
-                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask)
+                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask, -1)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))

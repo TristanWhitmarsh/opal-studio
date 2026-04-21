@@ -242,6 +242,8 @@ class ChannelPanel(QWidget):
         type_header_layout.setContentsMargins(8, 8, 8, 8)
         
         type_top = QHBoxLayout()
+        type_top.addWidget(QLabel("Phenotypes"))
+        type_top.addStretch()
         btn_type_on = QPushButton("Show all")
         btn_type_off = QPushButton("Hide all")
         btn_type_on.clicked.connect(lambda: self._model.set_category_visible("type", True))
@@ -486,10 +488,19 @@ class ChannelPanel(QWidget):
 
     def _on_data_changed(self, top_left, bottom_right, roles):
         row = top_left.row()
-        if ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles:
+        if ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles or ChannelListModel.SelectedRole in roles:
             if 0 <= row < len(self._row_widgets):
                 ch = self._model.channel(row)
                 frame = self._row_widgets[row]
+                
+                if ChannelListModel.SelectedRole in roles:
+                    pal = frame.palette()
+                    color = frame.style().standardPalette().color(QPalette.ColorRole.Window)
+                    if ch.selected:
+                        color = color.darker(115)
+                    pal.setColor(QPalette.ColorRole.Window, color)
+                    frame.setPalette(pal)
+                    
                 try:
                     top_layout = frame.layout().itemAt(0).layout()
                     

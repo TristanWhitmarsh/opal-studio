@@ -296,7 +296,14 @@ class ChannelListModel(QAbstractListModel):
         elif role == self.RangeMaxRole:
             ch.range_max = float(value)
         elif role == self.SelectedRole:
-            ch.selected = bool(value)
+            is_selected = bool(value)
+            ch.selected = is_selected
+            if is_selected:
+                for i, other in enumerate(self._channels):
+                    if i != index.row() and other.selected:
+                        other.selected = False
+                        o_idx = self.index(i, 0)
+                        self.dataChanged.emit(o_idx, o_idx, [self.SelectedRole])
         elif role == self.ColorRole:
             ch.color = value
         elif role == self.AlphaRole:
