@@ -1,16 +1,11 @@
-name: opal-env
+name: opal-all
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.11
-  - "numpy<2"
+  - python=3.9
+  - cudatoolkit=11.2
+  - cudnn=8.1
   - pip
   - pip:
-    - PySide6
-    - tifffile
-    - zarr
-    - imagecodecs
-    - scikit-image
-    - stardist
-    - "cellpose<4.0"
+      - -r requirements.txt
