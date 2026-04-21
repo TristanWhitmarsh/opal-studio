@@ -441,7 +441,7 @@ class CellposeTab(QWidget):
         self._scan_models()
         form.addRow("Model:", self._model_combo)
 
-        self._diameter = QLineEdit()
+        self._diameter = QLineEdit("6.5")
         self._diameter.setPlaceholderText("Auto")
         self._diameter.setValidator(QDoubleValidator(0.1, 1000.0, 2))
         self._diameter.setFixedWidth(60)
@@ -709,7 +709,7 @@ class WatershedTab(QWidget):
         )
         form.addRow("Threshold:", self._threshold)
 
-        self._min_mean_intensity = QLineEdit("0")
+        self._min_mean_intensity = QLineEdit("0.02")
         self._min_mean_intensity.setValidator(QDoubleValidator(-1000000.0, 1000000.0, 4))
         self._min_mean_intensity.setFixedWidth(80)
         self._min_mean_intensity.setToolTip("Minimum mean intensity in a cell to keep it.")
