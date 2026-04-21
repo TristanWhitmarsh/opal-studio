@@ -601,7 +601,12 @@ class MainWindow(QMainWindow):
                         raw = raw[v_top:v_bottom, v_left:v_right]
 
                     # Normalize for deep learning models to prevent NMS hangs or junk results
-                    p = np.percentile(raw, (1, 99.8))
+                    # Subsample for percentile calculation if image is large
+                    if raw.size > 1000000:
+                        subsample = raw[::int(np.sqrt(raw.size/1000000)), ::int(np.sqrt(raw.size/1000000))]
+                        p = np.percentile(subsample, (1, 99.8))
+                    else:
+                        p = np.percentile(raw, (1, 99.8))
                     data = np.clip((raw - p[0]) / (p[1] - p[0] + 1e-6), 0, 1)
                     input_channels_data.append(data)
                     x = data if x is None else x + data
@@ -627,7 +632,7 @@ class MainWindow(QMainWindow):
                     input_stack = np.expand_dims(input_stack, axis=0) # add batch dim
                     
                     # Predict: returns (Batch, H, W, 2) where 0=cell, 1=nuclei
-                    labeled_combined = app.predict(input_stack, image_mpp=params.get("pixel_size", 1.0))
+                    labeled_combined = app.predict(input_stack, image_mpp=params.get("pixel_size", 1.0), batch_size=64)
                     
                     if labeled_combined.shape[-1] >= 2:
                         cell_labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
@@ -719,13 +724,16 @@ class MainWindow(QMainWindow):
                     labels, _ = model.predict_instances(x, n_tiles=n_tiles, **kwargs)
                 elif method == "cellpose":
                     from cellpose import models
+                    # Explicitly enable GPU for Cellpose
+                    import torch
+                    use_gpu = torch.cuda.is_available()
                     if params.get("model_path"):
-                        model = models.CellposeModel(pretrained_model=params["model_path"])
+                        model = models.CellposeModel(pretrained_model=params["model_path"], gpu=use_gpu)
                     else:
-                        model = models.Cellpose(model_type=params["model_name"])
+                        model = models.Cellpose(model_type=params["model_name"], gpu=use_gpu)
                     
                     channels = [[0, 0]]
-                    result = model.eval([x], diameter=params.get("diameter"), channels=channels)
+                    result = model.eval([x], diameter=params.get("diameter"), channels=channels, batch_size=64)
                     labels = result[0][0]
                 elif method == "instanseg":
                     from instanseg import InstanSeg
@@ -738,12 +746,17 @@ class MainWindow(QMainWindow):
                         model_name = local_model_dir
                         print(f"[InstanSeg] Using local model directory: {model_name}")
                     
-                    model = InstanSeg(model_name)
+                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    print(f"[InstanSeg] Using device: {device}")
+                    model = InstanSeg(model_name, device=device)
                     x_input = x
                     if "brightfield" in params["model_name"].lower() and x.ndim == 2:
                         x_input = np.stack([x]*3, axis=-1)
                     
-                    out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
+                    if max(x.shape[0], x.shape[1]) > 512:
+                        out, _ = model.eval_medium_image(x_input, params.get("pixel_size", 1.0), tile_size=512, batch_size=16)
+                    else:
+                        out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
                     
                     labels_tensor = out[0]
                     if hasattr(labels_tensor, 'cpu'):
@@ -1283,6 +1296,7 @@ class MainWindow(QMainWindow):
     def _get_contour_data(self, labels: np.ndarray) -> dict:
         """Generate vector contours from a label image (Pre-cached as QPolygonF)."""
         try:
+            import cv2
             objs = find_objects(labels)
             contour_data = {}
             
@@ -1292,25 +1306,30 @@ class MainWindow(QMainWindow):
                 
                 crop = labels[loc]
                 binary_crop = (crop == label_id).astype(np.uint8)
-                binary_crop = np.pad(binary_crop, 1, mode='constant', constant_values=0)
                 
-                objs_contours = find_contours(binary_crop, level=0.5)
-                if not objs_contours: continue
+                # Use OpenCV for much faster contour finding
+                cnts, _ = cv2.findContours(binary_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts: continue
                 
                 polygons = []
-                for c in objs_contours:
+                for c in cnts:
+                    if len(c) < 3: continue
                     qpoly = QPolygonF()
-                    for py, px in c:
-                        # Offset back to original image space + 0.5px shift
-                        oy = loc[0].start - 1 + py + 0.5
-                        ox = loc[1].start - 1 + px + 0.5
+                    for pt in c:
+                        px, py = pt[0]
+                        # Offset back to original image space
+                        oy = loc[0].start + py
+                        ox = loc[1].start + px
                         qpoly.append(QPointF(ox, oy))
+                    # Close the polygon
+                    qpoly.append(qpoly.at(0))
                     polygons.append(qpoly)
                 
-                contour_data[label_id] = {
-                    "polygons": polygons,
-                    "bbox": [loc[0].start, loc[1].start, loc[0].stop, loc[1].stop] # [y0, x0, y1, x1]
-                }
+                if polygons:
+                    contour_data[label_id] = {
+                        "polygons": polygons,
+                        "bbox": [loc[0].start, loc[1].start, loc[0].stop, loc[1].stop] # [y0, x0, y1, x1]
+                    }
             
             return contour_data
         except Exception as e:
