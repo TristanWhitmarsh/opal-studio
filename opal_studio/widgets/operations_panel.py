@@ -596,6 +596,12 @@ class MesmerTab(QWidget):
         self._membrane_combo.setMinimumWidth(50)
         form.addRow("Membrane:", self._membrane_combo)
 
+        # Compartment
+        self._compartment_combo = QComboBox()
+        self._compartment_combo.addItems(["nuclear", "whole-cell"])
+        self._compartment_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        form.addRow("Compartment:", self._compartment_combo)
+
         # API Key
         self._api_key = QLineEdit("0eJIjCpR.fYenvVnMb4ZAKCjxYnjZ1R2V6kvLdq5V")
         self._api_key.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -648,6 +654,7 @@ class MesmerTab(QWidget):
             "channel_indices": indices,
             "api_key": self._api_key.text(),
             "pixel_size": float(self._pixel_size.text() or 1.0),
+            "compartment": self._compartment_combo.currentText(),
         })
 
 class WatershedTab(QWidget):

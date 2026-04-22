@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import os
 import threading
+import multiprocessing
 from pathlib import Path
 import random
 import colorsys
@@ -581,21 +582,6 @@ class MainWindow(QMainWindow):
                 input_channels_data = []
                 print(f"[Segmentation] Model: {method} | Region: {region_mode} | Target: {target_mode}")
                 
-                # Setup logging/progress for specific models
-                if method in ["mesmer", "stardist"]:
-                    try:
-                        import tensorflow as tf
-                        gpus = tf.config.list_physical_devices('GPU')
-                        if gpus:
-                            for gpu in gpus:
-                                tf.config.experimental.set_memory_growth(gpu, True)
-                    except Exception: 
-                        pass # Ignore if already set or no GPU
-                
-                if method == "cellpose":
-                    from cellpose import io
-                    io.logger_setup()
-                
                 v_top, v_bottom, v_left, v_right = 0, 0, 0, 0
                 full_shape = None
                 
@@ -673,130 +659,12 @@ class MainWindow(QMainWindow):
                             full_labels[v_top:v_bottom, v_left:v_right] = out_labels
                             final_labels = full_labels
                     else:
-                        if existing_labels is not None:
-                            final_labels = out_labels
-                        else:
-                            final_labels = out_labels
+                        final_labels = out_labels
 
                     contour_data = self._get_contour_data(final_labels.astype(np.int32))
                     self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
 
-                if method == "mesmer":
-                    from deepcell.applications import Mesmer
-                    
-                    # Set API key for authentication
-                    if params.get("api_key"):
-                        os.environ["DEEPCELL_ACCESS_TOKEN"] = params["api_key"]
-                    
-                    app = Mesmer()
-                    
-                    # Mesmer expects [nuclear, membrane]
-                    n_data = input_channels_data[0]
-                    if len(input_channels_data) > 1:
-                        m_data = input_channels_data[1]
-                    else:
-                        m_data = np.zeros_like(n_data)
-                        
-                    # Prepare input: (Batch, H, W, 2)
-                    input_stack = np.stack([n_data, m_data], axis=-1)
-                    input_stack = np.expand_dims(input_stack, axis=0) # add batch dim
-                    
-                    # Predict: returns (Batch, H, W, 2) where 0=cell, 1=nuclei
-                    labeled_combined = app.predict(input_stack, image_mpp=params.get("pixel_size", 1.0), batch_size=16)
-                    
-                    if labeled_combined.shape[-1] >= 2:
-                        cell_labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
-                        nuc_labels = np.squeeze(labeled_combined[0, ..., 1]).astype(np.int32)
-                        
-
-                        # Emit cell labels as a side result if they exist
-                        if cell_labels.max() > 0:
-                            process_and_emit(cell_labels, "Mesmer Cells", True)
-                        
-                        labels = nuc_labels
-                        override_name = "Mesmer Nuclei"
-                    else:
-                        # Only one channel returned
-                        labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
-                        override_name = "Mesmer Mask"
-                    
-                    # Force release of session memory to prevent OOM in subsequent PyTorch calls
-                    import tensorflow as tf
-                    tf.keras.backend.clear_session()
-
-                elif method == "stardist":
-                    from stardist.models import StarDist2D
-                    model_folder = params.get("model_folder", params["model_name"])
-                    model_path = os.path.join(os.getcwd(), "models", model_folder)
-                    if os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "config.json")):
-                        model = StarDist2D(None, name=model_folder, basedir='models')
-                    else:
-                        model = StarDist2D.from_pretrained(params["model_name"])
-
-                    kwargs = {"nms_thresh": params["nms_thresh"]}
-                    if not params["use_default_thresh"]: kwargs["prob_thresh"] = params["prob_thresh"]
-                    
-                    # Automatic tiling for StarDist to prevent hangs/OOM on large images
-                    n_tiles = None
-                    if x.shape[0] > 1024 or x.shape[1] > 1024:
-                        n_tiles = (int(np.ceil(x.shape[0] / 1024)), int(np.ceil(x.shape[1] / 1024)))
-                        print(f"[StarDist] Large image detected ({x.shape}). Using tiling: {n_tiles}")
-                    
-                    labels, _ = model.predict_instances(x, n_tiles=n_tiles, **kwargs)
-                elif method == "cellpose":
-                    from cellpose import models
-                    # Explicitly enable GPU for Cellpose
-                    import torch
-                    use_gpu = torch.cuda.is_available()
-                    if params.get("model_path"):
-                        model = models.CellposeModel(pretrained_model=params["model_path"], gpu=use_gpu)
-                    else:
-                        model = models.Cellpose(model_type=params["model_name"], gpu=use_gpu)
-                    
-                    channels = [[0, 0]]
-                    # progress=True enables the tqdm bar in the console
-                    result = model.eval([x], diameter=params.get("diameter"), channels=channels, batch_size=64, progress=True)
-                    labels = result[0][0]
-                elif method == "instanseg":
-                    from instanseg import InstanSeg
-                    import torch
-                    
-                    model_name = params["model_name"]
-                    # Use local pre-downloaded model directory if available
-                    local_model_dir = os.path.join(os.getcwd(), "models", "instanseg", model_name)
-                    if os.path.exists(os.path.join(local_model_dir, "instanseg.pt")):
-                        model_name = local_model_dir
-                        print(f"[InstanSeg] Using local model directory: {model_name}")
-                    
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    print(f"[InstanSeg] Using device: {device}")
-                    model = InstanSeg(model_name, device=device)
-                    x_input = x
-                    if "brightfield" in params["model_name"].lower() and x.ndim == 2:
-                        x_input = np.stack([x]*3, axis=-1)
-                    
-                    if max(x.shape[0], x.shape[1]) > 512:
-                        out, _ = model.eval_medium_image(x_input, params.get("pixel_size", 1.0), tile_size=512, batch_size=16, show_progress=True)
-                    else:
-                        out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
-                    
-                    labels_tensor = out[0]
-                    if hasattr(labels_tensor, 'cpu'):
-                        labels_tensor = labels_tensor.cpu().numpy()
-                    elif hasattr(labels_tensor, 'numpy'):
-                        labels_tensor = labels_tensor.numpy()
-                        
-                    labels_tensor = np.squeeze(labels_tensor)
-                    if labels_tensor.ndim == 3:
-                        # Process extra channels like cells before proceeding with main labels (nuclei)
-                        for c in range(1, labels_tensor.shape[0]):
-                           # For side-channels from InstanSeg, we also pre-calculate contours
-                           side_labels = labels_tensor[c].astype(np.int32)
-                           process_and_emit(side_labels, override_name, True)
-                        labels = labels_tensor[0]
-                    else:
-                        labels = labels_tensor
-                elif method == "watershed":
+                if method == "watershed":
                     from skimage.filters import gaussian
                     from skimage.filters import threshold_local as sk_threshold_local
                     from skimage.filters import threshold_otsu as sk_threshold_otsu
@@ -817,20 +685,15 @@ class MainWindow(QMainWindow):
                     )
 
                     if labeller == "voronoi":
-                        # Blur and detect local maxima
                         blurred_spots = gaussian(nuclei_gauss, spot_sigma)
                         spot_centroids = local_maxima(blurred_spots)
-                        # Blur and threshold
                         blurred_outline = gaussian(nuclei_gauss, outline_sigma)
-                        # Normalise to [0, 255] for local thresholding
                         blurred_outline = (
                             (blurred_outline - blurred_outline.min())
                             / (blurred_outline.max() - blurred_outline.min() + 1e-8)
                             * 255
                         )
                         sk_thresh = sk_threshold_local(blurred_outline, 101, offset=0)
-                        # threshold acts as an additive offset: >1 makes segmentation stricter (fewer cells),
-                        # <1 makes it more permissive. Convert to 0-255 scale (range centre = 1.0).
                         thresh_offset = (threshold - 1.0) * 255 * 0.1
                         binary_otsu = blurred_outline > sk_thresh + thresh_offset
                         remaining_spots = spot_centroids * binary_otsu
@@ -854,64 +717,34 @@ class MainWindow(QMainWindow):
                                 if mean_val >= min_mean_intensity:
                                     mapping[cid] = cid
                             labels = mapping[labels]
-
-                # Process and emit final resulting labels
-                if labels is not None:
-                    try:
-                        # ensure process_and_emit exists (if not defined, fall back, e.g. single channel fallback)
-                        process_and_emit
-                    except NameError:
-                        def process_and_emit(out_labels, out_name, out_is_cell):
-                            if out_labels is None: return
-                            target_idx = -1
-                            if target_mode == "overwrite" and target_mask_index is not None:
-                                tgt_ch = self._channel_model.channel(target_mask_index)
-                                if getattr(tgt_ch, 'is_cell_mask', False) == out_is_cell:
-                                    target_idx = target_mask_index
-
-                            existing_labels = None
-                            if target_idx != -1:
-                                target_ch = self._channel_model.channel(target_idx)
-                                existing_labels = target_ch.mask_data.copy() if target_ch.mask_data is not None else None
-
-                            if region_mode == "visible":
-                                from skimage.segmentation import clear_border
-                                if out_labels.max() > 0:
-                                    out_labels = clear_border(out_labels)
-
-                                if existing_labels is not None:
-                                    viewport_ext = existing_labels[v_top:v_bottom, v_left:v_right]
-                                    if viewport_ext.shape[0] > 0 and viewport_ext.shape[1] > 0:
-                                        top_b = viewport_ext[0, :]
-                                        bot_b = viewport_ext[-1, :]
-                                        left_b = viewport_ext[:, 0]
-                                        right_b = viewport_ext[:, -1]
-                                        border_ids = np.unique(np.concatenate([top_b, bot_b, left_b, right_b]))
-                                        all_ids = np.unique(viewport_ext)
-                                        ids_to_remove = np.setdiff1d(all_ids, border_ids)
-                                        ids_to_remove = ids_to_remove[ids_to_remove > 0]
-                                        if len(ids_to_remove) > 0:
-                                            mask_to_remove = np.isin(existing_labels, ids_to_remove)
-                                            existing_labels[mask_to_remove] = 0
-
-                                    if out_labels.max() > 0:
-                                        max_id = existing_labels.max()
-                                        mask_new = out_labels > 0
-                                        existing_labels[v_top:v_bottom, v_left:v_right][mask_new] = out_labels[mask_new] + max_id
-                                    final_labels = existing_labels
-                                else:
-                                    full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
-                                    full_labels[v_top:v_bottom, v_left:v_right] = out_labels
-                                    final_labels = full_labels
-                            else:
-                                if existing_labels is not None:
-                                    final_labels = out_labels
-                                else:
-                                    final_labels = out_labels
-
-                            contour_data = self._get_contour_data(final_labels.astype(np.int32))
-                            self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
+                    
                     process_and_emit(labels, override_name, False)
+                else:
+                    # Run deep learning models in a separate process
+                    from opal_studio.segmentation_engine import run_segmentation_task_pipe
+                    
+                    ctx = multiprocessing.get_context("spawn")
+                    parent_conn, child_conn = ctx.Pipe()
+                    
+                    worker_params = params.copy()
+                    worker_params["override_name"] = override_name
+                    
+                    proc = ctx.Process(target=run_segmentation_task_pipe, args=(child_conn, worker_params, input_channels_data))
+                    proc.start()
+                    
+                    try:
+                        worker_res = parent_conn.recv()
+                    except EOFError:
+                        raise Exception("Worker process terminated unexpectedly.")
+                    finally:
+                        proc.join()
+                        parent_conn.close()
+                    
+                    if not worker_res.get("success"):
+                        raise Exception(f"Worker Error: {worker_res.get('error')}\n{worker_res.get('traceback')}")
+                    
+                    for out_labels, out_name, out_is_cell in worker_res.get("results", []):
+                        process_and_emit(out_labels, out_name, out_is_cell)
                 print(f"[Segmentation] Result emitted.")
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -1059,23 +892,10 @@ class MainWindow(QMainWindow):
 
         def _run():
             try:
-                import tensorflow as tf
-                from scipy.ndimage import label as cc_label
                 from opal_studio.image_loader import _get_yx
+                from opal_studio.segmentation_engine import run_positivity_task
                 
                 print(f"[AI] Starting cell positivity detection for mask: {original_mask_ch.name}")
-                
-                model_path = os.path.join(os.getcwd(), "models", "cellpos", "marker_cnn_epoch_100.h5")
-                if not os.path.exists(model_path):
-                    self.segmentationError.emit(f"Model not found: {model_path}")
-                    return
-                
-                print(f"[AI] Loading model: {model_path}")
-                model = tf.keras.models.load_model(model_path, compile=False)
-                
-                PATCH_SIZE = 64
-                THRESHOLD = 0.5
-                CHUNK_SIZE = 500
                 
                 target_channels = []
                 for i in range(self._channel_model.rowCount()):
@@ -1097,93 +917,34 @@ class MainWindow(QMainWindow):
                     copy_w = min(w, dw)
                     markers[:copy_h, :copy_w, z] = data[:copy_h, :copy_w]
 
-                def get_neighbor_slices(img_data, curr_z):
-                    Z = img_data.shape[2]
-                    if curr_z == 0:
-                        z_prev = curr_z
-                        z_next = curr_z + 1 if Z > 1 else curr_z
-                    elif curr_z == Z - 1:
-                        z_prev = curr_z - 1
-                        z_next = curr_z
-                    else:
-                        z_prev = curr_z - 1
-                        z_next = curr_z + 1
-                    return img_data[:, :, z_prev], img_data[:, :, curr_z], img_data[:, :, z_next]
+                # Run in worker process
+                ctx = multiprocessing.get_context("spawn")
+                queue = multiprocessing.Queue()
+                
+                proc = ctx.Process(target=run_positivity_task, args=(queue, params, {"labels": labels, "markers": markers}))
+                proc.start()
+                
+                try:
+                    worker_res = queue.get()
+                except Exception:
+                    raise Exception("Worker process failed to return result.")
+                finally:
+                    proc.join()
+                
+                if not worker_res.get("success"):
+                    raise Exception(f"Worker Error: {worker_res.get('error')}\n{worker_res.get('traceback')}")
+                
+                for slice_out, z_idx in worker_res.get("results", []):
+                    ch = target_channels[z_idx]
+                    self.segmentationResultReady.emit(slice_out, ch.name, True, ch.color, None, ch.name, False, -1)
+                    self.operationProgress.emit(z_idx + 1, S)
 
-                def center_crop_on_mask(img, mask, crop_size=64):
-                    H, W = img.shape[:2]
-                    ys, xs = np.where(mask > 0.5)
-                    if ys.size == 0:
-                        return None, None
-                    cy = int(np.mean(ys))
-                    cx = int(np.mean(xs))
-                    half = crop_size // 2
-                    y0 = max(0, cy - half)
-                    x0 = max(0, cx - half)
-                    y1 = min(H, y0 + crop_size)
-                    x1 = min(W, x0 + crop_size)
-                    if y1 - y0 < crop_size: y0 = max(0, y1 - crop_size)
-                    if x1 - x0 < crop_size: x0 = max(0, x1 - crop_size)
-                    return img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+                print("[AI] Cell positivity detection complete.")
+                self.operationFinished.emit(S)
 
-                self.operationProgress.emit(0, S)
-
-                for z in range(S):
-                    ch = target_channels[z]
-                    print(f"\nProcessing slice/channel {z+1}/{S}")
-                    img_prev, img_curr, img_next = get_neighbor_slices(markers, z)
-                    
-                    cell_region = labels > 0
-                    labeled_slice, num_components = cc_label(cell_region)
-                    
-                    if num_components == 0:
-                        continue
-                        
-                    slice_out = np.zeros_like(labels, dtype=np.int16)
-                    patches = []
-                    cell_ids = []
-                    
-                    def flush_chunk():
-                        if not patches: return
-                        X = np.stack(patches, axis=0).astype(np.float32)
-                        probs = model.predict(X, batch_size=512, verbose=0).reshape(-1)
-                        for cid, p in zip(cell_ids, probs):
-                            label_val = 2 if p >= THRESHOLD else 1
-                            slice_out[labeled_slice == cid] = label_val
-                        patches.clear()
-                        cell_ids.clear()
-                        
-                    for comp_id in range(1, num_components + 1):
-                        cell_mask_full = (labeled_slice == comp_id).astype(np.float32)
-                        img_curr_patch, cell_patch = center_crop_on_mask(img_curr, cell_mask_full, PATCH_SIZE)
-                        if img_curr_patch is None: continue
-                        
-                        ys, xs = np.where(cell_mask_full > 0.5)
-                        cy = int(np.mean(ys))
-                        cx = int(np.mean(xs))
-                        half = PATCH_SIZE // 2
-                        Hc, Wc = img_curr.shape
-                        y0 = max(0, cy - half)
-                        x0 = max(0, cx - half)
-                        y1 = min(Hc, y0 + PATCH_SIZE)
-                        x1 = min(Wc, x0 + PATCH_SIZE)
-                        if y1 - y0 < PATCH_SIZE: y0 = max(0, y1 - PATCH_SIZE)
-                        if x1 - x0 < PATCH_SIZE: x0 = max(0, x1 - PATCH_SIZE)
-                        
-                        img_prev_patch = img_prev[y0:y1, x0:x1]
-                        img_next_patch = img_next[y0:y1, x0:x1]
-                        
-                        stacked = np.stack([img_prev_patch, img_curr_patch, img_next_patch, cell_patch], axis=-1)
-                        patches.append(stacked)
-                        cell_ids.append(comp_id)
-                        
-                        if len(patches) >= CHUNK_SIZE:
-                            flush_chunk()
-                            
-                    flush_chunk()
-                    
-                    self.segmentationResultReady.emit(slice_out, f"{ch.name}", True, ch.color, None, ch.name, False)
-                    self.operationProgress.emit(z + 1, S)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.segmentationError.emit(str(e))
 
                 print("[AI] Cell positivity detection complete.")
                 self.operationFinished.emit(S)
