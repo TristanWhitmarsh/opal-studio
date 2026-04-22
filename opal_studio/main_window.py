@@ -217,7 +217,7 @@ class MainWindow(QMainWindow):
                     rgb = palette[i]
                     channels.append(Channel(
                         name=name, color=QColor(*rgb),
-                        visible=(i == 0), data_min=float(dmin), data_max=float(dmax), index=i
+                        visible=True, data_min=float(dmin), data_max=float(dmax), index=i
                     ))
                 self._channel_model.set_channels(channels)
 

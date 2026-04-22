@@ -16,54 +16,66 @@ import colorsys
 import numpy as np
 
 
-def generate_spaced_colors(target_count=100):
+def generate_spaced_colors(target_count=100, min_dist=75):
     """
     Generates a set of visually distinct colors by finding the largest gaps
     in the hue space and subdividing them.
+    
+    New Constraint: The selected midpoint must be at least min_dist (hue space) 
+    away from the previous color to prevent adjacent channels from appearing 
+    too similar in sequence.
     """
     # Starting colors: Red, Green, Blue (RGB tuples)
     colors_rgb = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
     
-    # We assume Saturation and Value are at 100% (1.0) based on pure red, green, and blue
+    # We assume Saturation and Value are at 100% (1.0)
     saturation = 1.0
     value = 1.0
     
     while len(colors_rgb) < target_count:
-        hues = []
+        hues_list = []
         
         # 1. Convert all current RGB colors to Hue (0-255 scale)
         for r, g, b in colors_rgb:
-            # colorsys expects inputs in the 0.0 - 1.0 range
             h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
-            hues.append(h * 256.0) # Scale to 256 so it wraps perfectly from 255 to 0
+            hues_list.append(h * 256.0)
             
+        last_h = hues_list[-1]
+        
         # 2. Sort the hues to find the gaps between adjacent colors
-        hues.sort()
+        sorted_hues = sorted(hues_list)
         
-        max_gap = -1
-        best_midpoint = 0
-        
-        # 3. Find the biggest gap, accounting for the circular nature of the hue wheel
-        for i in range(len(hues)):
-            h1 = hues[i]
-            # Next hue (wrap around to the first hue if we are at the end of the list)
-            h2 = hues[(i + 1) % len(hues)]
+        # 3. Collect all gaps and their midpoints
+        gaps = [] # list of (gap_size, midpoint)
+        for i in range(len(sorted_hues)):
+            h1 = sorted_hues[i]
+            h2 = sorted_hues[(i + 1) % len(sorted_hues)]
             
-            # If we are looking at the gap between the last color and the first color
-            if i == len(hues) - 1:
+            if i == len(sorted_hues) - 1:
                 gap = (h2 + 256.0) - h1
             else:
                 gap = h2 - h1
+            
+            midpoint = (h1 + (gap / 2.0)) % 256.0
+            gaps.append((gap, midpoint))
+            
+        # 4. Sort gaps by size (largest first)
+        gaps.sort(key=lambda x: x[0], reverse=True)
+        
+        # 5. Pick the largest gap that satisfies the distance constraint from the previous hue
+        best_midpoint = gaps[0][1] # Fallback to the absolute largest gap
+        for gap_size, midpoint in gaps:
+            # Distance on a circle (0-256)
+            diff = abs(midpoint - last_h)
+            dist = min(diff, 256.0 - diff)
+            
+            if dist >= min_dist:
+                best_midpoint = midpoint
+                break
                 
-            # 4. Save the midpoint of the largest gap
-            if gap > max_gap:
-                max_gap = gap
-                best_midpoint = (h1 + (gap / 2.0)) % 256.0
-                
-        # 5. Convert the new midpoint hue back to an RGB color
+        # 6. Convert the chosen midpoint hue back to an RGB color
         r_float, g_float, b_float = colorsys.hsv_to_rgb(best_midpoint / 256.0, saturation, value)
         
-        # Convert back to 0-255 integers and append to our list
         new_color = (
             int(round(r_float * 255)), 
             int(round(g_float * 255)), 
