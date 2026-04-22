@@ -347,7 +347,7 @@ class StarDistTab(QWidget):
         self._scan_models()
         form.addRow("Model:", self._model_combo)
 
-        self._prob_thresh = QLineEdit()
+        self._prob_thresh = QLineEdit("0.1")
         self._prob_thresh.setPlaceholderText("Auto")
         self._prob_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
         self._prob_thresh.setFixedWidth(60)
