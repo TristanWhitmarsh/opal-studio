@@ -343,7 +343,7 @@ class StarDistTab(QWidget):
         self._model_combo = QComboBox()
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._model_combo.setMinimumWidth(50)
-        self._model_combo.addItems(["2D_versatile_fluo", "2D_versatile_he", "2D_paper_dsb2018"])
+        self._model_combo.addItems(["2D_versatile_fluo", "2D_paper_dsb2018"])
         self._scan_models()
         form.addRow("Model:", self._model_combo)
 
@@ -524,8 +524,6 @@ class InstanSegTab(QWidget):
         self._model_combo.addItems([
             "single_channel_nuclei",
             "fluorescence_nuclei_and_cells",
-            "brightfield_nuclei",
-            "multi_channel_fluorescence"
         ])
         form.addRow("Model:", self._model_combo)
 

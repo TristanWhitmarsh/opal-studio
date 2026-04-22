@@ -10,14 +10,20 @@ authors = [
     {name = "Tristan"}
 ]
 license = {text = "MIT + Commons Clause"}
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
-    "PySide6",
+    "PySide6>=6.5.0",
     "tifffile",
-    "zarr",
     "imagecodecs",
-    "numpy",
+    "numpy<2.0.0",
     "scikit-image",
+    "pandas",
+    "tensorflow==2.8.0",
+    "torch>=2.0.0",
+    "deepcell",
+    "stardist",
+    "cellpose",
+    "instanseg-torch",
 ]
 
 [project.scripts]

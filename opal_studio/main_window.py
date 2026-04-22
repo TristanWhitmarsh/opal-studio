@@ -627,6 +627,60 @@ class MainWindow(QMainWindow):
                     input_channels_data.append(data)
                     x = data if x is None else x + data
                 
+                def process_and_emit(out_labels, out_name, out_is_cell):
+                    if out_labels is None: return
+                    target_idx = -1
+                    if target_mode == "overwrite" and target_mask_index is not None:
+                        tgt_ch = self._channel_model.channel(target_mask_index)
+                        if getattr(tgt_ch, 'is_cell_mask', False) == out_is_cell:
+                            target_idx = target_mask_index
+
+                    existing_labels = None
+                    if target_idx != -1:
+                        target_ch = self._channel_model.channel(target_idx)
+                        existing_labels = target_ch.mask_data.copy() if target_ch.mask_data is not None else None
+
+                    if region_mode == "visible":
+                        from skimage.segmentation import clear_border
+                        if out_labels.max() > 0:
+                            out_labels = clear_border(out_labels)
+
+                        if existing_labels is not None:
+                            # 1. remove cells in existing_labels that are inside the viewport but don't touch viewport bounds
+                            viewport_ext = existing_labels[v_top:v_bottom, v_left:v_right]
+                            if viewport_ext.shape[0] > 0 and viewport_ext.shape[1] > 0:
+                                top_b = viewport_ext[0, :]
+                                bot_b = viewport_ext[-1, :]
+                                left_b = viewport_ext[:, 0]
+                                right_b = viewport_ext[:, -1]
+                                border_ids = np.unique(np.concatenate([top_b, bot_b, left_b, right_b]))
+                                all_ids = np.unique(viewport_ext)
+                                ids_to_remove = np.setdiff1d(all_ids, border_ids)
+                                ids_to_remove = ids_to_remove[ids_to_remove > 0]
+                                if len(ids_to_remove) > 0:
+                                    mask_to_remove = np.isin(existing_labels, ids_to_remove)
+                                    existing_labels[mask_to_remove] = 0
+
+                            # 2. Add out_labels into existing_labels offsetting IDs
+                            if out_labels.max() > 0:
+                                max_id = existing_labels.max()
+                                mask_new = out_labels > 0
+                                existing_labels[v_top:v_bottom, v_left:v_right][mask_new] = out_labels[mask_new] + max_id
+                            final_labels = existing_labels
+                        else:
+                            # New mask, apply zeros outside
+                            full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
+                            full_labels[v_top:v_bottom, v_left:v_right] = out_labels
+                            final_labels = full_labels
+                    else:
+                        if existing_labels is not None:
+                            final_labels = out_labels
+                        else:
+                            final_labels = out_labels
+
+                    contour_data = self._get_contour_data(final_labels.astype(np.int32))
+                    self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
+
                 if method == "mesmer":
                     from deepcell.applications import Mesmer
                     
@@ -654,59 +708,6 @@ class MainWindow(QMainWindow):
                         cell_labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
                         nuc_labels = np.squeeze(labeled_combined[0, ..., 1]).astype(np.int32)
                         
-                        def process_and_emit(out_labels, out_name, out_is_cell):
-                            if out_labels is None: return
-                            target_idx = -1
-                            if target_mode == "overwrite" and target_mask_index is not None:
-                                tgt_ch = self._channel_model.channel(target_mask_index)
-                                if getattr(tgt_ch, 'is_cell_mask', False) == out_is_cell:
-                                    target_idx = target_mask_index
-
-                            existing_labels = None
-                            if target_idx != -1:
-                                target_ch = self._channel_model.channel(target_idx)
-                                existing_labels = target_ch.mask_data.copy() if target_ch.mask_data is not None else None
-
-                            if region_mode == "visible":
-                                from skimage.segmentation import clear_border
-                                if out_labels.max() > 0:
-                                    out_labels = clear_border(out_labels)
-
-                                if existing_labels is not None:
-                                    # 1. remove cells in existing_labels that are inside the viewport but don't touch viewport bounds
-                                    viewport_ext = existing_labels[v_top:v_bottom, v_left:v_right]
-                                    if viewport_ext.shape[0] > 0 and viewport_ext.shape[1] > 0:
-                                        top_b = viewport_ext[0, :]
-                                        bot_b = viewport_ext[-1, :]
-                                        left_b = viewport_ext[:, 0]
-                                        right_b = viewport_ext[:, -1]
-                                        border_ids = np.unique(np.concatenate([top_b, bot_b, left_b, right_b]))
-                                        all_ids = np.unique(viewport_ext)
-                                        ids_to_remove = np.setdiff1d(all_ids, border_ids)
-                                        ids_to_remove = ids_to_remove[ids_to_remove > 0]
-                                        if len(ids_to_remove) > 0:
-                                            mask_to_remove = np.isin(existing_labels, ids_to_remove)
-                                            existing_labels[mask_to_remove] = 0
-
-                                    # 2. Add out_labels into existing_labels offsetting IDs
-                                    if out_labels.max() > 0:
-                                        max_id = existing_labels.max()
-                                        mask_new = out_labels > 0
-                                        existing_labels[v_top:v_bottom, v_left:v_right][mask_new] = out_labels[mask_new] + max_id
-                                    final_labels = existing_labels
-                                else:
-                                    # New mask, apply zeros outside
-                                    full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
-                                    full_labels[v_top:v_bottom, v_left:v_right] = out_labels
-                                    final_labels = full_labels
-                            else:
-                                if existing_labels is not None:
-                                    final_labels = out_labels
-                                else:
-                                    final_labels = out_labels
-
-                            contour_data = self._get_contour_data(final_labels.astype(np.int32))
-                            self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
 
                         # Emit cell labels as a side result if they exist
                         if cell_labels.max() > 0:
