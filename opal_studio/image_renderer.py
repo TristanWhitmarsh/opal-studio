@@ -101,9 +101,9 @@ def render_viewport_tiled(
     Result is a single image -- atomic swap, no visible tile seams.
     """
     if img.is_rgb:
-        return _render_viewport_rgb(img, level_idx, viewport)
+        return _render_viewport_rgb(cache, img, level_idx, viewport, tile_size)
     return _render_viewport_multichannel(
-        img, channels, level_idx, viewport, brightness
+        cache, img, channels, level_idx, viewport, brightness, tile_size
     )
 
 
@@ -160,7 +160,7 @@ def render_viewport(
 # RGB paths
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_viewport_rgb(img: ImageData, level_idx: int, viewport: QRectF) -> tuple:
+def _render_viewport_rgb(cache: TileCache, img: ImageData, level_idx: int, viewport: QRectF, tile_size: int) -> tuple:
     lvl = img.levels[level_idx]
     ds = lvl.downsample
     lh, lw = _get_yx(lvl.shape, img.axes, img.is_rgb)
@@ -172,7 +172,7 @@ def _render_viewport_rgb(img: ImageData, level_idx: int, viewport: QRectF) -> tu
                          (lv_x1 - lv_x0) * ds, (lv_y1 - lv_y0) * ds)
     if lv_y1 <= lv_y0 or lv_x1 <= lv_x0:
         return _blank_qimage(1, 1), actual_rect
-    tile = get_tile(img, level_idx, None, slice(lv_y0, lv_y1), slice(lv_x0, lv_x1))
+    tile = _read_channel_slice(cache, img, level_idx, None, slice(lv_y0, lv_y1), slice(lv_x0, lv_x1), tile_size)
     return _rgb_array_to_qimage(_to_uint8(tile)), actual_rect
 
 
@@ -201,11 +201,13 @@ def _rgb_array_to_qimage(tile: np.ndarray) -> QImage:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _render_viewport_multichannel(
+    cache: TileCache,
     img: ImageData,
     channels: List[Channel],
     level_idx: int,
     viewport: QRectF,
     brightness: float,
+    tile_size: int,
 ) -> tuple:
     lvl = img.levels[level_idx]
     ds = lvl.downsample
@@ -230,7 +232,7 @@ def _render_viewport_multichannel(
     # Scale factor for additive blending
     intensity_channels = [c for c in channels if not c.is_mask
                           and not c.is_cell_mask and not c.is_type_mask]
-    scale = brightness * len(intensity_channels) if intensity_channels else brightness
+    scale = brightness / len(intensity_channels) if intensity_channels else brightness
 
     # Channels that need a disk page read: everything that doesn't have
     # ready-to-use in-memory data.  A channel with is_processed=True but
@@ -253,7 +255,7 @@ def _render_viewport_multichannel(
         future_to_ch = {
             _READ_POOL.submit(
                 _read_channel_slice,
-                img, level_idx, ch.index, y_sl, x_sl,
+                cache, img, level_idx, ch.index, y_sl, x_sl, tile_size,
             ): ch
             for ch in disk_channels
         }
@@ -321,7 +323,7 @@ def _render_multichannel(
 
     intensity_channels = [c for c in channels if not c.is_mask
                           and not c.is_cell_mask and not c.is_type_mask]
-    scale = brightness * len(intensity_channels) if intensity_channels else brightness
+    scale = brightness / len(intensity_channels) if intensity_channels else brightness
 
     h, w = 0, 0
     canvas = None
@@ -364,34 +366,84 @@ def _render_multichannel(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_channel_slice(
+    cache: TileCache,
     img: ImageData,
     level_idx: int,
-    channel: int,
+    channel: Optional[int],
     y_sl: slice,
     x_sl: slice,
+    tile_size: int,
 ) -> np.ndarray:
     """
-    Thread-safe channel read via a per-thread TiffFile instance.
-
-    Each worker thread in _READ_POOL has its own TiffFile so seeks never
-    collide.  If the level is already fully cached in RAM (a numpy array),
-    we read from there without touching the file at all.
+    Assemble the viewport from cached tiles.
+    Missing tiles are read via a thread-local TiffFile instance to avoid collisions.
     """
     # Fast path: use the in-RAM level cache -- numpy reads are thread-safe.
     lvl = img.levels[level_idx]
     if lvl._cache is not None:
         return get_tile(img, level_idx, channel, y_sl, x_sl)  # slices cache
 
-    # Slow path: read from file using a THREAD-LOCAL TiffFile (own handle).
-    try:
-        tif  = _get_thread_tif(img)
-        page = tif.series[0].levels[level_idx].pages[channel]
-        raw  = page.asarray()
-        return raw[y_sl, x_sl]
-    except Exception:
-        # Fallback to the shared handle (last resort; single-level files with
-        # no pyramid attribute, etc.).
-        return get_tile(img, level_idx, channel, y_sl, x_sl)
+    vh = y_sl.stop - y_sl.start
+    vw = x_sl.stop - x_sl.start
+    
+    if img.is_rgb:
+        out = np.zeros((vh, vw, 3), dtype=img.dtype)
+    else:
+        out = np.zeros((vh, vw), dtype=img.dtype)
+
+    col_start = x_sl.start // tile_size
+    col_end   = (x_sl.stop - 1) // tile_size
+    row_start = y_sl.start // tile_size
+    row_end   = (y_sl.stop - 1) // tile_size
+
+    lh, lw = _get_yx(lvl.shape, img.axes, img.is_rgb)
+    tif = None
+    page_array = None
+
+    for tr in range(row_start, row_end + 1):
+        for tc in range(col_start, col_end + 1):
+            key = (level_idx, channel, tr, tc, tile_size)
+            tile = cache.get(key)
+            
+            if tile is None:
+                if page_array is None and not img.is_rgb:
+                    try:
+                        tif = _get_thread_tif(img)
+                        page = tif.series[0].levels[level_idx].pages[channel]
+                        page_array = page.asarray()
+                    except Exception:
+                        pass # Fallback to get_tile
+                        
+                ty0 = tr * tile_size
+                tx0 = tc * tile_size
+                ty1 = min(ty0 + tile_size, lh)
+                tx1 = min(tx0 + tile_size, lw)
+                
+                if page_array is not None and not img.is_rgb:
+                    tile = page_array[ty0:ty1, tx0:tx1]
+                else:
+                    tile = get_tile(img, level_idx, channel, slice(ty0, ty1), slice(tx0, tx1))
+                    
+                tile = np.ascontiguousarray(tile)
+                cache.put(key, tile)
+                
+            # Paste tile into output array
+            ty0 = tr * tile_size
+            tx0 = tc * tile_size
+            
+            dy = max(0, ty0 - y_sl.start)
+            dx = max(0, tx0 - x_sl.start)
+            
+            sy = max(0, y_sl.start - ty0)
+            sx = max(0, x_sl.start - tx0)
+            
+            h = min(tile.shape[0] - sy, vh - dy)
+            w = min(tile.shape[1] - sx, vw - dx)
+            
+            if h > 0 and w > 0:
+                out[dy:dy+h, dx:dx+w] = tile[sy:sy+h, sx:sx+w]
+
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
