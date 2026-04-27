@@ -391,10 +391,19 @@ class ImageCanvas(QWidget):
                                 bbox[3] < vpt.left() or bbox[1] > vpt.right()):
                             continue
                         if ch.is_mask:
-                            rng.seed(int(lid))
-                            col = QColor.fromRgbF(rng.random(), rng.random(), rng.random())
+                            if ch.random_contour_colors:
+                                rng.seed(int(lid))
+                                col = QColor.fromRgbF(rng.random(), rng.random(), rng.random())
+                            else:
+                                col = ch.color
                         else:
-                            col = QColor(0, 255, 0) if lid == 1 else QColor(255, 0, 0)
+                            # is_cell_mask
+                            state = lid # fallback
+                            if ch.pos_lut is not None and lid < len(ch.pos_lut):
+                                state = ch.pos_lut[lid]
+                            
+                            # Inverted colors for contrast: Red contour on Green cell, Green contour on Red cell
+                            col = QColor(255, 0, 0) if state == 2 else QColor(0, 255, 0) # 2=pos (red contour), 1=neg (green contour)
                         pen.setColor(col)
                         p.setPen(pen)
                         for qpoly in data["polygons"]:

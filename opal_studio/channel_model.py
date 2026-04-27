@@ -108,6 +108,8 @@ class Channel:
     contour_visible: bool = False
     is_type_mask: bool = False
     source_marker: str = ""
+    pos_lut: np.ndarray | None = None
+    random_contour_colors: bool = True
 
 
 class ChannelListModel(QAbstractListModel):
@@ -233,14 +235,13 @@ class ChannelListModel(QAbstractListModel):
         self.endInsertRows()
         self.channels_changed.emit()
 
-    def get_unique_name(self, base_name: str) -> str:
-        """Find the next available name by appending an incrementing number."""
+    def get_unique_name(self, base_name: str, always_suffix: bool = False) -> str:
+        """Find the next available name, optionally appending an incrementing number."""
         existing_names = {c.name for c in self._channels}
         
-        # If the base name doesn't exist at all, we can use it? 
-        # But user wants "DNA_Equal1" even if "DNA_Equal" doesn't exist.
-        # Let's assume the base_name passed in is "DNA_Equal" or "DNA_Median".
-        
+        if not always_suffix and base_name not in existing_names:
+            return base_name
+            
         i = 1
         while True:
             candidate = f"{base_name}{i}"

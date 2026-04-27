@@ -491,7 +491,14 @@ def _composite_channel(
                     )
 
         elif ch.is_cell_mask:
-            m1, m2 = labels == 1, labels == 2
+            if ch.pos_lut is not None:
+                # Use LUT to map unique labels to positivity states
+                states = ch.pos_lut[labels]
+                m1, m2 = states == 1, states == 2
+            else:
+                # Fallback to direct state map (0,1,2)
+                m1, m2 = labels == 1, labels == 2
+                
             if np.any(m1):
                 canvas[m1] = ((1.0 - alpha_mask) * canvas[m1]
                               + alpha_mask * np.array([0.0, 1.0, 0.0], np.float32))

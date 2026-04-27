@@ -127,7 +127,7 @@ class EqualizeTab(QWidget):
         form.addRow("Range:", p_lay)
 
         # CLAHE (Always on, just show parameters)
-        self.clahe_clip = QLineEdit("0.01")
+        self.clahe_clip = QLineEdit("0.05")
         self.clahe_clip.setValidator(QDoubleValidator(0.001, 1.0, 3))
         self.clahe_clip.setFixedWidth(60)
         form.addRow("Clip:", self.clahe_clip)
@@ -855,10 +855,24 @@ class MaskExpansionTab(QWidget):
         self._mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._mask_combo.setMinimumWidth(50)
         form.addRow("Mask:", self._mask_combo)
+
         self._pixels = QLineEdit("6")
         self._pixels.setValidator(QIntValidator(1, 100))
         self._pixels.setFixedWidth(60)
         form.addRow("Expand:", self._pixels)
+
+        # Method selector
+        self._method_combo = QComboBox()
+        self._method_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._method_combo.setMinimumWidth(50)
+        self._method_combo.addItem("Binary Mask", "binary_mask")
+        self._method_combo.addItem("Label Map", "label_map")
+        self._method_combo.setToolTip(
+            "Binary Mask: expands each cell using watershed, creating separation lines between touching cells.\n"
+            "Label Map: expands each cell with its integer label value, no watershed lines."
+        )
+        form.addRow("Method:", self._method_combo)
+
         layout.addLayout(form)
 
         # Run Button
@@ -882,10 +896,12 @@ class MaskExpansionTab(QWidget):
 
     def _on_run(self):
         if self._mask_combo.currentIndex() < 0: return
+        method = self._method_combo.currentData()
+        tool = "expansion_watershed" if method == "binary_mask" else "expansion_labelmap"
         self.runRequested.emit({
             "mask_index": self._mask_combo.currentData(),
             "expansion_pixels": int(self._pixels.text() or 6),
-            "tool": "expansion_watershed"
+            "tool": tool
         })
 
     def setEnabled(self, enabled):
@@ -978,6 +994,287 @@ class CellSamplerTab(QWidget):
         self._run_btn.setEnabled(enabled)
 
 
+class ThresholdPositivityTab(QWidget):
+    """
+    Threshold-based cell positivity tab.
+
+    Workflow
+    --------
+    1. User picks a cell-mask and clicks "Get Thresholds".
+       → Background thread computes per-cell mean intensity for every
+         image channel using scipy.ndimage.mean (one vectorised call per
+         channel, fast for 10 k cells).
+    2. For each channel the Otsu threshold over the per-cell means is
+       calculated and stored.  A channel dropdown + scrollbar let the
+       user inspect and adjust any channel's threshold interactively.
+    3. On every scrollbar move the positivity map is rebuilt with a
+       single numpy LUT lookup (O(H×W), no Python cell loop) and the
+       existing channel's mask_data is updated in-place, triggering a
+       canvas repaint without creating a new channel object.
+    """
+
+    runThresholdComputeRequested = Signal(dict)   # {mask_index}
+    applyThresholdRequested      = Signal(dict)   # {ch_index, threshold, mask_index, ch_name, ch_color}
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+
+        # State shared with MainWindow after compute
+        # keyed by image-channel model index → np.ndarray of per-cell means
+        # index 0 = background (always 0)
+        self._cell_means: dict[int, np.ndarray] = {}
+        self._labels: np.ndarray | None = None          # the label map used for compute
+        self._mask_model_index: int = -1                # which mask channel was used
+        self._otsu_thresholds: dict[int, float] = {}    # ch_model_idx → otsu threshold
+        self._generated_ch_indices: dict[int, int] = {} # ch_model_idx → result channel model idx
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+
+        # Mask picker
+        self._mask_combo = QComboBox()
+        self._mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._mask_combo.setMinimumWidth(50)
+        form.addRow("Mask:", self._mask_combo)
+        layout.addLayout(form)
+
+        self._get_btn = QPushButton("Get Thresholds")
+        self._get_btn.clicked.connect(self._on_get)
+        layout.addWidget(self._get_btn)
+
+        # ---- interactive threshold controls (hidden until compute done) ----
+        self._controls = QWidget()
+        ctrl_lay = QVBoxLayout(self._controls)
+        ctrl_lay.setContentsMargins(0, 6, 0, 0)
+        ctrl_lay.setSpacing(6)
+
+        ctrl_form = QFormLayout()
+        ctrl_form.setContentsMargins(0, 0, 0, 0)
+        ctrl_form.setSpacing(6)
+        ctrl_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        ctrl_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        ctrl_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        ctrl_form.setHorizontalSpacing(4)
+
+        self._channel_combo = QComboBox()
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        ctrl_form.addRow("Channel:", self._channel_combo)
+        ctrl_lay.addLayout(ctrl_form)
+
+        # Threshold value input
+        thresh_row = QHBoxLayout()
+        thresh_row.addWidget(QLabel("Threshold:"))
+        self._thresh_input = QLineEdit()
+        self._thresh_input.setFixedWidth(80)
+        self._thresh_input.setValidator(QDoubleValidator())
+        self._thresh_input.editingFinished.connect(self._on_input_changed)
+        thresh_row.addWidget(self._thresh_input)
+        thresh_row.addStretch()
+        self._pos_count_label = QLabel("")
+        thresh_row.addWidget(self._pos_count_label)
+        ctrl_lay.addLayout(thresh_row)
+
+        # Scrollbar for threshold
+        from PySide6.QtWidgets import QScrollBar
+        self._slider = QScrollBar(Qt.Orientation.Horizontal)
+        self._slider.setMinimum(0)
+        self._slider.setMaximum(1000)   # mapped to [min_mean, max_mean]
+        self._slider.setPageStep(10)
+        self._slider.valueChanged.connect(self._on_slider_changed)
+        ctrl_lay.addWidget(self._slider)
+
+        layout.addWidget(self._controls)
+        self._controls.setVisible(False)
+        layout.addStretch()
+
+        self._refresh_masks()
+        self._channel_model.modelReset.connect(self._refresh_masks)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_masks())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_masks())
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_masks(self):
+        current = self._mask_combo.currentText()
+        self._mask_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_mask:
+                self._mask_combo.addItem(ch.name, i)
+        idx = self._mask_combo.findText(current)
+        if idx >= 0:
+            self._mask_combo.setCurrentIndex(idx)
+
+    def _on_get(self):
+        if self._mask_combo.currentIndex() < 0:
+            return
+        self._get_btn.setEnabled(False)
+        self._controls.setVisible(False)
+        mask_idx = self._mask_combo.currentData()
+        self.runThresholdComputeRequested.emit({"mask_index": mask_idx})
+
+    def receive_means(self, labels, cell_means: dict, otsu_thresholds: dict, mask_model_index: int):
+        """
+        Called from MainWindow (main thread via signal) when per-cell
+        means are ready.
+
+        Parameters
+        ----------
+        labels            : (H,W) int32 label map
+        cell_means        : {ch_model_idx: np.ndarray[max_label+1]}  (index 0 = bg)
+        otsu_thresholds   : {ch_model_idx: float}
+        mask_model_index  : which mask channel was used
+        """
+        self._labels = labels
+        self._cell_means = cell_means
+        self._otsu_thresholds = otsu_thresholds
+        self._mask_model_index = mask_model_index
+        self._generated_ch_indices = {}
+
+        # Populate channel dropdown with image channels that have means
+        prev = self._channel_combo.currentData()
+        self._channel_combo.blockSignals(True)
+        self._channel_combo.clear()
+        for ch_idx in sorted(cell_means.keys()):
+            ch = self._channel_model.channel(ch_idx)
+            self._channel_combo.addItem(ch.name, ch_idx)
+        self._channel_combo.blockSignals(False)
+
+        # Restore previous selection or default to first
+        restore = self._channel_combo.findData(prev)
+        self._channel_combo.setCurrentIndex(restore if restore >= 0 else 0)
+
+        # Apply Otsu thresholds for ALL channels immediately
+        for ch_idx, otsu in self._otsu_thresholds.items():
+            ch = self._channel_model.channel(ch_idx)
+            self.applyThresholdRequested.emit({
+                "ch_model_index":   ch_idx,
+                "threshold":        otsu,
+                "mask_index":       self._mask_model_index,
+                "ch_name":          ch.name,
+                "ch_color":         ch.color,
+                "target_ch_index":  -1,
+            })
+
+        self._controls.setVisible(True)
+        self._get_btn.setEnabled(True)
+        self._on_channel_changed()  # Sync slider to Otsu threshold
+
+    def _on_channel_changed(self):
+        """Update slider range and position to the Otsu threshold for the selected channel."""
+        ch_idx = self._channel_combo.currentData()
+        if ch_idx is None or ch_idx not in self._cell_means:
+            return
+        means = self._cell_means[ch_idx]
+        # means[0] = background; ignore it
+        valid = means[1:]
+        if valid.size == 0:
+            return
+        self._means_min = float(np.min(valid))
+        self._means_max = float(np.max(valid))
+        if self._means_max <= self._means_min:
+            self._means_max = self._means_min + 1.0
+
+        # Set slider position to Otsu threshold (safely)
+        otsu = self._otsu_thresholds.get(ch_idx, (self._means_min + self._means_max) / 2)
+        rng = self._means_max - self._means_min
+        if rng > 0 and not np.isnan(otsu):
+            slider_val = int((otsu - self._means_min) / rng * 1000)
+            self._slider.blockSignals(True)
+            self._slider.setValue(max(0, min(1000, slider_val)))
+            self._slider.blockSignals(False)
+        else:
+            self._slider.setValue(0)
+
+        self._update_threshold_display()
+        # Apply immediately to show the Otsu result for this channel
+        self._emit_apply()
+
+    def _on_slider_changed(self):
+        self._update_threshold_display()
+        self._emit_apply()
+
+    def _on_input_changed(self):
+        try:
+            val = float(self._thresh_input.text())
+            if hasattr(self, '_means_min') and hasattr(self, '_means_max') and self._means_max > self._means_min:
+                # Update slider position
+                frac = (val - self._means_min) / (self._means_max - self._means_min)
+                self._slider.blockSignals(True)
+                self._slider.setValue(max(0, min(1000, int(frac * 1000))))
+                self._slider.blockSignals(False)
+                # Update pos count display
+                ch_idx = self._channel_combo.currentData()
+                means = self._cell_means.get(ch_idx)
+                if means is not None:
+                    n_pos = int(np.sum(means[1:] >= val))
+                    n_total = int(np.sum(means[1:] > 0))
+                    self._pos_count_label.setText(f"{n_pos}/{n_total}")
+                self._emit_apply()
+        except ValueError:
+            pass
+
+    def _update_threshold_display(self):
+        thresh = self._current_threshold()
+        if thresh is None:
+            return
+        # Count positive cells
+        ch_idx = self._channel_combo.currentData()
+        means = self._cell_means.get(ch_idx)
+        if means is not None:
+            n_pos = int(np.sum(means[1:] >= thresh))
+            n_total = int(np.sum(means[1:] > 0))  # cells with any signal
+            self._pos_count_label.setText(f"{n_pos}/{n_total}")
+        self._thresh_input.blockSignals(True)
+        self._thresh_input.setText(f"{thresh:.4g}")
+        self._thresh_input.blockSignals(False)
+
+    def _current_threshold(self) -> float | None:
+        if not hasattr(self, '_means_min'):
+            return None
+        frac = self._slider.value() / 1000.0
+        return self._means_min + frac * (self._means_max - self._means_min)
+
+    def _emit_apply(self):
+        thresh = self._current_threshold()
+        if thresh is None or self._labels is None:
+            return
+        ch_idx = self._channel_combo.currentData()
+        if ch_idx is None:
+            return
+        ch = self._channel_model.channel(ch_idx)
+        target_idx = self._generated_ch_indices.get(ch_idx, -1)
+        self.applyThresholdRequested.emit({
+            "ch_model_index":   ch_idx,
+            "threshold":        thresh,
+            "mask_index":       self._mask_model_index,
+            "ch_name":          ch.name,
+            "ch_color":         ch.color,
+            "target_ch_index":  target_idx,
+        })
+
+    def register_generated_channel(self, ch_model_index: int, result_ch_index: int):
+        """Called by MainWindow after a new result channel is added for the first time."""
+        self._generated_ch_indices[ch_model_index] = result_ch_index
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._get_btn.setEnabled(enabled)
+
+
 class OperationsPanel(QWidget):
     """Right-side panel with collapsible sections for Pre-processing and Segmentation."""
 
@@ -987,6 +1284,8 @@ class OperationsPanel(QWidget):
     runMaskProcessingRequested = Signal(dict)
     runCellPositivityRequested = Signal(dict)
     runCellIdentificationRequested = Signal()
+    runThresholdComputeRequested = Signal(dict)
+    applyThresholdRequested = Signal(dict)
     segmentationFinished = Signal(object)
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
@@ -1157,13 +1456,12 @@ class OperationsPanel(QWidget):
         ai_lay.addStretch()
 
         # Thresholds Tab
-        thresh_tab = QWidget()
-        thresh_lay = QVBoxLayout(thresh_tab)
-        thresh_lay.addWidget(QLabel("Threshold parameters coming soon..."))
-        thresh_lay.addStretch()
+        self._thresh_tab = ThresholdPositivityTab(self._channel_model)
+        self._thresh_tab.runThresholdComputeRequested.connect(self._on_run_threshold_compute)
+        self._thresh_tab.applyThresholdRequested.connect(self._on_apply_threshold)
 
         self._pos_tabs.addTab(ai_tab, self._spacer_icon, "AI")
-        self._pos_tabs.addTab(thresh_tab, self._spacer_icon, "Thresholds")
+        self._pos_tabs.addTab(self._thresh_tab, self._spacer_icon, "Thresholds")
         panel.addWidget(self._pos_tabs)
 
         self._channel_model.modelReset.connect(self._refresh_positivity_combos)
@@ -1255,6 +1553,16 @@ class OperationsPanel(QWidget):
             "mask_index": self._pos_mask_combo.currentData()
         })
 
+    def _on_run_threshold_compute(self, params):
+        self._thresh_tab.setEnabled(False)
+        self._progress.setVisible(True)
+        self._progress.setRange(0, 0)
+        self.runThresholdComputeRequested.emit(params)
+
+    def _on_apply_threshold(self, params):
+        """Forwarded directly to MainWindow — intentionally not blocking the UI."""
+        self.applyThresholdRequested.emit(params)
+
     def _on_run_cell_identification(self):
         self._ident_run_btn.setEnabled(False)
         self._progress.setVisible(True); self._progress.setRange(0, 0)
@@ -1272,6 +1580,7 @@ class OperationsPanel(QWidget):
         self._expansion_tab.setEnabled(True)
         self._cell_sampler_tab.setEnabled(True)
         self._pos_run_btn.setEnabled(True)
+        self._thresh_tab.setEnabled(True)
         self._ident_run_btn.setEnabled(True)
         self._progress.setVisible(False)
 

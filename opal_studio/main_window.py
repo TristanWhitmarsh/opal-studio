@@ -68,27 +68,38 @@ def expand_labels_watershed(labels, expansion_pixels=6):
                     center = coords.mean(axis=0).astype(int)
                     markers[center[0], center[1]] = cell_id
 
-    # 4. Apply watershed
+    # 4. Apply watershed with explicit types for Cython compatibility
     expanded_labels = watershed(
-        elevation,
-        markers=markers,
+        elevation.astype(np.float32),
+        markers=markers.astype(np.int32),
         mask=expansion_mask,
         watershed_line=True
     )
     
-    return expanded_labels > 0
+    return expanded_labels
+
+
+def expand_labels_labelmap(labels, expansion_pixels=6):
+    """
+    Expand labeled regions by simple dilation, preserving each cell's integer label value.
+    Touching cells overwrite each other based on proximity (Voronoi-style via distance transform),
+    with no watershed separation lines.
+    """
+    from skimage.segmentation import expand_labels
+    return expand_labels(labels, distance=expansion_pixels)
 
 
 class MainWindow(QMainWindow):
     """Top-level window for Opal Studio."""
 
     # Signals for cross-thread communication
-    segmentationResultReady = Signal(object, str, bool, object, object, str, bool, int) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx
+    segmentationResultReady = Signal(object, str, bool, object, object, str, bool, int, object, bool, object) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut, random_colors, aux_labels
     segmentationError = Signal(str)
     preprocessingResultReady = Signal(str, str, object, float, float) # original_name, suffix, data, min, max
     preprocessingError = Signal(str)
     operationProgress = Signal(int, int)
     operationFinished = Signal(int)
+    thresholdMeansReady = Signal(object, object, object, int)  # labels, cell_means dict, otsu dict, mask_model_idx
 
     def __init__(self):
         super().__init__()
@@ -112,8 +123,11 @@ class MainWindow(QMainWindow):
         self._ops_panel.runMaskProcessingRequested.connect(self._run_mask_expansion)
         self._ops_panel.runCellPositivityRequested.connect(self._run_cell_positivity)
         self._ops_panel.runCellIdentificationRequested.connect(self._run_cell_identification)
+        self._ops_panel.runThresholdComputeRequested.connect(self._run_threshold_compute)
+        self._ops_panel.applyThresholdRequested.connect(self._apply_threshold_positivity)
         self.operationProgress.connect(self._ops_panel.set_progress_info)
         self.operationFinished.connect(self._on_operation_complete)
+        self.thresholdMeansReady.connect(self._on_threshold_means_ready)
         
         self.segmentationResultReady.connect(self._on_segmentation_complete)
         self.segmentationError.connect(self._on_segmentation_error)
@@ -543,7 +557,7 @@ class MainWindow(QMainWindow):
 
     def _on_preprocessing_complete(self, original_name, suffix, data, data_min, data_max):
         self._ops_panel.stop_loading()
-        new_name = self._channel_model.get_unique_name(f"{original_name}{suffix}")
+        new_name = self._channel_model.get_unique_name(f"{original_name}{suffix}", always_suffix=True)
         new_ch = Channel(
             name=new_name, color=QColor(255, 255, 255), visible=True,
             data_min=data_min, data_max=data_max,
@@ -662,7 +676,7 @@ class MainWindow(QMainWindow):
                         final_labels = out_labels
 
                     contour_data = self._get_contour_data(final_labels.astype(np.int32))
-                    self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx)
+                    self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx, None, True, None)
 
                 if method == "watershed":
                     from skimage.filters import gaussian
@@ -753,45 +767,52 @@ class MainWindow(QMainWindow):
         self._segmentation_thread = threading.Thread(target=_run, daemon=True)
         self._segmentation_thread.start()
 
-    def _on_segmentation_complete(self, labels, name=None, is_cell_mask=False, color=None, contour_data=None, source_marker="", is_type_mask=False, target_idx=-1):
+    def _on_segmentation_complete(self, labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut=None, random_colors=True, aux_labels=None):
         self._ops_panel.stop_loading()
-        mask_data = labels.astype(np.int32)
-        if contour_data is None:
-            contour_data = self._get_contour_data(mask_data)
+        
+        if target_idx >= 0:
+            # Update existing
+            try:
+                ch = self._channel_model.channel(target_idx)
+                ch.mask_data = labels
+                ch.contour_data = contour_data
+                ch.pos_lut = pos_lut
+                ch.random_contour_colors = random_colors
+                if aux_labels is not None:
+                    ch.processed_data = aux_labels
+                idx_qt = self._channel_model.index(target_idx)
+                self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+                self._channel_model.channels_changed.emit()
+                self._status.showMessage(f"Updated: {ch.name}", 5000)
+                return
+            except Exception:
+                pass
 
-        if target_idx != -1:
-            ch = self._channel_model.channel(target_idx)
-            ch.mask_data = mask_data
-            ch.contour_data = contour_data
-            idx_qt = self._channel_model.index(target_idx)
-            self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
-            self._channel_model.channels_changed.emit()
-            self._status.showMessage(f"Updated: {ch.name}", 5000)
-        else:
-            base_name = name if name else "Mask"
-            mask_name = self._channel_model.get_unique_name(base_name)
-            row_color = color if color else QColor(255, 255, 255)
-            
-            print(f"[DEBUG-STAT] RECEIVED MASK: name={mask_name}, is_cell_mask={is_cell_mask}, min={np.min(labels)}, max={np.max(labels)}")
-            
-            new_ch = Channel(
-                name=mask_name, color=row_color, visible=True,
-                is_mask=(not is_cell_mask and not is_type_mask), 
-                is_cell_mask=is_cell_mask,
-                is_type_mask=is_type_mask,
-                mask_data=mask_data,
-                contour_data=contour_data,
-                source_marker=source_marker,
-                index=-1
-            )
-            self._channel_model.add_channel(new_ch)
-            
-            # Select it!
-            new_idx = self._channel_model.rowCount() - 1
-            idx_qt = self._channel_model.index(new_idx)
-            self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
+        # Create new
+        mask_name = self._channel_model.get_unique_name(name if name else "Mask")
+        row_color = color if color else QColor(255, 255, 255)
+        
+        new_ch = Channel(
+            name=mask_name, color=row_color, visible=True,
+            is_mask=(not is_cell_mask and not is_type_mask), 
+            is_cell_mask=is_cell_mask,
+            is_type_mask=is_type_mask,
+            mask_data=labels,
+            contour_data=contour_data,
+            pos_lut=pos_lut,
+            processed_data=aux_labels,
+            random_contour_colors=random_colors,
+            source_marker=source_marker,
+            index=-1
+        )
+        self._channel_model.add_channel(new_ch)
+        
+        # Select it!
+        new_idx = self._channel_model.rowCount() - 1
+        idx_qt = self._channel_model.index(new_idx)
+        self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
 
-            self._status.showMessage(f"Task Complete: {mask_name}", 5000)
+        self._status.showMessage(f"Task Complete: {mask_name}", 5000)
 
     @Slot(str)
     def _on_segmentation_error(self, message):
@@ -829,7 +850,7 @@ class MainWindow(QMainWindow):
                     new_name = f"Sampled{suffix}"
                     
                     contour_data = self._get_contour_data(mask_result)
-                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False, -1)
+                    self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False, -1, None, True, None)
                 except Exception as e:
                     import traceback; traceback.print_exc()
                     self.segmentationError.emit(str(e))
@@ -854,6 +875,18 @@ class MainWindow(QMainWindow):
                 if tool == "expansion_watershed":
                     expansion_pixels = params["expansion_pixels"]
                     expanded = expand_labels_watershed(labels, expansion_pixels)
+                    # Extract individual contours before binarizing
+                    contour_data = self._get_contour_data(expanded.astype(np.int32))
+                    mask_result = (expanded > 0).astype(np.int32)
+                    new_name = f"{original_mask_ch.name}_Expand"
+                    
+                    # Store the labeled version in aux_labels so thresholding can find individual cells
+                    # even though mask_data is binary.
+                    self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask, -1, None, False, expanded.astype(np.int32))
+                    return
+                elif tool == "expansion_labelmap":
+                    expansion_pixels = params["expansion_pixels"]
+                    expanded = expand_labels_labelmap(labels, expansion_pixels)
                     mask_result = expanded.astype(np.int32)
                     new_name = f"{original_mask_ch.name}_Expand"
                 elif tool == "filter_size":
@@ -873,7 +906,7 @@ class MainWindow(QMainWindow):
                     new_name = f"{original_mask_ch.name}_Filter"
                 
                 contour_data = self._get_contour_data(mask_result)
-                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask, -1)
+                self.segmentationResultReady.emit(mask_result, new_name, original_mask_ch.is_cell_mask, original_mask_ch.color, contour_data, "", original_mask_ch.is_type_mask, -1, None, True, None)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))
@@ -934,9 +967,23 @@ class MainWindow(QMainWindow):
                 if not worker_res.get("success"):
                     raise Exception(f"Worker Error: {worker_res.get('error')}\n{worker_res.get('traceback')}")
                 
+                # Extract individual contours using original labels
+                contour_data = self._get_contour_data(labels)
+                max_id = int(np.max(labels))
+
                 for slice_out, z_idx in worker_res.get("results", []):
                     ch = target_channels[z_idx]
-                    self.segmentationResultReady.emit(slice_out, ch.name, True, ch.color, None, ch.name, False, -1)
+                    
+                    # AI returns slice_out (0/1/2 map). Convert to pos_lut (ID -> state)
+                    pos_lut = np.zeros(max_id + 1, dtype=np.int16)
+                    mask_active = labels > 0
+                    if np.any(mask_active):
+                        pos_lut[labels[mask_active]] = slice_out[mask_active]
+
+                    self.segmentationResultReady.emit(
+                        labels, ch.name, True, ch.color, contour_data, 
+                        ch.name, False, -1, pos_lut, False, None
+                    )
                     self.operationProgress.emit(z_idx + 1, S)
 
                 print("[AI] Cell positivity detection complete.")
@@ -955,9 +1002,190 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Threshold-based cell positivity
+    # ------------------------------------------------------------------
+
+    @Slot(dict)
+    def _run_threshold_compute(self, params: dict):
+        """Background thread: compute per-cell mean intensity for every image channel."""
+        if not self._image:
+            self._ops_panel.stop_loading()
+            return
+
+        mask_idx = params["mask_index"]
+        mask_ch = self._channel_model.channel(mask_idx)
+        labels = mask_ch.mask_data
+        if labels is None:
+            self._ops_panel.stop_loading()
+            return
+
+        def _run():
+            try:
+                from opal_studio.image_loader import _get_yx
+                from skimage.filters import threshold_otsu
+
+                # Handle binary masks (e.g. from Expansion) by using aux labels or re-labeling
+                working_labels = labels
+                if mask_ch.processed_data is not None:
+                    working_labels = mask_ch.processed_data
+                elif labels.max() == 1:
+                    from skimage.measure import label
+                    working_labels = label(labels).astype(np.int32)
+                
+                cell_ids = np.unique(working_labels)
+                cell_ids = cell_ids[cell_ids > 0]
+                if len(cell_ids) == 0:
+                    self.segmentationError.emit("No cells found in the selected mask.")
+                    return
+                
+                # Update labels sent to UI so _apply knows which one to use
+                labels_for_ui = working_labels
+
+                max_label = int(working_labels.max())
+
+                cell_means: dict[int, np.ndarray] = {}
+                otsu_thresholds: dict[int, float] = {}
+
+                h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
+
+                for i in range(self._channel_model.rowCount()):
+                    ch = self._channel_model.channel(i)
+                    if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
+                        continue  # skip mask channels; include raw and processed image channels
+
+                    if ch.is_processed and ch.processed_data is not None:
+                        data = ch.processed_data.astype(np.float32)
+                    else:
+                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+
+                    # Crop/pad to label map size just in case
+                    dh, dw = data.shape[:2]
+                    crop_h, crop_w = min(h, dh), min(w, dw)
+                    lab_crop = working_labels[:crop_h, :crop_w]
+                    dat_crop = data[:crop_h, :crop_w]
+
+                    # Vectorised: one scipy call returns mean for every label ID
+                    means_list = ndi.mean(dat_crop, labels=lab_crop, index=cell_ids)
+                    if not isinstance(means_list, np.ndarray):
+                        means_list = np.array([means_list])
+                    
+                    # Clean NaNs (labels that weren't found in the crop)
+                    means_list = np.nan_to_num(means_list)
+
+                    # Build LUT indexed by label value (index 0 = background = 0)
+                    means_lut = np.zeros(max_label + 1, dtype=np.float32)
+                    means_lut[cell_ids] = means_list
+
+                    cell_means[i] = means_lut
+
+                    # Otsu on the per-cell means (ignore background zeros)
+                    valid_means = means_lut[cell_ids]
+                    valid_means = valid_means[valid_means > 0]
+                    if valid_means.size > 1:
+                        try:
+                            val = threshold_otsu(valid_means)
+                            if not np.isnan(val):
+                                otsu_thresholds[i] = float(val)
+                        except Exception:
+                            pass
+                
+                # Deliver to main thread
+                self.thresholdMeansReady.emit(working_labels, cell_means, otsu_thresholds, mask_idx)
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.segmentationError.emit(str(e))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @Slot(object, object, object, int)
+    def _on_threshold_means_ready(self, labels, cell_means, otsu_thresholds, mask_model_idx):
+        """Deliver computed means to the Thresholds tab (main thread)."""
+        self._ops_panel.stop_loading()
+        self._ops_panel._thresh_tab.receive_means(labels, cell_means, otsu_thresholds, mask_model_idx)
+
+    @Slot(dict)
+    def _apply_threshold_positivity(self, params: dict):
+        """
+        Apply a threshold to the precomputed per-cell means and update (or create)
+        the result channel.  Runs on the MAIN THREAD — the LUT lookup is O(H×W)
+        and completes in <50 ms even for very large images.
+        """
+        ch_model_idx    = params["ch_model_index"]
+        threshold       = params["threshold"]
+        mask_idx        = params["mask_index"]
+        ch_name         = params["ch_name"]
+        ch_color        = params["ch_color"]
+        target_ch_idx   = params["target_ch_index"]  # -1 = not yet created
+
+        mask_ch = self._channel_model.channel(mask_idx)
+        labels  = mask_ch.mask_data
+        if labels is None:
+            return
+
+        # Source of truth for IDs: processed_data (if it's a label map) or connected components if binary
+        working_labels = labels
+        if mask_ch.processed_data is not None:
+            working_labels = mask_ch.processed_data
+        elif labels.max() == 1:
+            from skimage.measure import label
+            working_labels = label(labels).astype(np.int32)
+        
+        # Retrieve the per-cell means LUT that was already computed
+        thresh_tab = self._ops_panel._thresh_tab
+        means_lut  = thresh_tab._cell_means.get(ch_model_idx)
+        if means_lut is None:
+            return
+
+        # --- Individual Cell identity ---
+        # We store the ORIGINAL label map (with 10k unique IDs) in mask_data,
+        # but store the positivity classification in a LUT (pos_lut).
+        # This allows per-cell contours and individual cell manipulation.
+        
+        pos_lut = np.zeros(len(means_lut), dtype=np.int16)
+        cell_ids = np.flatnonzero(means_lut > 0)
+        if len(cell_ids):
+            pos_lut[cell_ids] = np.where(means_lut[cell_ids] >= threshold, 2, 1).astype(np.int16)
+
+        if target_ch_idx != -1:
+            # Update existing channel in-place
+            try:
+                tgt_ch = self._channel_model.channel(target_ch_idx)
+                tgt_ch.mask_data = working_labels   # Use working labels
+                tgt_ch.pos_lut = pos_lut    # Store states separately
+                idx_qt = self._channel_model.index(target_ch_idx)
+                self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+                self._channel_model.channels_changed.emit()
+                return
+            except Exception:
+                pass  # Channel may have been removed — fall through to create new
+
+        # First time: create a new cell-mask channel
+        contour_data = self._get_contour_data(labels)   # One contour per cell ID
+        new_name = self._channel_model.get_unique_name(ch_name)
+        new_ch = Channel(
+            name=new_name,
+            color=ch_color,
+            visible=True,
+            is_cell_mask=True,
+            mask_data=working_labels,        # Use working labels
+            pos_lut=pos_lut,         # Positivity states
+            contour_data=contour_data,
+            source_marker=ch_name,
+            index=-1,
+        )
+        self._channel_model.add_channel(new_ch)
+        new_idx = self._channel_model.rowCount() - 1
+
+        # Register so future slider moves update in-place
+        thresh_tab.register_generated_channel(ch_model_idx, new_idx)
+        self._status.showMessage(f"Threshold positivity: {new_name}", 3000)
+
     def _run_cell_identification(self):
         """Perform logical gating based on phenotyping definitions in a background thread."""
         if not self._image: return
+
 
         definitions = self._phenotyping_tab.get_phenotype_definitions()
         if not definitions:
@@ -987,6 +1215,7 @@ class MainWindow(QMainWindow):
 
                 total_types = len(definitions)
                 identified_count = 0
+                any_identified_mask = np.zeros((h, w), dtype=bool)
 
                 for i, (type_name, criteria) in enumerate(definitions.items()):
                     if not criteria:
@@ -1004,6 +1233,7 @@ class MainWindow(QMainWindow):
                             break
                     
                     if criteria_met and np.any(valid_mask):
+                        any_identified_mask |= valid_mask
                         type_data = np.zeros((h, w), dtype=np.uint8)
                         type_data[valid_mask] = 1 # Binary mask for this type
                         
@@ -1015,10 +1245,19 @@ class MainWindow(QMainWindow):
                         # Wait, we need it to be is_type_mask. 
                         # I'll update _on_segmentation_complete once more to handle this.
                         # Signal compatibility: is_cell_mask=False, source_marker="", is_type_mask=True
-                        self.segmentationResultReady.emit(type_data, type_name, False, row_color, None, "", True)
+                        self.segmentationResultReady.emit(type_data, type_name, False, row_color, None, "", True, -1)
                         identified_count += 1
                     
                     self.operationProgress.emit(i+1, total_types)
+
+                # Add Unknown phenotype for cells that matched nothing
+                is_cell = (some_mask > 0)
+                unknown_mask = is_cell & (~any_identified_mask)
+                if np.any(unknown_mask):
+                    unknown_data = np.zeros((h, w), dtype=np.uint8)
+                    unknown_data[unknown_mask] = 1
+                    self.segmentationResultReady.emit(unknown_data, "Unknown", False, QColor(128, 128, 128), None, "", True, -1)
+                    identified_count += 1
 
                 self.operationFinished.emit(identified_count)
 
@@ -1101,8 +1340,8 @@ class MainWindow(QMainWindow):
                     for pt in c:
                         px, py = pt[0]
                         # Offset back to original image space
-                        oy = loc[0].start + py
-                        ox = loc[1].start + px
+                        oy = loc[0].start + py + 0.5
+                        ox = loc[1].start + px + 0.5
                         qpoly.append(QPointF(ox, oy))
                     # Close the polygon
                     qpoly.append(qpoly.at(0))
