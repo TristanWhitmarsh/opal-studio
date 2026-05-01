@@ -63,11 +63,20 @@ class OperationsTabWidget(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setElideMode(Qt.TextElideMode.ElideRight)
+        self.setElideMode(Qt.TextElideMode.ElideNone)
         self.setUsesScrollButtons(True)
         self.setTabBarAutoHide(False)
-        self.tabBar().setExpanding(True)
+        self.tabBar().setExpanding(False)
+        # Enable wheel scrolling to cycle through tabs
+        self.tabBar().wheelEvent = self._wheel_scroll_tabs
         self.currentChanged.connect(self._on_current_changed)
+
+    def _wheel_scroll_tabs(self, event):
+        if event.angleDelta().y() > 0:
+            self.setCurrentIndex(max(0, self.currentIndex() - 1))
+        else:
+            self.setCurrentIndex(min(self.count() - 1, self.currentIndex() + 1))
+        event.accept()
 
     def _on_current_changed(self, index):
         self.updateGeometry()
@@ -345,17 +354,20 @@ class StarDistTab(QWidget):
         self._model_combo.setMinimumWidth(50)
         self._model_combo.addItems(["2D_versatile_fluo", "2D_paper_dsb2018"])
         self._scan_models()
+        self._model_combo.setToolTip("Pre-trained StarDist models for different imaging modalities (e.g., fluorescence nuclei).")
         form.addRow("Model:", self._model_combo)
 
         self._prob_thresh = QLineEdit("0.1")
         self._prob_thresh.setPlaceholderText("Auto")
         self._prob_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
         self._prob_thresh.setFixedWidth(60)
+        self._prob_thresh.setToolTip("Probability threshold for object detection. Higher values lead to fewer, more confident detections. Range [0.01, 1.0]. Leave empty for model defaults.")
         form.addRow("prob_thresh:", self._prob_thresh)
 
         self._nms_thresh = QLineEdit("0.3")
         self._nms_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
         self._nms_thresh.setFixedWidth(60)
+        self._nms_thresh.setToolTip("Non-Maximum Suppression (NMS) threshold. Controls how much overlap is allowed between predicted shapes. Range [0.01, 1.0]. Higher values allow more overlap.")
         form.addRow("nms_thresh:", self._nms_thresh)
         
         layout.addLayout(form)
@@ -439,22 +451,26 @@ class CellposeTab(QWidget):
         self._model_combo.setMinimumWidth(50)
         self._model_combo.addItems(["nuclei", "cyto", "cyto2"])
         self._scan_models()
+        self._model_combo.setToolTip("Pre-trained Cellpose models. 'nuclei' for nuclear staining, 'cyto' or 'cyto2' for cytoplasmic/cellular staining.")
         form.addRow("Model:", self._model_combo)
 
         self._diameter = QLineEdit("6.5")
         self._diameter.setPlaceholderText("Auto")
-        self._diameter.setValidator(QDoubleValidator(0.1, 1000.0, 2))
+        self._diameter.setValidator(QDoubleValidator(0.0, 1000.0, 2))
         self._diameter.setFixedWidth(60)
+        self._diameter.setToolTip("Expected cell diameter in pixels. Set to 0 or 'Auto' for automated estimation based on image content.")
         form.addRow("Diameter:", self._diameter)
 
         self._cellprob_threshold = QLineEdit("0.0")
         self._cellprob_threshold.setValidator(QDoubleValidator(-6.0, 6.0, 2))
         self._cellprob_threshold.setFixedWidth(60)
-        form.addRow("Prob Threshold:", self._cellprob_threshold)
+        self._cellprob_threshold.setToolTip("Threshold for cell probability map. Higher values (stricter) reduce the number and size of detected cells. Range [-6.0, 6.0]. Default 0.0.")
+        form.addRow("Cell Prob Threshold:", self._cellprob_threshold)
 
         self._flow_threshold = QLineEdit("0.4")
         self._flow_threshold.setValidator(QDoubleValidator(0.0, 10.0, 2))
         self._flow_threshold.setFixedWidth(60)
+        self._flow_threshold.setToolTip("Maximum allowed error for the flow field. Higher values allow more masks to be created but may include low-quality results. Range [0.0, 10.0]. Default 0.4.")
         form.addRow("Flow Threshold:", self._flow_threshold)
         
         layout.addLayout(form)
@@ -490,7 +506,13 @@ class CellposeTab(QWidget):
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
         diam_text = self._diameter.text()
-        diam = float(diam_text) if diam_text else None
+        if diam_text.lower() == "auto" or not diam_text:
+            diam = None
+        else:
+            try:
+                diam = float(diam_text)
+            except ValueError:
+                diam = None
         
         cellprob_threshold = float(self._cellprob_threshold.text() or 0.0)
         flow_threshold = float(self._flow_threshold.text() or 0.4)
@@ -536,23 +558,27 @@ class OmniposeTab(QWidget):
         self._model_combo.setMinimumWidth(50)
         self._model_combo.addItems(["bact_phase_omni", "bact_fluor_omni", "worm_omni", "worm_bact_omni", "worm_high_res_omni", "cyto2_omni", "plant_omni"])
         self._scan_models()
+        self._model_combo.setToolTip("Specialized Omnipose models for various cell shapes (bacteria, worms, plant cells, etc.).")
         form.addRow("Model:", self._model_combo)
 
-        self._diameter = QLineEdit("0.0")
-        self._diameter.setPlaceholderText("Auto (0 for Omnipose)")
+        self._diameter = QLineEdit("Auto")
+        self._diameter.setPlaceholderText("Auto")
         self._diameter.setValidator(QDoubleValidator(0.0, 1000.0, 2))
         self._diameter.setFixedWidth(60)
+        self._diameter.setToolTip("Expected cell diameter in pixels. For Omnipose, 0 or 'Auto' uses internal scale estimation.")
         form.addRow("Diameter:", self._diameter)
 
         self._mask_threshold = QLineEdit("0.0")
         self._mask_threshold.setPlaceholderText("Default 0.0")
         self._mask_threshold.setValidator(QDoubleValidator(-10.0, 10.0, 2))
         self._mask_threshold.setFixedWidth(60)
-        form.addRow("Prob Threshold:", self._mask_threshold)
+        self._mask_threshold.setToolTip("Threshold for mask probability map. Higher values reduce the number and size of detected masks. Range [-10.0, 10.0]. Default 0.0.")
+        form.addRow("Mask Threshold:", self._mask_threshold)
 
         self._flow_threshold = QLineEdit("0.4")
         self._flow_threshold.setValidator(QDoubleValidator(0.0, 10.0, 2))
         self._flow_threshold.setFixedWidth(60)
+        self._flow_threshold.setToolTip("Maximum allowed error for the flow field. Higher values are less strict and may create more masks. Range [0.0, 10.0]. Default 0.4.")
         form.addRow("Flow Threshold:", self._flow_threshold)
         
         layout.addLayout(form)
@@ -588,7 +614,13 @@ class OmniposeTab(QWidget):
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
         diam_text = self._diameter.text()
-        diam = float(diam_text) if diam_text else 0.0
+        if diam_text.lower() == "auto" or not diam_text:
+            diam = 0.0
+        else:
+            try:
+                diam = float(diam_text)
+            except ValueError:
+                diam = 0.0
         
         mask_threshold = float(self._mask_threshold.text() or 0.0)
         flow_threshold = float(self._flow_threshold.text() or 0.4)
@@ -638,12 +670,14 @@ class InstanSegTab(QWidget):
             "single_channel_nuclei",
             "fluorescence_nuclei_and_cells",
         ])
+        self._model_combo.setToolTip("InstanSeg models for single-channel nuclei or multi-channel fluorescence (nuclei and cells).")
         form.addRow("Model:", self._model_combo)
 
         # Pixel Size
         self._pixel_size = QLineEdit("1.0")
         self._pixel_size.setValidator(QDoubleValidator(0.001, 1000.0, 3))
         self._pixel_size.setFixedWidth(60)
+        self._pixel_size.setToolTip("The resolution of the image in micrometers per pixel (\u03bcm/px). Used to scale the model's receptive field to the physical size of cells.")
         form.addRow("Pixel Size (\u03bcm):", self._pixel_size)
         
         layout.addLayout(form)
@@ -713,6 +747,7 @@ class MesmerTab(QWidget):
         self._compartment_combo = QComboBox()
         self._compartment_combo.addItems(["nuclear", "whole-cell"])
         self._compartment_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._compartment_combo.setToolTip("Segment either only the nuclei or the whole-cell area (including cytoplasm).")
         form.addRow("Compartment:", self._compartment_combo)
 
         # API Key
@@ -724,6 +759,7 @@ class MesmerTab(QWidget):
         self._pixel_size = QLineEdit("1.0")
         self._pixel_size.setValidator(QDoubleValidator(0.001, 1000.0, 3))
         self._pixel_size.setFixedWidth(60)
+        self._pixel_size.setToolTip("The resolution of the image in micrometers per pixel (\u03bcm/px). Crucial for accurate deep learning inference on varied datasets.")
         form.addRow("Pixel Size (\u03bcm):", self._pixel_size)
         
         layout.addLayout(form)
@@ -801,6 +837,7 @@ class WatershedTab(QWidget):
         self._labeller_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._labeller_combo.setMinimumWidth(50)
         self._labeller_combo.addItems(["voronoi", "gauss"])
+        self._labeller_combo.setToolTip("The core logic for seeding: 'voronoi' uses local maxima; 'gauss' uses global Otsu thresholding.")
         self._labeller_combo.currentTextChanged.connect(self._on_labeller_changed)
         form.addRow("Labeller:", self._labeller_combo)
 
@@ -808,6 +845,7 @@ class WatershedTab(QWidget):
         self._spot_sigma = QLineEdit("2")
         self._spot_sigma.setValidator(QDoubleValidator(0.1, 100.0, 2))
         self._spot_sigma.setFixedWidth(80)
+        self._spot_sigma.setToolTip("Smoothing factor for seed detection. Higher values merge nearby seeds, reducing over-segmentation. Range [0.1, 100.0].")
         self._spot_sigma_label = QLabel("Spot Sigma:")
         form.addRow(self._spot_sigma_label, self._spot_sigma)
 
@@ -815,6 +853,7 @@ class WatershedTab(QWidget):
         self._outline_sigma = QLineEdit("2")
         self._outline_sigma.setValidator(QDoubleValidator(0.1, 100.0, 2))
         self._outline_sigma.setFixedWidth(80)
+        self._outline_sigma.setToolTip("Smoothing factor for boundary detection. Higher values create smoother, more generalized cell shapes. Range [0.1, 100.0].")
         form.addRow("Outline:", self._outline_sigma)
 
         # Threshold
@@ -822,6 +861,7 @@ class WatershedTab(QWidget):
         self._threshold.setValidator(QDoubleValidator(0.01, 100.0, 2))
         self._threshold.setFixedWidth(80)
         self._threshold.setToolTip(
+            "Sensitivity of detection. Range [0.01, 100.0].\n"
             "Voronoi: offset from local threshold (>1 = stricter, <1 = more permissive).\n"
             "Gauss: multiplier on Otsu threshold (>1 = stricter, <1 = more permissive)."
         )
@@ -830,7 +870,7 @@ class WatershedTab(QWidget):
         self._min_mean_intensity = QLineEdit("0.2")
         self._min_mean_intensity.setValidator(QDoubleValidator(-1000000.0, 1000000.0, 4))
         self._min_mean_intensity.setFixedWidth(80)
-        self._min_mean_intensity.setToolTip("Minimum mean intensity in a cell to keep it.")
+        self._min_mean_intensity.setToolTip("Filters out detected objects whose average pixel intensity is below this value. Useful for removing background noise or dim artifacts.")
         form.addRow("Intensity Threshold:", self._min_mean_intensity)
 
         layout.addLayout(form)
@@ -1391,7 +1431,7 @@ class ThresholdPositivityTab(QWidget):
 class OperationsPanel(QWidget):
     """Right-side panel with collapsible sections for Pre-processing and Segmentation."""
 
-    WIDTH = 420
+    DEFAULT_WIDTH = 300
     runPreprocessingRequested = Signal(dict)
     runSegmentationRequested = Signal(dict)
     runMaskProcessingRequested = Signal(dict)
@@ -1404,7 +1444,7 @@ class OperationsPanel(QWidget):
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
         self._channel_model = channel_model
-        self.setFixedWidth(self.WIDTH)
+        self.setMinimumWidth(300)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         main_layout = QVBoxLayout(self)

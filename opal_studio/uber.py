@@ -9,18 +9,17 @@ class UBM:
         self._carray = carray
 
     def get_iou(self, m1, m2):
+        """Vectorized Intersection over Union computation."""
+        mins = np.minimum(m1, m2)
+        maxs = np.maximum(m1, m2)
 
-        # min over max
-        xsi = np.shape(m1)[0]
-        ysi = np.shape(m1)[1]
-        mins = np.zeros_like(m1)
-        maxs = np.zeros_like(m1)
-        for ii in range(xsi):
-            for jj in range(ysi):
-                mins[ii, jj] = np.amin(np.array([m1[ii, jj], m2[ii, jj]]))
-                maxs[ii, jj] = np.amax(np.array([m1[ii, jj], m2[ii, jj]]))
-
-        return np.sum(mins.flatten()) / np.sum(maxs.flatten())
+        sum_mins = np.sum(mins)
+        sum_maxs = np.sum(maxs)
+        
+        if sum_maxs == 0:
+            return 0.0
+            
+        return sum_mins / sum_maxs
 
     def measure_area(self, im):
 
