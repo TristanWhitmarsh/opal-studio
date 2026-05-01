@@ -15,6 +15,7 @@ Built using PySide6 and leveraging a state-of-the-art Python data stack, Opal St
     - **InstanSeg**: Fast, state-of-the-art nucleus and cell segmentation.
     - **StarDist (2D)**: Robust nuclear segmentation using star-convex polygons.
     - **Cellpose**: Integrated support for Cyto, Nuclei, and custom models.
+    - **Omnipose**: Dedicated support for bacterial, plant, and high-res worm segmentation.
     - **Watershed**: Traditional marker-controlled region expansion for classical workflows.
 - **Intelligent Mask Processing**: 
     - **Cell Sampler (Ubermasking)**: Geometrically merge results from multiple segmentation engines using intelligent strategies (Jaccard agreement, Population density, Area variance).

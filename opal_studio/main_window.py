@@ -586,6 +586,7 @@ class MainWindow(QMainWindow):
                 method_names = {
                     "stardist": "StarDist",
                     "cellpose": "Cellpose",
+                    "omnipose": "Omnipose",
                     "instanseg": "InstanSeg",
                     "watershed": "Watershed",
                     "mesmer": "Mesmer"

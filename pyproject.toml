@@ -23,6 +23,7 @@ dependencies = [
     "deepcell",
     "stardist",
     "cellpose",
+    "omnipose",
     "instanseg-torch",
 ]
 

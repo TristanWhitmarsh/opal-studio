@@ -19,6 +19,7 @@ setup(
         "deepcell",
         "stardist",
         "cellpose",
+        "omnipose",
         "instanseg-torch",
         "pywin32; sys_platform == 'win32'", # Required for creating windows shortcuts
     ],

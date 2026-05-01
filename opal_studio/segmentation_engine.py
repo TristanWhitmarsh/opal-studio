@@ -47,9 +47,36 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                 model = models.Cellpose(model_type=params["model_name"], gpu=use_gpu)
             
             x = input_channels_data[0]
-            res = model.eval([x], diameter=params.get("diameter"), channels=[[0, 0]], batch_size=64)
+            res = model.eval([x], 
+                             diameter=params.get("diameter"), 
+                             channels=[[0, 0]], 
+                             batch_size=64,
+                             cellprob_threshold=params.get("cellprob_threshold", 0.0),
+                             flow_threshold=params.get("flow_threshold", 0.4))
             labels = res[0][0]
             results.append((labels, params.get("override_name", "Cellpose"), False))
+
+        elif method == "omnipose":
+            from cellpose_omni import models
+            import torch
+            use_gpu = torch.cuda.is_available()
+            
+            if params.get("model_path"):
+                model = models.CellposeModel(pretrained_model=params["model_path"], gpu=use_gpu, nchan=2, nclasses=4, omni=True)
+            else:
+                model = models.CellposeModel(model_type=params["model_name"], gpu=use_gpu, nchan=2, nclasses=4, omni=True)
+            
+            x = input_channels_data[0]
+            # cellpose_omni eval arguments are similar to cellpose
+            res = model.eval([x], 
+                             diameter=params.get("diameter"), 
+                             channels=[[0, 0]], 
+                             batch_size=64, 
+                             omni=True,
+                             mask_threshold=params.get("mask_threshold", 0.0),
+                             flow_threshold=params.get("flow_threshold", 0.4))
+            labels = res[0][0]
+            results.append((labels, params.get("override_name", "Omnipose"), False))
 
         elif method == "instanseg":
             from instanseg import InstanSeg

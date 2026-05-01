@@ -446,6 +446,16 @@ class CellposeTab(QWidget):
         self._diameter.setValidator(QDoubleValidator(0.1, 1000.0, 2))
         self._diameter.setFixedWidth(60)
         form.addRow("Diameter:", self._diameter)
+
+        self._cellprob_threshold = QLineEdit("0.0")
+        self._cellprob_threshold.setValidator(QDoubleValidator(-6.0, 6.0, 2))
+        self._cellprob_threshold.setFixedWidth(60)
+        form.addRow("Prob Threshold:", self._cellprob_threshold)
+
+        self._flow_threshold = QLineEdit("0.4")
+        self._flow_threshold.setValidator(QDoubleValidator(0.0, 10.0, 2))
+        self._flow_threshold.setFixedWidth(60)
+        form.addRow("Flow Threshold:", self._flow_threshold)
         
         layout.addLayout(form)
 
@@ -482,12 +492,115 @@ class CellposeTab(QWidget):
         diam_text = self._diameter.text()
         diam = float(diam_text) if diam_text else None
         
+        cellprob_threshold = float(self._cellprob_threshold.text() or 0.0)
+        flow_threshold = float(self._flow_threshold.text() or 0.4)
+        
         self.runRequested.emit({
             "method": "cellpose",
             "channel_indices": [self._channel_combo.currentData()],
             "model_name": self._model_combo.currentText(),
             "model_path": self._model_combo.currentData(),
             "diameter": diam,
+            "cellprob_threshold": cellprob_threshold,
+            "flow_threshold": flow_threshold
+        })
+        
+class OmniposeTab(QWidget):
+    """Sub-widget for Omnipose segmentation parameters."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # Model Parameters
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+
+        # Channel Selector
+        self._channel_combo = QComboBox()
+        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channel_combo.setMinimumWidth(50)
+        form.addRow("Channel:", self._channel_combo)
+
+        self._model_combo = QComboBox()
+        self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._model_combo.setMinimumWidth(50)
+        self._model_combo.addItems(["bact_phase_omni", "bact_fluor_omni", "worm_omni", "worm_bact_omni", "worm_high_res_omni", "cyto2_omni", "plant_omni"])
+        self._scan_models()
+        form.addRow("Model:", self._model_combo)
+
+        self._diameter = QLineEdit("0.0")
+        self._diameter.setPlaceholderText("Auto (0 for Omnipose)")
+        self._diameter.setValidator(QDoubleValidator(0.0, 1000.0, 2))
+        self._diameter.setFixedWidth(60)
+        form.addRow("Diameter:", self._diameter)
+
+        self._mask_threshold = QLineEdit("0.0")
+        self._mask_threshold.setPlaceholderText("Default 0.0")
+        self._mask_threshold.setValidator(QDoubleValidator(-10.0, 10.0, 2))
+        self._mask_threshold.setFixedWidth(60)
+        form.addRow("Prob Threshold:", self._mask_threshold)
+
+        self._flow_threshold = QLineEdit("0.4")
+        self._flow_threshold.setValidator(QDoubleValidator(0.0, 10.0, 2))
+        self._flow_threshold.setFixedWidth(60)
+        form.addRow("Flow Threshold:", self._flow_threshold)
+        
+        layout.addLayout(form)
+
+        # Run Button
+        self._run_btn = QPushButton("Run Omnipose")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+
+        self._refresh_channels()
+        self._channel_model.modelReset.connect(self._refresh_channels)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+
+    def _refresh_channels(self):
+        current = self._channel_combo.currentText()
+        self._channel_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.is_mask:
+                self._channel_combo.addItem(ch.name, i)
+        idx = self._channel_combo.findText(current)
+        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
+
+    def _scan_models(self):
+        models_dir = os.path.join(os.getcwd(), "models", "omnipose")
+        if not os.path.exists(models_dir): return
+        for file in os.listdir(models_dir):
+            path = os.path.join(models_dir, file)
+            if os.path.isfile(path) and not file.endswith('.txt') and not file.endswith('.ipynb'):
+                self._model_combo.addItem(f"Custom: {file[:30]}...", path)
+
+    def _on_run(self):
+        if self._channel_combo.currentIndex() < 0: return
+        diam_text = self._diameter.text()
+        diam = float(diam_text) if diam_text else 0.0
+        
+        mask_threshold = float(self._mask_threshold.text() or 0.0)
+        flow_threshold = float(self._flow_threshold.text() or 0.4)
+        
+        self.runRequested.emit({
+            "method": "omnipose",
+            "channel_indices": [self._channel_combo.currentData()],
+            "model_name": self._model_combo.currentText(),
+            "model_path": self._model_combo.currentData(),
+            "diameter": diam,
+            "mask_threshold": mask_threshold,
+            "flow_threshold": flow_threshold
         })
         
 class InstanSegTab(QWidget):
@@ -1393,6 +1506,9 @@ class OperationsPanel(QWidget):
         self._cellpose_tab = CellposeTab(self._channel_model)
         self._cellpose_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._cellpose_tab, self._spacer_icon, "Cellpose")
+        self._omnipose_tab = OmniposeTab(self._channel_model)
+        self._omnipose_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._omnipose_tab, self._spacer_icon, "Omnipose")
         self._instanseg_tab = InstanSegTab(self._channel_model)
         self._instanseg_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._instanseg_tab, self._spacer_icon, "InstanSeg")
@@ -1531,6 +1647,7 @@ class OperationsPanel(QWidget):
 
         self._stardist_tab.setEnabled(False)
         self._cellpose_tab.setEnabled(False)
+        self._omnipose_tab.setEnabled(False)
         self._instanseg_tab.setEnabled(False)
         self._watershed_tab.setEnabled(False)
         self._mesmer_tab.setEnabled(False)
@@ -1573,6 +1690,7 @@ class OperationsPanel(QWidget):
         self._filter_tab.setEnabled(True)
         self._stardist_tab.setEnabled(True)
         self._cellpose_tab.setEnabled(True)
+        self._omnipose_tab.setEnabled(True)
         self._instanseg_tab.setEnabled(True)
         self._mesmer_tab.setEnabled(True)
         self._watershed_tab.setEnabled(True)
