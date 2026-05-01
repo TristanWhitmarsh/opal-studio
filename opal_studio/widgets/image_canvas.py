@@ -75,11 +75,11 @@ class _ViewportRequest:
     """Value object carrying everything needed for one render."""
     __slots__ = (
         "img", "channels", "cache", "level_idx",
-        "viewport", "brightness", "seq", "channel_version",
+        "viewport", "brightness", "seq", "channel_version", "is_progressive",
     )
 
     def __init__(self, img, channels, cache, level_idx,
-                 viewport: QRectF, brightness, seq, channel_version):
+                 viewport: QRectF, brightness, seq, channel_version, is_progressive=False):
         self.img = img
         self.channels = channels
         self.cache = cache
@@ -88,6 +88,7 @@ class _ViewportRequest:
         self.brightness = brightness
         self.seq = seq
         self.channel_version = channel_version
+        self.is_progressive = is_progressive
 
 
 class _RenderWorker(QObject):
@@ -97,15 +98,20 @@ class _RenderWorker(QObject):
     one render runs at a time.  Stale requests (superseded by a newer seq)
     are dropped before any work is done.
     """
-    frame_ready = Signal(QImage, QRectF, int, int)
-    # (image, viewport_it_covers, seq, channel_version)
+    frame_ready = Signal(QImage, QRectF, int, int, int, bool)
+    # (image, viewport_it_covers, seq, channel_version, level_idx, is_progressive)
+    overview_ready = Signal(QImage, int)
+    # (image, channel_version)
 
     request = Signal(object, int)  # (_ViewportRequest, latest_seq)
+    overview_request = Signal(object, int)  # (_ViewportRequest, latest_ch_ver)
 
     def __init__(self):
         super().__init__()
         self._latest_seq = -1
+        self._latest_overview_ver = -1
         self.request.connect(self._process, Qt.ConnectionType.QueuedConnection)
+        self.overview_request.connect(self._process_overview, Qt.ConnectionType.QueuedConnection)
 
     @Slot(object, int)
     def _process(self, req: _ViewportRequest, latest_seq: int):
@@ -124,12 +130,31 @@ class _RenderWorker(QObject):
             )
             # Emit actual_rect (integer-snapped level coords back-projected to
             # base-image space), NOT req.viewport which is floating-point and
-            # differs from the image's true coverage by up to ds pixels.
-            self.frame_ready.emit(qimg, actual_rect, req.seq, req.channel_version)
+            self.frame_ready.emit(qimg, actual_rect, req.seq, req.channel_version, req.level_idx, req.is_progressive)
         except Exception as exc:
             import traceback
             traceback.print_exc()
             print(f"[Opal] render error: {exc}")
+
+    @Slot(object, int)
+    def _process_overview(self, req: _ViewportRequest, latest_ch_ver: int):
+        self._latest_overview_ver = max(self._latest_overview_ver, latest_ch_ver)
+        if req.channel_version < self._latest_overview_ver:
+            return  # stale overview request
+
+        try:
+            qimg, _ = render_viewport_tiled(
+                req.cache,
+                req.img,
+                req.channels,
+                req.level_idx,
+                req.viewport,
+                req.brightness,
+                TILE_SIZE,
+            )
+            self.overview_ready.emit(qimg, req.channel_version)
+        except Exception as exc:
+            print(f"[Opal] overview render error: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -163,6 +188,13 @@ class ImageCanvas(QWidget):
         # Last completed full-viewport frame (shown while next frame loads)
         self._display_image: Optional[QImage] = None
         self._display_viewport: QRectF = QRectF()  # image-space rect it covers
+        self._display_level_idx: int = -1
+        self._display_channel_version: int = 0
+
+        # Coarser progressive frame (shown underneath display_image while loading)
+        self._progressive_image: Optional[QImage] = None
+        self._progressive_viewport: QRectF = QRectF()
+        self._progressive_level_idx: int = -1
 
         # Sequencing: channel version + request seq to discard stale frames
         self._channel_version = 0
@@ -175,6 +207,8 @@ class ImageCanvas(QWidget):
         self._worker.moveToThread(self._thread)
         self._worker.frame_ready.connect(self._on_frame_ready,
                                          Qt.ConnectionType.QueuedConnection)
+        self._worker.overview_ready.connect(self._on_overview_ready,
+                                            Qt.ConnectionType.QueuedConnection)
         self._thread.start()
 
         # Debounce timer
@@ -209,6 +243,11 @@ class ImageCanvas(QWidget):
         self._tile_cache.clear()
         self._display_image = None
         self._display_viewport = QRectF()
+        self._display_level_idx = -1
+        self._display_channel_version = 0
+        self._progressive_image = None
+        self._progressive_viewport = QRectF()
+        self._progressive_level_idx = -1
         self._overview = None
         self._channel_version = 0
         self._seq = 0
@@ -226,20 +265,9 @@ class ImageCanvas(QWidget):
     def _on_channels_changed(self):
         """
         Bump the channel version and schedule a new render.
-
-        We deliberately do NOT clear _display_image (keeping the last good
-        frame visible avoids a flash to the black background on every slider
-        tick or checkbox toggle). The stale frame stays visible for ~40ms
-        until the new render drops in gracefully.
-
-        We do NOT re-render the overview synchronously — that can block the
-        main thread for 200-500 ms on large/single-level images and would
-        freeze the UI during rapid slider movement.  Instead the overview
-        version is invalidated so it is not painted; once the background
-        render completes and is accepted the display_image takes over.
         """
         self._channel_version += 1
-        self._schedule_render()
+        self._schedule_render(immediate_progressive=False)
         self.update()
 
     # ── Viewport helpers ──────────────────────────────────────────────────────
@@ -271,14 +299,12 @@ class ImageCanvas(QWidget):
     # ── Overview (background fallback) ────────────────────────────────────────
 
     def _load_overview(self):
-        """Synchronously render the coarsest level on the main thread."""
+        """Initial synchronous overview load."""
         if not self._img or not self._img.levels:
             return
         channels = self._model.visible_channels()
         try:
             self._overview = render_overview(self._img, channels, self._model.brightness)
-            # Record which channel-version this overview represents so the
-            # paint code only shows it when it is current.
             self._overview_channel_version = self._channel_version
         except Exception as exc:
             print(f"[Opal] overview error: {exc}")
@@ -286,13 +312,51 @@ class ImageCanvas(QWidget):
             self._overview_channel_version = -1
         self.update()
 
+    def _request_overview_update(self):
+        """Request an asynchronous overview update from the worker thread."""
+        if not self._img or not self._img.levels:
+            return
+        channels = self._model.visible_channels()
+        if not channels and not self._img.is_rgb:
+            self._overview = None
+            self._overview_channel_version = self._channel_version
+            return
+
+        level_idx = len(self._img.levels) - 1
+        axes = self._img._tif.series[0].axes.upper() if self._img._tif else ""
+        h, w = _get_yx(self._img.base_shape, axes, self._img.is_rgb)
+
+        req = _ViewportRequest(
+            img=self._img,
+            channels=list(channels),
+            cache=self._tile_cache,
+            level_idx=level_idx,
+            viewport=QRectF(0, 0, w, h),
+            brightness=self._model.brightness,
+            seq=-1,  # Not used for overview
+            channel_version=self._channel_version,
+            is_progressive=False,
+        )
+        self._worker.overview_request.emit(req, self._channel_version)
+
+    @Slot(QImage, int)
+    def _on_overview_ready(self, qimg: QImage, ch_ver: int):
+        """Receive updated overview from worker."""
+        if ch_ver != self._channel_version:
+            return
+        self._overview = qimg
+        self._overview_channel_version = ch_ver
+        self.update()
+
     # ── Render request scheduling ─────────────────────────────────────────────
 
-    def _schedule_render(self):
-        """Debounced render request."""
+    def _schedule_render(self, immediate_progressive=False):
+        """Debounced render request. If immediate_progressive is True, submit a coarse render instantly."""
+        if immediate_progressive:
+            self._submit_render(progressive=True)
         self._render_timer.start()
 
-    def _submit_render(self):
+    def _submit_render(self, progressive=False):
         """Build and post a render request to the worker thread."""
         if not self._img:
             return
@@ -300,10 +364,17 @@ class ImageCanvas(QWidget):
         channels = self._model.visible_channels()
         if not channels and not self._img.is_rgb:
             self._display_image = None
+            self._overview = None
             self.update()
             return
 
         level_idx = self._current_level()
+        
+        # QuPath-style progressive rendering: if panning/zooming, request a faster 
+        # coarse level first to give immediate visual feedback.
+        if progressive and level_idx + 1 < len(self._img.levels):
+            level_idx = min(level_idx + 2, len(self._img.levels) - 1)
+
         self._seq += 1
         self._pending_seq = self._seq
 
@@ -316,20 +387,43 @@ class ImageCanvas(QWidget):
             brightness=self._model.brightness,
             seq=self._seq,
             channel_version=self._channel_version,
+            is_progressive=progressive,
         )
         self._worker.request.emit(req, self._seq)
+        
+        # Only request an overview update on the final debounced high-res render
+        # to prevent queue clogging when dragging sliders.
+        if not progressive:
+            self._request_overview_update()
+            
         # Draw immediately with whatever we have (overview + scaled old frame)
         self.update()
 
-    @Slot(QImage, QRectF, int, int)
-    def _on_frame_ready(self, qimg: QImage, viewport: QRectF, seq: int, ch_ver: int):
+    @Slot(QImage, QRectF, int, int, int, bool)
+    def _on_frame_ready(self, qimg: QImage, viewport: QRectF, seq: int, ch_ver: int, level_idx: int, is_progressive: bool):
         """Receive completed frame from worker."""
         if seq < self._pending_seq:
             return   # superseded
         if ch_ver != self._channel_version:
             return   # channel state changed since this was rendered
-        self._display_image = qimg
-        self._display_viewport = viewport
+            
+        if is_progressive:
+            self._progressive_image = qimg
+            self._progressive_viewport = viewport
+            self._progressive_level_idx = level_idx
+            
+            # If our sharp display image is from a different channel version, OR if it's 
+            # actually coarser (blurrier) than this progressive image (e.g. huge zoom-in), drop it.
+            if (self._display_channel_version != ch_ver or 
+                self._display_level_idx > level_idx):
+                self._display_image = None
+        else:
+            self._display_image = qimg
+            self._display_viewport = viewport
+            self._display_channel_version = ch_ver
+            self._display_level_idx = level_idx
+            self._progressive_image = None
+
         self.update()
 
     # ── Painting ──────────────────────────────────────────────────────────────
@@ -350,17 +444,32 @@ class ImageCanvas(QWidget):
             spp = self._screen_pixels_per_image_pixel()
             ih, iw = _get_yx(self._img.base_shape, self._img.axes, self._img.is_rgb)
 
-            # ── Layer 1: Overview (background, only when version is current) ──
-            # Painted only when the overview matches the current channel state.
-            # A stale overview (version mismatch) would show deselected
-            # channels / wrong brightness in areas not yet covered by the
-            # hi-res display_image, so we suppress it when outdated.
-            if self._overview and self._overview_channel_version == self._channel_version:
+            # ── Layer 1: Overview (background fallback) ───────────────────────
+            # Always paint the overview to act as a placeholder, preventing
+            # black flickers when zooming out. QuPath-style rendering leaves
+            # background data until the hi-res foreground is ready.
+            if self._overview:
                 dst_x = -self._viewport.left() * spp
                 dst_y = -self._viewport.top()  * spp
+                # Draw slightly faded if stale, else normal
+                alpha = 1.0 if self._overview_channel_version == self._channel_version else 0.6
+                if alpha < 1.0:
+                    p.setOpacity(alpha)
                 p.drawImage(QRectF(dst_x, dst_y, iw * spp, ih * spp), self._overview)
+                p.setOpacity(1.0)
 
-            # ── Layer 2: Last completed hi-res frame ───────────────────────
+            # ── Layer 2: Progressive frame (coarse, fills black edges) ─────
+            # Drawn underneath the high-res frame so that any sharp data we
+            # ALREADY have is preserved, but any new areas (edges) get filled.
+            if self._progressive_image and not self._progressive_viewport.isEmpty():
+                vpt = self._progressive_viewport
+                dst_x = (vpt.left() - self._viewport.left()) * spp
+                dst_y = (vpt.top()  - self._viewport.top())  * spp
+                dst_w = vpt.width()  * spp
+                dst_h = vpt.height() * spp
+                p.drawImage(QRectF(dst_x, dst_y, dst_w, dst_h), self._progressive_image)
+
+            # ── Layer 3: Last completed hi-res frame ───────────────────────
             # Drawn scaled to the current viewport so it tracks pan/zoom
             # instantly while a new render is computing.
             if self._display_image and not self._display_viewport.isEmpty():
@@ -446,7 +555,7 @@ class ImageCanvas(QWidget):
             img_y - frac_y * new_h,
             new_w, new_h,
         )
-        self._schedule_render()
+        self._schedule_render(immediate_progressive=True)
         self.update()
 
     # ── Pan ───────────────────────────────────────────────────────────────────
@@ -476,7 +585,7 @@ class ImageCanvas(QWidget):
                 self._viewport_at_pan_start.width(),
                 self._viewport_at_pan_start.height(),
             )
-            self._schedule_render()
+            self._schedule_render(immediate_progressive=True)
             self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
@@ -495,7 +604,7 @@ class ImageCanvas(QWidget):
             new_vw = new_size.width()  / spp
             new_vh = new_size.height() / spp
             self._viewport = QRectF(cx - new_vw / 2, cy - new_vh / 2, new_vw, new_vh)
-            self._schedule_render()
+            self._schedule_render(immediate_progressive=True)
         super().resizeEvent(event)
 
     def _stop_worker(self):

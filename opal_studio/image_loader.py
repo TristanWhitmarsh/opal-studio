@@ -40,6 +40,7 @@ class LevelInfo:
     downsample: float   # relative to level-0
     _pages: list = field(default_factory=list)          # tifffile.TiffPage refs
     _cache: Optional[np.ndarray] = None                 # full-level cache for small levels
+    _zarr: Optional[object] = None                      # zarr array for fast lazy chunk reading
 
 
 @dataclass
@@ -95,7 +96,7 @@ class TileCache:
     Memory budget is approximate (based on array nbytes).
     """
 
-    def __init__(self, max_bytes: int = 512 * 1024 * 1024):
+    def __init__(self, max_bytes: int = 4 * 1024 * 1024 * 1024):  # 4 GB default
         self._max_bytes = max_bytes
         self._cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
         self._current_bytes = 0
@@ -180,11 +181,24 @@ def open_image(path: str | Path) -> ImageData:
         # For multi-channel OME-TIFF each page is one channel.
         pages = list(level_series.pages)
 
+        # Try to create a zarr store for fast chunked access
+        z_arr = None
+        try:
+            import zarr
+            z_store = level_series.aszarr()
+            z_arr = zarr.open(z_store, mode='r')
+            if isinstance(z_arr, zarr.hierarchy.Group):
+                if '0' in z_arr:
+                    z_arr = z_arr['0']
+        except Exception:
+            pass
+
         levels.append(LevelInfo(
             index=i,
             shape=level_series.shape,
             downsample=downsample,
             _pages=pages,
+            _zarr=z_arr,
         ))
 
     img = ImageData(
@@ -233,6 +247,15 @@ def get_tile(
         return _slice_array(lvl._cache, img.axes, img.is_rgb, channel, y_slice, x_slice)
 
     # 3. True lazy access: read only the required page and slice
+    # Use Zarr for fast chunked access if available
+    if lvl._zarr is not None:
+        try:
+            return _slice_array(lvl._zarr, img.axes, img.is_rgb, channel, y_slice, x_slice)
+        except Exception as exc:
+            print(f"[Opal] Zarr read fallback: {exc}")
+            pass # fallback to full-page read
+
+    # Fallback: full-page read (very slow for large compressed images)
     if img.is_rgb:
         page = lvl._pages[0]
         try:
@@ -311,7 +334,9 @@ def best_level_for_zoom(img: ImageData, screen_pixels_per_image_pixel: float) ->
 
     best = 0  # fallback: finest level is always acceptable
     for lvl in img.levels:
-        if 1.0 / lvl.downsample >= screen_pixels_per_image_pixel:
+        # Allow up to 25% sub-sampling before dropping to a coarser level to load faster.
+        # This matches QuPath's behavior of favoring render speed during interactions.
+        if 1.0 / lvl.downsample >= screen_pixels_per_image_pixel * 0.75:
             best = lvl.index  # still good enough — try the next coarser level
         else:
             break             # this level is too coarse — stop

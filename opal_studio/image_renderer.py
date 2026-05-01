@@ -61,6 +61,7 @@ _READ_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="opal-reader")
 # other's seek positions, causing corrupted compressed data and ZSTD errors.
 # By giving each thread its own TiffFile, all seeks are independent.
 _tif_local = threading.local()
+_zarr_local = threading.local()
 
 
 def _get_thread_tif(img: "ImageData") -> "_tifffile.TiffFile":
@@ -72,6 +73,24 @@ def _get_thread_tif(img: "ImageData") -> "_tifffile.TiffFile":
     if key not in _tif_local.tifs:
         _tif_local.tifs[key] = _tifffile.TiffFile(key)
     return _tif_local.tifs[key]
+
+
+def _get_thread_zarr(img: "ImageData", level_idx: int):
+    """Return a thread-local zarr store opened from img.path for a specific level."""
+    cache = getattr(_zarr_local, "stores", None)
+    if cache is None:
+        _zarr_local.stores = {}
+    key = f"{img.path}_{level_idx}"
+    if key not in _zarr_local.stores:
+        import zarr
+        tif = _get_thread_tif(img)
+        z_store = tif.series[0].levels[level_idx].aszarr()
+        z_arr = zarr.open(z_store, mode='r')
+        if isinstance(z_arr, zarr.hierarchy.Group):
+            if '0' in z_arr:
+                z_arr = z_arr['0']
+        _zarr_local.stores[key] = z_arr
+    return _zarr_local.stores[key]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,8 +416,7 @@ def _read_channel_slice(
     row_end   = (y_sl.stop - 1) // tile_size
 
     lh, lw = _get_yx(lvl.shape, img.axes, img.is_rgb)
-    tif = None
-    page_array = None
+    z_arr = None
 
     for tr in range(row_start, row_end + 1):
         for tc in range(col_start, col_end + 1):
@@ -406,11 +424,9 @@ def _read_channel_slice(
             tile = cache.get(key)
             
             if tile is None:
-                if page_array is None and not img.is_rgb:
+                if z_arr is None and not img.is_rgb:
                     try:
-                        tif = _get_thread_tif(img)
-                        page = tif.series[0].levels[level_idx].pages[channel]
-                        page_array = page.asarray()
+                        z_arr = _get_thread_zarr(img, level_idx)
                     except Exception:
                         pass # Fallback to get_tile
                         
@@ -419,8 +435,18 @@ def _read_channel_slice(
                 ty1 = min(ty0 + tile_size, lh)
                 tx1 = min(tx0 + tile_size, lw)
                 
-                if page_array is not None and not img.is_rgb:
-                    tile = page_array[ty0:ty1, tx0:tx1]
+                if z_arr is not None and not img.is_rgb:
+                    try:
+                        if len(z_arr.shape) > 2:
+                            # typically (C, Y, X)
+                            tile = z_arr[channel, ty0:ty1, tx0:tx1]
+                        else:
+                            tile = z_arr[ty0:ty1, tx0:tx1]
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        print(f"[Opal] Zarr thread slice error: {e}")
+                        tile = get_tile(img, level_idx, channel, slice(ty0, ty1), slice(tx0, tx1))
                 else:
                     tile = get_tile(img, level_idx, channel, slice(ty0, ty1), slice(tx0, tx1))
                     
