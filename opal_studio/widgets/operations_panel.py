@@ -1482,6 +1482,19 @@ class OperationsPanel(QWidget):
         self._progress.setVisible(False); self._progress.setTextVisible(False)
         main_layout.addWidget(self._progress)
 
+    def reset(self):
+        """Restore all operations panel settings to defaults."""
+        self.stop_loading()
+        self._radio_full.setChecked(True)
+        self._radio_new_mask.setChecked(True)
+        
+        # Optionally: Collapse all sections to start fresh
+        # (Though some users might prefer them staying open, defaults are usually best)
+        # for i in range(self._container_layout.count()):
+        #     item = self._container_layout.itemAt(i)
+        #     if item and item.widget() and isinstance(item.widget(), CollapsiblePanel):
+        #         item.widget().set_expanded(False)
+
     def _setup_preprocessing_section(self):
         panel = CollapsiblePanel("Pre-processing", collapsed=True)
         self._container_layout.addWidget(panel)

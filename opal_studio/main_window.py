@@ -236,6 +236,8 @@ class MainWindow(QMainWindow):
                 self._channel_model.set_channels(channels)
 
             self._canvas.set_image(img)
+            self._ops_panel.reset()
+            self._phenotyping_tab.clear()
             self._status.showMessage(f"Loaded: {Path(path).name}", 5000)
         except Exception as e:
             import traceback; traceback.print_exc()

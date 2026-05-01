@@ -214,3 +214,11 @@ class PhenotypingTab(QWidget):
                     criteria[ch_name] = state
             definitions[c_type] = criteria
         return definitions
+
+    def clear(self):
+        """Reset all phenotyping definitions and states."""
+        self._cell_states = {}
+        self._cell_types = []
+        self._channel_names = []
+        self._refresh_table_ui()
+
