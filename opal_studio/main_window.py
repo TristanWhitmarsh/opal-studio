@@ -25,7 +25,9 @@ from PySide6.QtWidgets import (
 )
 
 from opal_studio.channel_model import Channel, ChannelListModel
-from opal_studio.image_loader import ImageData, open_image, get_tile, _get_yx
+from opal_studio.image_loader import (
+    ImageData, open_image, open_spatialdata, spatialdata_channel_maxima, get_tile, _get_yx
+)
 from opal_studio.widgets.channel_panel import ChannelPanel
 from opal_studio.widgets.image_canvas import ImageCanvas
 from opal_studio.widgets.operations_panel import OperationsPanel
@@ -177,6 +179,11 @@ class MainWindow(QMainWindow):
         open_act.triggered.connect(self._on_open)
         file_menu.addAction(open_act)
 
+        open_sdata_act = QAction("Open &SpatialData…", self)
+        open_sdata_act.setShortcut("Ctrl+Shift+O")
+        open_sdata_act.triggered.connect(self._on_open_spatialdata)
+        file_menu.addAction(open_sdata_act)
+
         file_menu.addSeparator()
         
         load_masks_act = QAction("&Load Masks…", self)
@@ -217,6 +224,45 @@ class MainWindow(QMainWindow):
     def _on_open(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Images (*.ome.tiff *.tiff *.tif *.png *.jpg);;All files (*)")
         if path: self._load_image(path)
+
+    def _on_open_spatialdata(self):
+        """Let the user pick a SpatialData root directory, then load it."""
+        path = QFileDialog.getExistingDirectory(self, "Open SpatialData Directory", "")
+        if path:
+            self._load_spatialdata(path)
+
+    def _load_spatialdata(self, path: str):
+        """Open a SpatialData directory and set it as the active image."""
+        try:
+            img = open_spatialdata(path)
+            self._image = img
+
+            from opal_studio.channel_model import generate_spaced_colors
+            palette = generate_spaced_colors(len(img.channel_names))
+            
+            # Efficiently compute per-channel maxima from coarsest level once
+            self._status.showMessage("Computing channel ranges...")
+            maxima = spatialdata_channel_maxima(img)
+            
+            channels = []
+            for i, name in enumerate(img.channel_names):
+                rgb = palette[i]
+                channels.append(Channel(
+                    name=name, color=QColor(*rgb),
+                    visible=True, 
+                    data_min=0.0, 
+                    data_max=float(maxima[i]), 
+                    index=i
+                ))
+            self._channel_model.set_channels(channels)
+
+            self._canvas.set_image(img)
+            self._ops_panel.reset()
+            self._phenotyping_tab.clear()
+            self._status.showMessage(f"Loaded SpatialData: {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Could not load SpatialData: {e}")
 
     def _load_image(self, path: str):
         try:

@@ -41,7 +41,7 @@ from PySide6.QtGui import QImage
 
 from opal_studio.channel_model import Channel
 from opal_studio.image_loader import (
-    ImageData, TileCache, get_tile, _get_yx,
+    ImageData, TileCache, ZarrV3Array, get_tile, _get_yx,
 )
 
 import threading
@@ -443,6 +443,35 @@ def _read_channel_slice(
 
     lh, lw = _get_yx(lvl.shape, img.axes, img.is_rgb)
     z_arr = None
+
+    # SpatialData fast-path: ZarrV3Array is already thread-safe (opens files
+    # per-call) so we bypass the tifffile-based _get_thread_zarr entirely.
+    if isinstance(lvl._zarr, ZarrV3Array):
+        for tr in range(row_start, row_end + 1):
+            for tc in range(col_start, col_end + 1):
+                key = (level_idx, channel, tr, tc, tile_size)
+                tile = cache.get(key)
+
+                if tile is None:
+                    ty0 = tr * tile_size
+                    tx0 = tc * tile_size
+                    ty1 = min(ty0 + tile_size, lh)
+                    tx1 = min(tx0 + tile_size, lw)
+                    tile = lvl._zarr[channel, slice(ty0, ty1), slice(tx0, tx1)]
+                    tile = np.ascontiguousarray(tile)
+                    cache.put(key, tile)
+
+                ty0 = tr * tile_size
+                tx0 = tc * tile_size
+                dy = max(0, ty0 - y_sl.start)
+                dx = max(0, tx0 - x_sl.start)
+                sy = max(0, y_sl.start - ty0)
+                sx = max(0, x_sl.start - tx0)
+                h = min(tile.shape[0] - sy, vh - dy)
+                w = min(tile.shape[1] - sx, vw - dx)
+                if h > 0 and w > 0:
+                    out[dy:dy+h, dx:dx+w] = tile[sy:sy+h, sx:sx+w]
+        return out
 
     for tr in range(row_start, row_end + 1):
         for tc in range(col_start, col_end + 1):

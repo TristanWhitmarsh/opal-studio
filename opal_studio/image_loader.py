@@ -1,22 +1,26 @@
 """
-Image loader for OME-TIFF files with pyramid support.
+Image loader for OME-TIFF and SpatialData (Zarr V3) files with pyramid support.
 
 Uses tifffile with efficient caching and lazy page-level reading to handle
-massive multi-channel datasets without exhausting memory.
+massive multi-channel datasets without exhausting memory.  SpatialData
+directories are read without the spatialdata library by manually decoding
+Zarr V3 chunks (zstd-compressed) via numcodecs.
 
 Public API (consumed by main_window, image_canvas, image_renderer):
-  open_image(path)           -> ImageData
+  open_image(path)              -> ImageData   (OME-TIFF)
+  open_spatialdata(path)        -> ImageData   (SpatialData / Zarr V3)
   get_tile(img, level, ch, y_slice, x_slice) -> np.ndarray   (unchanged)
   best_level_for_zoom(img, spp) -> int
-  get_cached_tile(cache, img, level, ch, tile_row, tile_col, tile_size) -> np.ndarray  (NEW)
+  get_cached_tile(cache, img, level, ch, tile_row, tile_col, tile_size) -> np.ndarray
   ImageData.get_full_channel_data(ch, level) -> np.ndarray   (unchanged)
 
-Future backends (OME-Zarr, etc.) should implement the same interface as
-ImageData + expose compatible get_tile / get_cached_tile semantics.
+Both backends expose an identical ImageData object so all rendering,
+segmentation and preprocessing code works without modification.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -26,6 +30,13 @@ from typing import Optional
 
 import numpy as np
 import tifffile
+
+try:
+    import numcodecs as _numcodecs
+    _ZSTD_DECODER = _numcodecs.Zstd()
+except ImportError:
+    _numcodecs = None  # type: ignore
+    _ZSTD_DECODER = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -40,7 +51,7 @@ class LevelInfo:
     downsample: float   # relative to level-0
     _pages: list = field(default_factory=list)          # tifffile.TiffPage refs
     _cache: Optional[np.ndarray] = None                 # full-level cache for small levels
-    _zarr: Optional[object] = None                      # zarr array for fast lazy chunk reading
+    _zarr: Optional[object] = None                      # zarr array (or ZarrV3Array) for lazy reading
 
 
 @dataclass
@@ -77,6 +88,12 @@ class ImageData:
             level = len(self.levels) - 1
 
         info = self.levels[level]
+
+        # SpatialData backend: _zarr is a ZarrV3Array
+        if isinstance(info._zarr, ZarrV3Array):
+            _, h, w = info._zarr.shape
+            return info._zarr[channel_idx, 0:h, 0:w]
+
         if channel_idx < len(info._pages):
             return info._pages[channel_idx].asarray()
         return np.zeros((1, 1), dtype=self.dtype)
@@ -215,6 +232,339 @@ def open_image(path: str | Path) -> ImageData:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ZarrV3Array — lightweight Zarr V3 chunk reader (no zarr library needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ZarrV3Array:
+    """
+    Minimal numpy-compatible reader for a Zarr V3 array stored on disk.
+
+    Supports `arr[c, y0:y1, x0:x1]` style indexing which is all that the
+    image renderer (via _read_channel_slice) and segmentation engine need.
+
+    Chunks are zstd-compressed raw bytes. The chunk directory layout follows
+    the Zarr V3 default separator convention: ``c/y_tile/x_tile``.
+
+    Thread-safety: multiple threads may call __getitem__ concurrently because
+    each call opens files independently (no shared file handles).
+    """
+
+    def __init__(self, array_path: Path, meta: dict):
+        self._path = array_path
+        self._shape = tuple(meta['shape'])         # (C, Y, X)
+        cs = meta['chunk_grid']['configuration']['chunk_shape']
+        self._chunk_shape = tuple(cs)              # (c_c, c_y, c_x)
+        self._dtype = np.dtype(meta['data_type'])
+        # Detect codec from codecs list
+        codecs = meta.get('codecs', [])
+        self._codec = None
+        for codec in codecs:
+            name = codec.get('name', '')
+            if name == 'zstd' and _ZSTD_DECODER is not None:
+                self._codec = _ZSTD_DECODER
+                break
+        # SpatialData stores chunks under a 'c/' subdirectory by convention.
+        # Auto-detect: if 'c/' exists, chunks are at array_path/c/<c>/<y>/<x>;
+        # otherwise standard layout array_path/<c>/<y>/<x> is used.
+        self._chunk_prefix = 'c' if (array_path / 'c').is_dir() else ''
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def __getitem__(self, idx):
+        """
+        idx must be a 3-tuple: (c_int, y_slice, x_slice)
+        Returns a 2-D numpy array of shape (y1-y0, x1-x0).
+        """
+        if not isinstance(idx, tuple) or len(idx) != 3:
+            raise IndexError(f"ZarrV3Array requires 3-element index, got {idx!r}")
+
+        c_idx, y_sl, x_sl = idx
+        if not isinstance(y_sl, slice) or not isinstance(x_sl, slice):
+            raise IndexError("y and x indices must be slices")
+
+        C, H, W = self._shape
+        cc, cy, cx = self._chunk_shape
+
+        y0 = max(0, y_sl.start if y_sl.start is not None else 0)
+        y1 = min(H, y_sl.stop  if y_sl.stop  is not None else H)
+        x0 = max(0, x_sl.start if x_sl.start is not None else 0)
+        x1 = min(W, x_sl.stop  if x_sl.stop  is not None else W)
+
+        out = np.zeros((y1 - y0, x1 - x0), dtype=self._dtype)
+
+        # Which chunk tiles overlap with the requested region?
+        c_chunk = c_idx // cc   # c tile index (typically == c_idx since cc=1)
+        ty_start = y0 // cy
+        ty_end   = (y1 - 1) // cy
+        tx_start = x0 // cx
+        tx_end   = (x1 - 1) // cx
+
+        for ty in range(ty_start, ty_end + 1):
+            for tx in range(tx_start, tx_end + 1):
+                if self._chunk_prefix:
+                    chunk_path = self._path / self._chunk_prefix / str(c_chunk) / str(ty) / str(tx)
+                else:
+                    chunk_path = self._path / str(c_chunk) / str(ty) / str(tx)
+                if not chunk_path.exists():
+                    continue  # fill_value (0) already in out
+
+                with open(chunk_path, 'rb') as fh:
+                    raw = fh.read()
+
+                if self._codec is not None:
+                    raw = self._codec.decode(raw)
+
+                # np.frombuffer returns a read-only view; copy() makes it writable
+                chunk = np.frombuffer(raw, dtype=self._dtype).reshape(cy, cx).copy()
+
+                # Region of this chunk that overlaps with request
+                t_y0 = ty * cy;  t_y1 = t_y0 + cy
+                t_x0 = tx * cx;  t_x1 = t_x0 + cx
+
+                # Overlap in global coords
+                gy0 = max(y0, t_y0);  gy1 = min(y1, t_y1)
+                gx0 = max(x0, t_x0);  gx1 = min(x1, t_x1)
+                if gy1 <= gy0 or gx1 <= gx0:
+                    continue
+
+                # Clip chunk to valid data size (edge chunks may be smaller)
+                cy_real = min(cy, H - t_y0)
+                cx_real = min(cx, W - t_x0)
+
+                # Source slice inside chunk array
+                sy0 = gy0 - t_y0;  sy1 = gy1 - t_y0
+                sx0 = gx0 - t_x0;  sx1 = gx1 - t_x0
+                sy1 = min(sy1, cy_real)
+                sx1 = min(sx1, cx_real)
+                if sy1 <= sy0 or sx1 <= sx0:
+                    continue
+
+                # Destination slice inside out array
+                dy0 = gy0 - y0;  dy1 = dy0 + (sy1 - sy0)
+                dx0 = gx0 - x0;  dx1 = dx0 + (sx1 - sx0)
+
+                out[dy0:dy1, dx0:dx1] = chunk[sy0:sy1, sx0:sx1]
+
+        # SpatialData stores float32; replace NaN/Inf with 0 for clean rendering
+        if np.issubdtype(self._dtype, np.floating):
+            np.nan_to_num(out, copy=False)
+
+        return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SpatialData directory opener
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_mcd_panel(sdata_path: Path) -> dict:
+    """
+    Parse extras/mcd_schema.xml (Standard BioTools / Fluidigm MCD format) and
+    return a dict mapping metal-label -> protein-label.
+
+    Example: {'Ir(191)': 'DNA1', 'Gd(155)': 'PDPN', ...}
+    Returns an empty dict if the file is missing or unparseable.
+    """
+    xml_path = sdata_path / 'extras' / 'mcd_schema.xml'
+    if not xml_path.exists():
+        return {}
+    try:
+        import re
+        content = xml_path.read_text(encoding='utf-8', errors='replace')
+        pattern = r'<AcquisitionChannel\b[^>]*>([\s\S]*?)</AcquisitionChannel>'
+        blocks = re.findall(pattern, content)
+
+        def get_tag(block, tag):
+            m = re.search(r'<' + tag + r'>(.*?)</' + tag + r'>', block)
+            return m.group(1).strip() if m else ''
+
+        panel: dict[str, str] = {}
+        for block in blocks:
+            metal = get_tag(block, 'ChannelName')
+            label = get_tag(block, 'ChannelLabel')
+            if metal and label and label not in (metal, ''):
+                # Strip the leading mass number prefix (e.g. "141Pr_aSMA" -> "aSMA")
+                clean = re.sub(r'^\d+[A-Za-z]+_?', '', label)
+                if clean:
+                    panel[metal] = clean
+        return panel
+    except Exception:
+        return {}
+
+
+def spatialdata_channel_maxima(img: 'ImageData') -> list[float]:
+    """
+    Return a list of per-channel maximum values read from the coarsest pyramid
+    level in a single pass.  Uses ZarrV3Array so no additional I/O libraries
+    are required.
+
+    Returns a list of floats, length == number of channels.
+    All-zero channels get a placeholder max of 1.0 so the slider stays usable.
+    """
+    if not img.levels:
+        return [1.0] * len(img.channel_names)
+
+    coarsest = img.levels[-1]
+    z_arr = coarsest._zarr
+    if not isinstance(z_arr, ZarrV3Array):
+        return [1.0] * len(img.channel_names)
+
+    C, H, W = z_arr.shape
+    maxima: list[float] = []
+    for c in range(C):
+        tile = z_arr[c, slice(0, H), slice(0, W)]
+        m = float(np.max(tile))
+        maxima.append(m if m > 0.0 else 1.0)
+    return maxima
+
+
+def open_spatialdata(path: str | Path, image_name: str | None = None) -> ImageData:
+    """
+    Open a SpatialData directory and return an *ImageData* compatible with the
+    OME-TIFF backend.
+
+    The directory must contain an ``images/`` sub-directory holding one or more
+    OME-Zarr V3 image groups.  Each group has a ``zarr.json`` with
+    ``attributes.ome.omero.channels`` and ``attributes.ome.multiscales``.
+
+    If ``extras/mcd_schema.xml`` is present (Standard BioTools MCD format),
+    channel names are enriched to ``"Metal(mass) / Protein"`` notation.
+
+    Parameters
+    ----------
+    path:
+        Path to the SpatialData root directory (contains ``images/``).
+    image_name:
+        Name of the image sub-group inside ``images/`` to open.  If *None*,
+        the function picks the first group it finds that has a valid
+        ``zarr.json``.
+
+    Returns
+    -------
+    ImageData
+        Fully populated with pyramid levels backed by *ZarrV3Array* objects.
+        The ``_tif`` field is *None* (SpatialData has no TiffFile).
+    """
+    sdata_path = Path(path)
+    images_dir = sdata_path / 'images'
+    if not images_dir.is_dir():
+        raise FileNotFoundError(f"No 'images' directory found in {sdata_path}")
+
+    # ── Discover image group ────────────────────────────────────────────────
+    if image_name is None:
+        # Try 'stitched' first (common SpatialData convention), then any group
+        candidates = ['stitched'] + sorted(
+            d.name for d in images_dir.iterdir()
+            if d.is_dir() and d.name != 'stitched' and (d / 'zarr.json').exists()
+        )
+        image_name = next(
+            (c for c in candidates if (images_dir / c / 'zarr.json').exists()),
+            None
+        )
+        if image_name is None:
+            raise FileNotFoundError(f"No valid image group found inside {images_dir}")
+
+    img_root = images_dir / image_name
+    group_meta_path = img_root / 'zarr.json'
+    if not group_meta_path.exists():
+        raise FileNotFoundError(f"zarr.json not found at {group_meta_path}")
+
+    with open(group_meta_path, 'r') as fh:
+        group_meta = json.load(fh)
+
+    # ── Channel names from OME-Zarr metadata ───────────────────────────────
+    try:
+        ch_defs = group_meta['attributes']['ome']['omero']['channels']
+        metal_names = [c.get('label', f'Channel {i}') for i, c in enumerate(ch_defs)]
+    except (KeyError, TypeError):
+        metal_names = []
+
+    # ── Enrich names with protein labels from MCD panel ────────────────────
+    panel = _parse_mcd_panel(sdata_path)
+    if panel:
+        channel_names = [
+            f"{m} / {panel[m]}" if m in panel else m
+            for m in metal_names
+        ]
+    else:
+        channel_names = metal_names
+
+    # ── Multiscale paths & downsamples ──────────────────────────────────────
+    try:
+        multiscales = group_meta['attributes']['ome']['multiscales'][0]
+        datasets = multiscales['datasets']  # list of {path, coordinateTransformations}
+    except (KeyError, TypeError, IndexError):
+        # Fallback: list numeric sub-directories as levels
+        datasets = [
+            {'path': str(d.name), 'coordinateTransformations': [{'type': 'scale', 'scale': [1.0, 1.0, 1.0]}]}
+            for d in sorted(img_root.iterdir())
+            if d.is_dir() and d.name.isdigit() and (d / 'zarr.json').exists()
+        ]
+
+    # ── Build LevelInfo list ────────────────────────────────────────────────
+    levels: list[LevelInfo] = []
+    base_shape = None
+    base_x = None
+
+    for i, ds_entry in enumerate(datasets):
+        lvl_path = img_root / ds_entry['path']
+        arr_meta_path = lvl_path / 'zarr.json'
+        if not arr_meta_path.exists():
+            continue
+
+        with open(arr_meta_path, 'r') as fh:
+            arr_meta = json.load(fh)
+
+        shape = tuple(arr_meta['shape'])  # (C, Y, X)
+        if len(shape) != 3:
+            continue
+
+        if base_shape is None:
+            base_shape = shape
+            base_x = shape[2]
+
+        lx = shape[2]
+        downsample = base_x / lx if lx > 0 else 1.0
+
+        z_arr = ZarrV3Array(lvl_path, arr_meta)
+
+        levels.append(LevelInfo(
+            index=i,
+            shape=shape,
+            downsample=downsample,
+            _pages=[],           # not used for SpatialData
+            _zarr=z_arr,
+        ))
+
+    if not levels:
+        raise RuntimeError(f"No valid pyramid levels found in {img_root}")
+
+    if not channel_names:
+        channel_names = [f'Channel {i}' for i in range(base_shape[0])]
+    elif len(channel_names) != base_shape[0]:
+        # Trim or pad if metadata is inconsistent with actual array size
+        n = base_shape[0]
+        channel_names = (channel_names + [f'Channel {i}' for i in range(n)])[:n]
+
+    img = ImageData(
+        path=sdata_path,
+        is_rgb=False,
+        channel_names=channel_names,
+        levels=levels,
+        dtype=levels[0]._zarr.dtype,
+        base_shape=base_shape,   # (C, Y, X)
+        axes='CYX',
+        _tif=None,
+    )
+    return img
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Tile reading — original API (unchanged, used by segmentation/preprocessing)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -230,6 +580,8 @@ def get_tile(
 
     This is the original API; segmentation and preprocessing workflows
     continue to call it directly via get_full_channel_data().
+    Supports both the OME-TIFF backend (tifffile + zarr) and the
+    SpatialData backend (ZarrV3Array).
     """
     lvl = img.levels[level_idx]
 
@@ -237,25 +589,29 @@ def get_tile(
     if lvl._cache is not None:
         return _slice_array(lvl._cache, img.axes, img.is_rgb, channel, y_slice, x_slice)
 
-    # 2. If the level is small enough, cache it for future calls
+    # 2. SpatialData fast-path: ZarrV3Array handles chunked reads directly.
+    #    Skip the tifffile level-cache fill (img._tif is None for SpatialData).
+    if isinstance(lvl._zarr, ZarrV3Array):
+        return lvl._zarr[channel, y_slice, x_slice]
+
+    # 3. If the level is small enough, cache it for future calls (OME-TIFF only)
     n_pixels = 1
     for dim in lvl.shape:
         n_pixels *= dim
 
-    if n_pixels * img.dtype.itemsize < 128 * 1024 * 1024:
+    if n_pixels * img.dtype.itemsize < 128 * 1024 * 1024 and img._tif is not None:
         lvl._cache = img._tif.series[0].levels[level_idx].asarray()
         return _slice_array(lvl._cache, img.axes, img.is_rgb, channel, y_slice, x_slice)
 
-    # 3. True lazy access: read only the required page and slice
-    # Use Zarr for fast chunked access if available
+    # 4. True lazy access via tifffile-backed zarr store (OME-TIFF only)
     if lvl._zarr is not None:
         try:
             return _slice_array(lvl._zarr, img.axes, img.is_rgb, channel, y_slice, x_slice)
         except Exception as exc:
             print(f"[Opal] Zarr read fallback: {exc}")
-            pass # fallback to full-page read
+            pass  # fallback to full-page read
 
-    # Fallback: full-page read (very slow for large compressed images)
+    # 5. Fallback: full-page read (very slow for large compressed images)
     if img.is_rgb:
         page = lvl._pages[0]
         try:
