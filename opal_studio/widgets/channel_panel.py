@@ -15,6 +15,31 @@ from PySide6.QtWidgets import (
     QTabWidget
 )
 
+
+class ElidedLabel(QLabel):
+    """A QLabel that elides text in the *middle* when it doesn't fit.
+
+    The critical detail: we override sizeHint() and minimumSizeHint() to
+    return width=0.  Without this Qt's layout will allocate the full text
+    width to the label and clip all widgets to the right of it (eye button,
+    delete button, etc.) instead of shrinking the label itself.
+    """
+
+    def sizeHint(self):
+        sh = super().sizeHint()
+        return QSize(0, sh.height())  # width=0 → layout can shrink freely
+
+    def minimumSizeHint(self):
+        msh = super().minimumSizeHint()
+        return QSize(0, msh.height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        fm = self.fontMetrics()
+        elided = fm.elidedText(self.text(), Qt.TextElideMode.ElideMiddle, self.width())
+        painter.drawText(self.rect(), int(self.alignment()), elided)
+        painter.end()
+
 class ClickableFrame(QFrame):
     clicked = Signal()
     def mousePressEvent(self, event):
@@ -401,9 +426,11 @@ class ChannelPanel(QWidget):
             swatch.clicked.connect(lambda _, r=row, s=swatch: self._pick_color(r, s))
             top.addWidget(swatch)
 
-        # Name
-        name = QLabel(ch.name)
+        # Name — elided in the middle when the panel is too narrow
+        name = ElidedLabel(ch.name)
         name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        name.setMinimumWidth(0)  # allow shrinking below the text's natural width
+        name.setToolTip(ch.name)  # full name on hover
         top.addWidget(name)
 
         # Delete button for mask or processed channel

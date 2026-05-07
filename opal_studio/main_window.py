@@ -157,7 +157,10 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(1, 1) # canvas
         self._splitter.setStretchFactor(2, 0) # operations
         self._splitter.setSizes([300, 680, 300])
-        self._splitter.setCollapsible(2, False)
+        self._splitter.setCollapsible(0, False)  # channel panel cannot vanish
+        self._splitter.setCollapsible(2, False)  # operations panel cannot vanish
+        self._channel_panel.setMinimumWidth(180)
+        self._ops_panel.setMinimumWidth(180)
         
         self.setCentralWidget(self._splitter)
 

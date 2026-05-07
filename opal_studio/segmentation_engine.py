@@ -16,7 +16,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
             from stardist.models import StarDist2D
             model_folder = params.get("model_folder", params["model_name"])
             # Ensure we look in the correct directory relative to the app
-            basedir = os.path.join(os.getcwd(), "models")
+            basedir = os.path.join(os.getcwd(), "models", "stardist")
             
             if os.path.isdir(os.path.join(basedir, model_folder)):
                 model = StarDist2D(None, name=model_folder, basedir=basedir)

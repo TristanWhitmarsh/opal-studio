@@ -357,7 +357,7 @@ class StarDistTab(QWidget):
         self._model_combo.setToolTip("Pre-trained StarDist models for different imaging modalities (e.g., fluorescence nuclei).")
         form.addRow("Model:", self._model_combo)
 
-        self._prob_thresh = QLineEdit("0.1")
+        self._prob_thresh = QLineEdit()
         self._prob_thresh.setPlaceholderText("Auto")
         self._prob_thresh.setValidator(QDoubleValidator(0.01, 1.0, 2))
         self._prob_thresh.setFixedWidth(60)
@@ -394,14 +394,13 @@ class StarDistTab(QWidget):
         
 
     def _scan_models(self):
-        models_dir = os.path.join(os.getcwd(), "models")
+        models_dir = os.path.join(os.getcwd(), "models", "stardist")
         if not os.path.exists(models_dir): return
         for folder in os.listdir(models_dir):
             path = os.path.join(models_dir, folder)
             if os.path.isdir(path) and os.path.exists(os.path.join(path, "config.json")):
-                name = "Custom" if folder.lower() == "stardist" else folder
-                if self._model_combo.findText(name) == -1:
-                    self._model_combo.addItem(name, folder)
+                if self._model_combo.findText(folder) == -1:
+                    self._model_combo.addItem(folder, folder)
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
@@ -498,10 +497,16 @@ class CellposeTab(QWidget):
     def _scan_models(self):
         models_dir = os.path.join(os.getcwd(), "models", "cellpose")
         if not os.path.exists(models_dir): return
-        for file in os.listdir(models_dir):
-            path = os.path.join(models_dir, file)
-            if os.path.isfile(path) and not file.endswith('.txt') and not file.endswith('.ipynb'):
-                self._model_combo.addItem(f"Custom: {file[:30]}...", path)
+        for folder in os.listdir(models_dir):
+            folder_path = os.path.join(models_dir, folder)
+            if os.path.isdir(folder_path):
+                # Find the model file inside the folder (largest non-metadata file)
+                files = [f for f in os.listdir(folder_path) if not f.endswith(('.json', '.txt', '.ipynb', '.png', '.jpg', '.jpeg'))]
+                if files:
+                    model_file_name = max(files, key=lambda f: os.path.getsize(os.path.join(folder_path, f)))
+                    model_file = os.path.join(folder_path, model_file_name)
+                    if self._model_combo.findText(folder) == -1:
+                        self._model_combo.addItem(folder, model_file)
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return

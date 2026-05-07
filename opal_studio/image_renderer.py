@@ -94,8 +94,34 @@ def _get_thread_zarr(img: "ImageData", level_idx: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Primary viewport render -- full viewport, single atomic QImage
+# Compositing layer order
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _composite_order(ch: "Channel") -> int:
+    """
+    Return a priority integer used to sort channels before compositing.
+
+    Layers (bottom → top):
+      0 – raw intensity channels (disk / zarr reads)
+      1 – processed / merged channels (in-memory computed data)
+      2 – segmentation masks  (is_mask)
+      3 – cell pos/neg masks  (is_cell_mask)
+      4 – phenotype type masks (is_type_mask)
+
+    Python's sorted() is stable, so channels with the same priority are
+    painted in their original list order.
+    """
+    if ch.is_type_mask:
+        return 4
+    if ch.is_cell_mask:
+        return 3
+    if ch.is_mask:
+        return 2
+    if ch.is_processed and ch.processed_data is not None:
+        return 1
+    return 0
+
+
 
 def render_viewport_tiled(
     cache: TileCache,       # kept in API for future tile-prefetch use
@@ -286,10 +312,10 @@ def _render_viewport_multichannel(
                 print(f"[Opal] channel read error ({ch.name}): {exc}")
                 channel_arrays[id(ch)] = np.zeros((height, width), dtype=np.float32)
 
-    # ── Composite (serial, in original channel order) ─────────────────────
+    # ── Composite (serial, in layer order) ───────────────────────────────────
     canvas = np.zeros((height, width, 3), dtype=np.float32)
 
-    for ch in channels:
+    for ch in sorted(channels, key=_composite_order):
         if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
             if not ch.visible or ch.mask_data is None:
                 continue
@@ -347,7 +373,7 @@ def _render_multichannel(
     h, w = 0, 0
     canvas = None
 
-    for ch in channels:
+    for ch in sorted(channels, key=_composite_order):
         if (ch.is_mask or ch.is_cell_mask or ch.is_type_mask) and ch.mask_data is not None:
             ds = img.levels[level_idx].downsample
             sy = slice(int(vy.start * ds), int(vy.stop * ds))

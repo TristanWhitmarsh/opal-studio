@@ -105,6 +105,7 @@ class _RenderWorker(QObject):
 
     request = Signal(object, int)  # (_ViewportRequest, latest_seq)
     overview_request = Signal(object, int)  # (_ViewportRequest, latest_ch_ver)
+    reset_sequence = Signal()  # emitted when a new image is loaded
 
     def __init__(self):
         super().__init__()
@@ -112,6 +113,13 @@ class _RenderWorker(QObject):
         self._latest_overview_ver = -1
         self.request.connect(self._process, Qt.ConnectionType.QueuedConnection)
         self.overview_request.connect(self._process_overview, Qt.ConnectionType.QueuedConnection)
+        self.reset_sequence.connect(self._reset, Qt.ConnectionType.QueuedConnection)
+
+    @Slot()
+    def _reset(self):
+        """Reset sequence counters when a new image is loaded."""
+        self._latest_seq = -1
+        self._latest_overview_ver = -1
 
     @Slot(object, int)
     def _process(self, req: _ViewportRequest, latest_seq: int):
@@ -252,6 +260,12 @@ class ImageCanvas(QWidget):
         self._channel_version = 0
         self._seq = 0
         self._pending_seq = -1
+
+        # Reset the worker's stale-check counters BEFORE posting any new render
+        # requests. Without this, all seq numbers (starting from 0) for the new
+        # image would be less than the high _latest_seq accumulated from the
+        # previous image and would be silently discarded as "stale".
+        self._worker.reset_sequence.emit()
 
         axes = img._tif.series[0].axes.upper() if img._tif else ""
         h, w = _get_yx(img.base_shape, axes, img.is_rgb)
