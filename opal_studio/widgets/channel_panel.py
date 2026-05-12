@@ -400,7 +400,7 @@ class ChannelPanel(QWidget):
             eye_btn.setIcon(self._eye_open_icon if ch.visible else self._dash_icon)
             
         eye_btn.setIconSize(QSize(16, 16))
-        eye_btn.clicked.connect(lambda checked, r=row: self._toggle_vis(r, checked))
+        eye_btn.clicked.connect(lambda checked=False, r=row, btn=eye_btn: self._toggle_vis(r, btn.isChecked()))
         top.addWidget(eye_btn)
 
         # Contour toggle (only for masks)
@@ -411,7 +411,7 @@ class ChannelPanel(QWidget):
             contour_btn.setChecked(ch.contour_visible)
             contour_btn.setIcon(self._contour_open_icon if ch.contour_visible else self._contour_closed_icon)
             contour_btn.setIconSize(QSize(16, 16))
-            contour_btn.clicked.connect(lambda checked, r=row: self._toggle_contour_vis(r, checked))
+            contour_btn.clicked.connect(lambda checked=False, r=row, btn=contour_btn: self._toggle_contour_vis(r, btn.isChecked()))
             top.addWidget(contour_btn)
 
         # Colour swatch
@@ -423,7 +423,7 @@ class ChannelPanel(QWidget):
             swatch.setIcon(QIcon(pixmap))
             swatch.setIconSize(QSize(16, 16))
             swatch.setCursor(Qt.CursorShape.PointingHandCursor)
-            swatch.clicked.connect(lambda _, r=row, s=swatch: self._pick_color(r, s))
+            swatch.clicked.connect(lambda checked=False, r=row, s=swatch: self._pick_color(r, s))
             top.addWidget(swatch)
 
         # Name — elided in the middle when the panel is too narrow
@@ -441,7 +441,7 @@ class ChannelPanel(QWidget):
             del_btn.setFixedSize(24, 24)
             del_btn.setToolTip("Delete this channel")
             del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            del_btn.clicked.connect(lambda _, r=row: self._model.remove_channel(r))
+            del_btn.clicked.connect(lambda checked=False, r=row: self._model.remove_channel(r))
             top.addWidget(del_btn)
 
         layout.addLayout(top)

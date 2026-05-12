@@ -1,3 +1,5 @@
-include README.md
-include requirements.txt
-recursive-include opal_studio *.png
+graft .
+prune images
+prune models
+prune .git
+global-exclude *.py[cod] __pycache__ *.so *.dylib .gitignore
