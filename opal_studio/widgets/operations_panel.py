@@ -675,6 +675,7 @@ class InstanSegTab(QWidget):
             "single_channel_nuclei",
             "fluorescence_nuclei_and_cells",
         ])
+        self._scan_models()
         self._model_combo.setToolTip("InstanSeg models for single-channel nuclei or multi-channel fluorescence (nuclei and cells).")
         form.addRow("Model:", self._model_combo)
 
@@ -707,12 +708,23 @@ class InstanSegTab(QWidget):
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
+    def _scan_models(self):
+        models_dir = os.path.join(os.getcwd(), "models", "instanseg")
+        if not os.path.exists(models_dir): return
+        for folder in os.listdir(models_dir):
+            folder_path = os.path.join(models_dir, folder)
+            if os.path.isdir(folder_path):
+                if os.path.exists(os.path.join(folder_path, "model_weights.pth")):
+                    if self._model_combo.findText(folder) == -1:
+                        self._model_combo.addItem(folder, folder_path)
+
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
         self.runRequested.emit({
             "method": "instanseg",
             "channel_indices": [self._channel_combo.currentData()],
             "model_name": self._model_combo.currentText(),
+            "model_path": self._model_combo.currentData(),
             "pixel_size": float(self._pixel_size.text() or 1.0),
         })
 
@@ -723,11 +735,13 @@ class MesmerTab(QWidget):
     def __init__(self, channel_model, parent=None):
         super().__init__(parent)
         self._channel_model = channel_model
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        # Model Parameters
+
+        # ── Model / channel parameters ──────────────────────────────────────
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
@@ -736,17 +750,28 @@ class MesmerTab(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(4)
 
+        # Model Selector
+        self._model_combo = QComboBox()
+        self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._model_combo.setMinimumWidth(50)
+        self._model_combo.addItem("Default (DeepCell)", None)
+        self._model_combo.setToolTip("Select a local Mesmer model folder or use the default DeepCell cloud model.")
+        self._model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self._scan_models()
+        form.addRow("Model:", self._model_combo)
+
         # Nuclear Channel
         self._nuclear_combo = QComboBox()
         self._nuclear_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._nuclear_combo.setMinimumWidth(50)
         form.addRow("Nuclear:", self._nuclear_combo)
 
-        # Membrane Channel
+        # Membrane Channel (hidden for local models)
+        self._membrane_label = QLabel("Membrane:")
         self._membrane_combo = QComboBox()
         self._membrane_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._membrane_combo.setMinimumWidth(50)
-        form.addRow("Membrane:", self._membrane_combo)
+        form.addRow(self._membrane_label, self._membrane_combo)
 
         # Compartment
         self._compartment_combo = QComboBox()
@@ -766,7 +791,56 @@ class MesmerTab(QWidget):
         self._pixel_size.setFixedWidth(60)
         self._pixel_size.setToolTip("The resolution of the image in micrometers per pixel (\u03bcm/px). Crucial for accurate deep learning inference on varied datasets.")
         form.addRow("Pixel Size (\u03bcm):", self._pixel_size)
-        
+
+        # ── Watershed postprocessing parameters ─────────────────────────────
+        self._ws_radius = QLineEdit("3")
+        self._ws_radius.setValidator(QIntValidator(1, 100))
+        self._ws_radius.setFixedWidth(70)
+        self._ws_radius.setToolTip("Radius for local maxima detection. Smaller values detect finer peaks; larger values merge nearby nuclei.")
+        form.addRow("Radius:", self._ws_radius)
+
+        self._ws_maxima_thresh = QLineEdit("0.0004")
+        self._ws_maxima_thresh.setValidator(QDoubleValidator(0.0, 1.0, 6))
+        self._ws_maxima_thresh.setFixedWidth(70)
+        self._ws_maxima_thresh.setToolTip("Minimum height of a peak in the inner-distance map to be counted as a seed. Lower = more seeds (may over-segment).")
+        form.addRow("Maxima threshold:", self._ws_maxima_thresh)
+
+        self._ws_maxima_smooth = QLineEdit("0")
+        self._ws_maxima_smooth.setValidator(QDoubleValidator(0.0, 10.0, 2))
+        self._ws_maxima_smooth.setFixedWidth(70)
+        self._ws_maxima_smooth.setToolTip("Gaussian smoothing sigma applied to the inner-distance map before peak detection. 0 = no smoothing.")
+        form.addRow("Maxima smooth:", self._ws_maxima_smooth)
+
+        self._ws_interior_thresh = QLineEdit("0.1")
+        self._ws_interior_thresh.setValidator(QDoubleValidator(0.0, 1.0, 4))
+        self._ws_interior_thresh.setFixedWidth(70)
+        self._ws_interior_thresh.setToolTip("Pixels with outer-distance below this threshold are treated as background. Higher = smaller/fewer cells.")
+        form.addRow("Interior threshold:", self._ws_interior_thresh)
+
+        self._ws_interior_smooth = QLineEdit("2")
+        self._ws_interior_smooth.setValidator(QDoubleValidator(0.0, 10.0, 2))
+        self._ws_interior_smooth.setFixedWidth(70)
+        self._ws_interior_smooth.setToolTip("Gaussian smoothing sigma applied to the outer-distance map before thresholding. 0 = no smoothing.")
+        form.addRow("Interior smooth:", self._ws_interior_smooth)
+
+        self._ws_small_objects = QLineEdit("0")
+        self._ws_small_objects.setValidator(QIntValidator(0, 100000))
+        self._ws_small_objects.setFixedWidth(70)
+        self._ws_small_objects.setToolTip("Objects smaller than this area (px\u00b2) are removed after watershed.")
+        form.addRow("Min object size:", self._ws_small_objects)
+
+        self._ws_fill_holes = QLineEdit("15")
+        self._ws_fill_holes.setValidator(QIntValidator(0, 100000))
+        self._ws_fill_holes.setFixedWidth(70)
+        self._ws_fill_holes.setToolTip("Holes smaller than this area (px\u00b2) inside segmented regions are filled.")
+        form.addRow("Fill holes (px\u00b2):", self._ws_fill_holes)
+
+        self._ws_exclude_border = QComboBox()
+        self._ws_exclude_border.addItems(["False", "True"])
+        self._ws_exclude_border.setFixedWidth(70)
+        self._ws_exclude_border.setToolTip("If True, objects touching the image border are removed.")
+        form.addRow("Exclude border:", self._ws_exclude_border)
+
         layout.addLayout(form)
 
         # Run Button
@@ -774,10 +848,57 @@ class MesmerTab(QWidget):
         self._run_btn.clicked.connect(self._on_run)
         layout.addWidget(self._run_btn)
 
+
         self._refresh_channels()
         self._channel_model.modelReset.connect(self._refresh_channels)
         self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+        # Apply initial visibility
+        self._on_model_changed(self._model_combo.currentIndex())
+
+
+    def _scan_models(self):
+        """Scan models/mesmer/ for subfolders containing a .keras model file."""
+        models_dir = os.path.join(os.getcwd(), "models", "mesmer")
+        if not os.path.exists(models_dir):
+            return
+        for folder in os.listdir(models_dir):
+            folder_path = os.path.join(models_dir, folder)
+            if not os.path.isdir(folder_path):
+                continue
+            # Find the .keras model file in the folder
+            keras_files = [f for f in os.listdir(folder_path) if f.endswith(".keras")]
+            if keras_files:
+                model_file = os.path.join(folder_path, keras_files[0])
+                if self._model_combo.findText(folder) == -1:
+                    self._model_combo.addItem(folder, model_file)
+
+    def _on_model_changed(self, index):
+        """Show/hide the membrane channel selector and update defaults."""
+        model_path = self._model_combo.currentData()
+        is_local = model_path is not None
+        self._membrane_label.setVisible(not is_local)
+        self._membrane_combo.setVisible(not is_local)
+        
+        # Reset to appropriate defaults based on model type
+        if is_local:
+            self._ws_radius.setText("2")
+            self._ws_maxima_thresh.setText("0.1")
+            self._ws_maxima_smooth.setText("0")
+            self._ws_interior_thresh.setText("0.15")
+            self._ws_interior_smooth.setText("1")
+            self._ws_small_objects.setText("15")
+            self._ws_fill_holes.setText("15")
+            self._ws_exclude_border.setCurrentText("False")
+        else:
+            self._ws_radius.setText("2")
+            self._ws_maxima_thresh.setText("0.1")
+            self._ws_maxima_smooth.setText("0")
+            self._ws_interior_thresh.setText("0.2")
+            self._ws_interior_smooth.setText("2")
+            self._ws_small_objects.setText("15")
+            self._ws_fill_holes.setText("15")
+            self._ws_exclude_border.setCurrentText("False")
 
     def _refresh_channels(self):
         n_current = self._nuclear_combo.currentText()
@@ -799,17 +920,32 @@ class MesmerTab(QWidget):
     def _on_run(self):
         if self._nuclear_combo.currentIndex() < 0: return
         
+        model_path = self._model_combo.currentData()
+        # For local models the membrane is always zero-filled (nucleus-only)
         indices = [self._nuclear_combo.currentData()]
-        if self._membrane_combo.currentData() != -1:
+        if model_path is None and self._membrane_combo.currentData() != -1:
             indices.append(self._membrane_combo.currentData())
-            
-        self.runRequested.emit({
+
+        params = {
             "method": "mesmer",
             "channel_indices": indices,
+            "model_path": model_path,
             "api_key": self._api_key.text(),
             "pixel_size": float(self._pixel_size.text() or 1.0),
             "compartment": self._compartment_combo.currentText(),
-        })
+            "watershed_kwargs": {
+                "radius": int(self._ws_radius.text() or 3),
+                "maxima_threshold": float(self._ws_maxima_thresh.text() or 0.0004),
+                "maxima_smooth": float(self._ws_maxima_smooth.text() or 0),
+                "interior_threshold": float(self._ws_interior_thresh.text() or 0.1),
+                "interior_smooth": float(self._ws_interior_smooth.text() or 2),
+                "small_objects_threshold": int(self._ws_small_objects.text() or 0),
+                "fill_holes_threshold": int(self._ws_fill_holes.text() or 15),
+                "exclude_border": self._ws_exclude_border.currentText() == "True",
+            },
+        }
+
+        self.runRequested.emit(params)
 
 class WatershedTab(QWidget):
     """Sub-widget for Watershed segmentation parameters."""
