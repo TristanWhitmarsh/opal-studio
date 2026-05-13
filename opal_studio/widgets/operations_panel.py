@@ -394,7 +394,7 @@ class StarDistTab(QWidget):
         
 
     def _scan_models(self):
-        models_dir = os.path.join(os.getcwd(), "models", "stardist")
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "stardist")
         if not os.path.exists(models_dir): return
         for folder in os.listdir(models_dir):
             path = os.path.join(models_dir, folder)
@@ -495,7 +495,7 @@ class CellposeTab(QWidget):
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
     def _scan_models(self):
-        models_dir = os.path.join(os.getcwd(), "models", "cellpose")
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "cellpose")
         if not os.path.exists(models_dir): return
         for folder in os.listdir(models_dir):
             folder_path = os.path.join(models_dir, folder)
@@ -609,7 +609,7 @@ class OmniposeTab(QWidget):
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
     def _scan_models(self):
-        models_dir = os.path.join(os.getcwd(), "models", "omnipose")
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "omnipose")
         if not os.path.exists(models_dir): return
         for file in os.listdir(models_dir):
             path = os.path.join(models_dir, file)
@@ -709,7 +709,7 @@ class InstanSegTab(QWidget):
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
     def _scan_models(self):
-        models_dir = os.path.join(os.getcwd(), "models", "instanseg")
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "instanseg")
         if not os.path.exists(models_dir): return
         for folder in os.listdir(models_dir):
             folder_path = os.path.join(models_dir, folder)
@@ -859,7 +859,7 @@ class MesmerTab(QWidget):
 
     def _scan_models(self):
         """Scan models/mesmer/ for subfolders containing a .keras model file."""
-        models_dir = os.path.join(os.getcwd(), "models", "mesmer")
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "mesmer")
         if not os.path.exists(models_dir):
             return
         for folder in os.listdir(models_dir):
@@ -1585,7 +1585,7 @@ class OperationsPanel(QWidget):
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
         self._channel_model = channel_model
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(325)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         main_layout = QVBoxLayout(self)

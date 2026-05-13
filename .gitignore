@@ -55,6 +55,10 @@ images/
 *.pth
 *.onnx
 models/
+opal_studio/models/
+*.tar
+*.zip
+*.gz
 
 # Gemini AI assistant files
 .gemini/

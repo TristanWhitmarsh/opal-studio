@@ -5,7 +5,8 @@
 # Setup:
 #   conda create -n opal-all python=3.9
 #   conda activate opal-all
-#   pip install -r requirements.txt
+#   pip install -r requirements.txt        ← note the -r flag!
+#   pip install --no-deps -e .             ← install opal-studio without re-resolving deps
 #
 # Constraints:
 #   - deepcell 0.12.x requires Python < 3.11 (using 3.9.25)
@@ -21,6 +22,10 @@ protobuf==3.20.3
 spektral==1.0.6
 
 # ── PyTorch Stack (Cellpose/InstanSeg) ───────────────────────────────────────
+# Install CUDA build with:
+#   pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 --index-url https://download.pytorch.org/whl/cu121
+# CPU-only fallback (slower, no GPU segmentation):
+#   pip install torch==2.1.2 torchvision==0.16.2
 torch==2.1.2
 torchvision==0.16.2
 einops==0.8.2

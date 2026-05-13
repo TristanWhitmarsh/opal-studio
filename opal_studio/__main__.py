@@ -49,10 +49,16 @@ if "--create-launcher" in sys.argv:
             home = os.path.expanduser("~")
             desktop_path = os.path.join(home, "Desktop", "OpalStudio.desktop")
             
-            import shutil
-            exe_path = shutil.which("opal-studio")
-            if not exe_path:
-                exe_path = f"{sys.executable} -m opal_studio"
+            activate_script = os.path.join(sys.prefix, "bin", "activate")
+            if os.path.exists(activate_script):
+                # Ensure the environment is activated so env vars are correct
+                exec_cmd = f'bash -c "source \'{activate_script}\' && python -m opal_studio"'
+            else:
+                import shutil
+                exe_path = shutil.which("opal-studio")
+                if not exe_path:
+                    exe_path = f"{sys.executable} -m opal_studio"
+                exec_cmd = exe_path
 
             icon_str = icon_path if icon_path else "utilities-terminal"
             
@@ -62,7 +68,7 @@ Version=1.0
 Type=Application
 Name=Opal Studio
 Comment=Launch Opal Studio Viewer
-Exec={exe_path}
+Exec={exec_cmd}
 Icon={icon_str}
 Terminal=false
 """)

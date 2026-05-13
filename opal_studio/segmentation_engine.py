@@ -2,6 +2,53 @@ import os
 import sys
 import traceback
 import numpy as np
+from pathlib import Path
+import importlib.util
+
+def ensure_peakdetect_scipy_compat():
+    spec = importlib.util.find_spec("peakdetect")
+    if spec is None or not spec.origin:
+        return
+
+    peakdetect_py = Path(spec.origin).resolve().parent / "peakdetect.py"
+    if not peakdetect_py.exists():
+        return
+
+    text = peakdetect_py.read_text(encoding="utf-8")
+
+    replacements = {
+        "from scipy import fft, ifft": "from scipy.fftpack import fft, ifft",
+        "from scipy.fft import fft, ifft": "from scipy.fftpack import fft, ifft",
+    }
+
+    new_text = text
+    for old, new in replacements.items():
+        new_text = new_text.replace(old, new)
+
+    if new_text != text:
+        peakdetect_py.write_text(new_text, encoding="utf-8")
+
+def ensure_instanseg_py39_compat():
+    """
+    Work around instanseg-torch 0.1.1 on Python 3.9 by ensuring
+    `from __future__ import annotations` is present at the top of
+    instanseg/utils/tiling.py before InstaSeg is imported.
+    """
+    spec = importlib.util.find_spec("instanseg")
+    if spec is None or not spec.origin:
+        return
+
+    instanseg_dir = Path(spec.origin).resolve().parent
+    tiling_py = instanseg_dir / "utils" / "tiling.py"
+    if not tiling_py.exists():
+        return
+
+    wanted = "from __future__ import annotations\n"
+    text = tiling_py.read_text(encoding="utf-8")
+
+    if not text.startswith(wanted):
+        tiling_py.write_text(wanted + text, encoding="utf-8")
+
 
 def run_segmentation_task_pipe(conn, params, input_channels_data):
     """
@@ -16,7 +63,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
             from stardist.models import StarDist2D
             model_folder = params.get("model_folder", params["model_name"])
             # Ensure we look in the correct directory relative to the app
-            basedir = os.path.join(os.getcwd(), "models", "stardist")
+            basedir = os.path.join(os.path.dirname(__file__), "models", "stardist")
             
             if os.path.isdir(os.path.join(basedir, model_folder)):
                 model = StarDist2D(None, name=model_folder, basedir=basedir)
@@ -57,6 +104,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
             results.append((labels, params.get("override_name", "Cellpose"), False))
 
         elif method == "omnipose":
+            ensure_peakdetect_scipy_compat()
             from cellpose_omni import models
             import torch
             use_gpu = torch.cuda.is_available()
@@ -80,6 +128,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
 
         elif method == "instanseg":
             import torch
+            ensure_instanseg_py39_compat()
             
             model_name = params["model_name"]
             model_path = params.get("model_path")
@@ -134,7 +183,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                 
             else:
                 from instanseg import InstanSeg
-                local_model_dir = os.path.join(os.getcwd(), "models", "instanseg", model_name)
+                local_model_dir = os.path.join(os.path.dirname(__file__), "models", "instanseg", model_name)
                 if os.path.exists(os.path.join(local_model_dir, "instanseg.pt")):
                     model_name = local_model_dir
                 
@@ -298,7 +347,7 @@ def run_positivity_task(queue, params, data):
         labels = data["labels"]
         markers = data["markers"]
         
-        model_path = os.path.join(os.getcwd(), "models", "cellpos", "marker_cnn_epoch_100.h5")
+        model_path = os.path.join(os.path.dirname(__file__), "models", "cellpos", "marker_cnn_epoch_100.h5")
         model = tf.keras.models.load_model(model_path, compile=False)
         
         PATCH_SIZE = 64
