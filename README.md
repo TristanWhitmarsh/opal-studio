@@ -12,11 +12,12 @@ Built using PySide6 and leveraging a state-of-the-art Python data stack, Opal St
 - **High-Performance Multi-Channel Viewing**: Load and dynamically manipulate dozens of high-resolution channels on the fly with native GPU-accelerated rendering.
 - **Advanced Pre-processing**: Built-in normalization, CLAHE (Contrast Limited Adaptive Histogram Equalization), and morphological filters (Median, Tophat).
 - **Multi-Engine AI Segmentation**: Deep integration with modern AI segmentation models:
+    - **Watershed**: Traditional marker-controlled region expansion for classical workflows.
     - **InstanSeg**: Fast, state-of-the-art nucleus and cell segmentation.
+    - **Mesmer (DeepCell)**: Integrated nuclear and whole-cell segmentation for multiplexed imaging.
     - **StarDist (2D)**: Robust nuclear segmentation using star-convex polygons.
     - **Cellpose**: Integrated support for Cyto, Nuclei, and custom models.
     - **Omnipose**: Dedicated support for bacterial, plant, and high-res worm segmentation.
-    - **Watershed**: Traditional marker-controlled region expansion for classical workflows.
 - **Intelligent Mask Processing**: 
     - **Cell Sampler (Ubermasking)**: Geometrically merge results from multiple segmentation engines using intelligent strategies (Jaccard agreement, Population density, Area variance).
     - **Size Filtering**: Dynamically remove segmented regions based on area constraints.
@@ -50,9 +51,17 @@ If you have downloaded/built a `.whl` distribution file (e.g. `opal_studio-0.1.0
 ```bash
 # General installation (will download dependencies from PyPI)
 pip install opal_studio-0.1.0-py3-none-any.whl
+```
 
-# If installing on a university cluster (enforcing CUDA 11.8 dependencies)
-pip install opal_studio-0.1.0-py3-none-any.whl --extra-index-url https://download.pytorch.org/whl/cu118
+#### University Cluster / Server Installation (CUDA 11.8 Compatibility)
+If you are installing on a university cluster or remote GPU server with an older CUDA driver (compatible with CUDA 11.8), execute the following commands in sequence to set up the environment, resolve all library dependency conflicts, and create the launcher:
+
+```bash
+source /storage/scratch.space/envs/opal-env/bin/activate
+pip install --force-reinstall opal_studio-0.1.0-py3-none-any.whl --extra-index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118 --force-reinstall
+pip install "numpy==1.26.4" "requests>=2.31"
+python -m opal_studio --create-launcher
 ```
 
 ---
@@ -120,10 +129,51 @@ python -m opal_studio --create-launcher
 ##### macOS
 * Desktop launcher creation is not natively supported on macOS yet, but you can launch the app normally from the terminal.
 
+## Performing Segmentation & Model Selection
 
+Opal Studio features a comprehensive, multi-engine segmentation panel on the right side under the **Operations Panel**. 
 
+### 1. How to Perform Segmentation
 
+#### Channel and Model Selection
+* **Select the Model**: Choose the segmentation tab corresponding to the engine you wish to use (e.g., *Watershed*, *InstanSeg*, etc.), then select the model from the **Model** dropdown.
+* **Select the Channel**: Choose the input channel (e.g., DNA, DAPI, or another nuclear marker) from the **Channel** dropdown.
 
+#### Region and Target Options
+* **Full image vs. Visible region only**:
+  * **Full image**: Runs the chosen segmentation engine over the entire image.
+  * **Visible region only**: Perfect for rapid testing. It segments only the portion of the image currently visible on your canvas.
+* **New mask vs. Overwrite selected mask**:
+  * **New mask**: Generates a brand-new mask channel in the left panel.
+  * **Overwrite selected mask**: Overwrites the active, highlighted mask channel, allowing you to rapidly iterate and adjust parameters without cluttering your channels.
+* **Smart Border Handling**: When segmenting sub-regions, the backend automatically handles border cell segmentations. Cells that are cut off or touch boundaries are smartly handled and clipped, preventing edge artifacts and ensuring clean masks when tiling or zooming.
+
+---
+
+### 2. Model Selection Guide (with IMC Guidelines)
+
+For **IMC (Imaging Mass Cytometry)** datasets, try using a **custom-trained IMC model** first (such as custom InstanSeg or Mesmer weights trained on IMC mass channels) to obtain modality-specific results.
+
+#### Speed Comparison Reference
+To help you select the right model for your workflow, here is a speed comparison benchmark (tested on a standard high-resolution dataset):
+
+| Segmentation Engine | Execution Speed |
+| :--- | :---: |
+| **Watershed** | **1 sec** |
+| **InstanSeg** | **10 sec** |
+| **Mesmer (DeepCell)** | **26 sec** |
+| **StarDist** | **60 sec** |
+| **Cellpose** | **14 sec** |
+| **Omnipose** | **25 sec** |
+
+#### Rough Accuracy Ranking on IMC Data
+When segmenting multiplexed IMC images, here is a rough objective accuracy assessment (from highest accuracy to lowest):
+
+$$\text{StarDist} > \text{InstanSeg} > \text{Mesmer} > \text{Cellpose} > \text{Watershed} > \text{Omnipose}$$
+
+Use this ranking along with the speed comparison to choose the optimal engine for your specific tissue and throughput requirements.
+
+---
 ## License
 
 Opal Studio is licensed under the **MIT License** with the **Commons Clause**.

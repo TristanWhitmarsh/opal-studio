@@ -762,6 +762,19 @@ class MesmerTab(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(4)
 
+        # Nuclear Channel
+        self._nuclear_combo = QComboBox()
+        self._nuclear_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._nuclear_combo.setMinimumWidth(50)
+        form.addRow("Nuclear Channel:", self._nuclear_combo)
+
+        # Membrane Channel (hidden for local models)
+        self._membrane_label = QLabel("Membrane Channel:")
+        self._membrane_combo = QComboBox()
+        self._membrane_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._membrane_combo.setMinimumWidth(50)
+        form.addRow(self._membrane_label, self._membrane_combo)
+
         # Model Selector
         self._model_combo = QComboBox()
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -771,19 +784,6 @@ class MesmerTab(QWidget):
         self._model_combo.currentIndexChanged.connect(self._on_model_changed)
         self._scan_models()
         form.addRow("Model:", self._model_combo)
-
-        # Nuclear Channel
-        self._nuclear_combo = QComboBox()
-        self._nuclear_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._nuclear_combo.setMinimumWidth(50)
-        form.addRow("Nuclear:", self._nuclear_combo)
-
-        # Membrane Channel (hidden for local models)
-        self._membrane_label = QLabel("Membrane:")
-        self._membrane_combo = QComboBox()
-        self._membrane_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._membrane_combo.setMinimumWidth(50)
-        form.addRow(self._membrane_label, self._membrane_combo)
 
         # Compartment
         self._compartment_combo = QComboBox()
@@ -1706,24 +1706,30 @@ class OperationsPanel(QWidget):
 
         self._seg_tabs = OperationsTabWidget()
         self._seg_tabs.setIconSize(QSize(1, 24))
-        self._stardist_tab = StarDistTab(self._channel_model)
-        self._stardist_tab.runRequested.connect(self._on_run_segmentation)
-        self._seg_tabs.addTab(self._stardist_tab, self._spacer_icon, "StarDist")
-        self._cellpose_tab = CellposeTab(self._channel_model)
-        self._cellpose_tab.runRequested.connect(self._on_run_segmentation)
-        self._seg_tabs.addTab(self._cellpose_tab, self._spacer_icon, "Cellpose")
-        self._omnipose_tab = OmniposeTab(self._channel_model)
-        self._omnipose_tab.runRequested.connect(self._on_run_segmentation)
-        self._seg_tabs.addTab(self._omnipose_tab, self._spacer_icon, "Omnipose")
-        self._instanseg_tab = InstanSegTab(self._channel_model)
-        self._instanseg_tab.runRequested.connect(self._on_run_segmentation)
-        self._seg_tabs.addTab(self._instanseg_tab, self._spacer_icon, "InstanSeg")
-        self._mesmer_tab = MesmerTab(self._channel_model)
-        self._mesmer_tab.runRequested.connect(self._on_run_segmentation)
-        self._seg_tabs.addTab(self._mesmer_tab, self._spacer_icon, "Mesmer")
+        
         self._watershed_tab = WatershedTab(self._channel_model)
         self._watershed_tab.runRequested.connect(self._on_run_segmentation)
         self._seg_tabs.addTab(self._watershed_tab, self._spacer_icon, "Watershed")
+        
+        self._instanseg_tab = InstanSegTab(self._channel_model)
+        self._instanseg_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._instanseg_tab, self._spacer_icon, "InstanSeg")
+        
+        self._mesmer_tab = MesmerTab(self._channel_model)
+        self._mesmer_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._mesmer_tab, self._spacer_icon, "Mesmer")
+        
+        self._stardist_tab = StarDistTab(self._channel_model)
+        self._stardist_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._stardist_tab, self._spacer_icon, "StarDist")
+        
+        self._cellpose_tab = CellposeTab(self._channel_model)
+        self._cellpose_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._cellpose_tab, self._spacer_icon, "Cellpose")
+        
+        self._omnipose_tab = OmniposeTab(self._channel_model)
+        self._omnipose_tab.runRequested.connect(self._on_run_segmentation)
+        self._seg_tabs.addTab(self._omnipose_tab, self._spacer_icon, "Omnipose")
         panel.addWidget(self._seg_tabs)
 
     def _setup_mask_processing_section(self):
