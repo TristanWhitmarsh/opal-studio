@@ -29,7 +29,36 @@ Built using PySide6 and leveraging a state-of-the-art Python data stack, Opal St
 
 ## Installation
 
-Opal Studio relies on standard data science and imaging libraries. We recommend installing it within a Conda environment.
+Opal Studio relies on standard data science and imaging libraries. For a smooth setup, we recommend installing it within a **Conda environment**.
+
+### 1. GPU & Driver Optimization (Critical for Cluster/Server Users)
+Opal Studio dynamically uses your GPU for deep learning segmentation (Cellpose, InstanSeg, StarDist). 
+
+To ensure PyTorch connects successfully with your graphics card:
+* **Standard Modern PC/Workstation**: You can proceed directly to step 2 (pip will install the latest CUDA version automatically).
+* **Older GPUs or University Clusters (e.g. CUDA 11.8 / A100 with older driver)**: 
+  You should install the compatible PyTorch build *before* installing Opal Studio. For example, to target **CUDA 11.8**:
+  ```bash
+  pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
+  ```
+
+---
+
+### 2. Standard Installation (From Wheel or PyPI)
+If you have downloaded/built a `.whl` distribution file (e.g. `opal_studio-0.1.0-py3-none-any.whl`), navigate to the directory and run:
+
+```bash
+# General installation (will download dependencies from PyPI)
+pip install opal_studio-0.1.0-py3-none-any.whl
+
+# If installing on a university cluster (enforcing CUDA 11.8 dependencies)
+pip install opal_studio-0.1.0-py3-none-any.whl --extra-index-url https://download.pytorch.org/whl/cu118
+```
+
+---
+
+### 3. Developer / Source Installation
+If you are developing Opal Studio or running it directly from source:
 
 1. **Clone the repository**:
    ```bash
@@ -37,16 +66,21 @@ Opal Studio relies on standard data science and imaging libraries. We recommend 
    cd opal-studio
    ```
 
-2. **Create and activate the environment**:
-   Using the provided `environment.yml`:
+2. **Create and activate the Conda environment**:
    ```bash
-   conda env create -f environment.yml
-   conda activate opal-env
+   conda create -n opal-all python=3.9
+   conda activate opal-all
    ```
 
-3. **Install the package (Editable mode)**:
+3. **Install the dependencies**:
    ```bash
-   pip install -e .
+   pip install -r requirements.txt
+   ```
+   *(Note: The `requirements.txt` is pre-configured to automatically download CUDA 11.8 compatible wheels for university servers).*
+
+4. **Install Opal Studio in editable development mode**:
+   ```bash
+   pip install --no-deps -e .
    ```
 
 ## Usage
@@ -58,12 +92,37 @@ conda activate opal-env
 python -m opal_studio
 ```
 
-### Quick Start
-1. **Load Image**: `File > Open Image` to load `.ome.tiff`, `.tiff`, or other standard formats.
-2. **Visualize**: Use the left **Channel Panel** to toggle visibility, adjust brightness/contrast, and assign colors.
-3. **Segment**: Open the right **Operations Panel**, select a segmentation engine (e.g., StarDist or InstanSeg), and click **Run**.
-4. **Phenotype**: Switch to the **Phenotyping** tab in the center area to define cell populations or use the **Cell Positivity** AI in the right panel.
-5. **Export**: Use `File > Save Masks` to export your results as multi-channel OME-TIFFs.
+### Creating a Desktop Launcher (Linux & Windows)
+
+For convenience, Opal Studio can automatically generate a desktop launch button so you do not have to manually activate your environment and type the run command every time.
+
+To create the desktop launcher, activate your virtual environment and run:
+
+```bash
+python -m opal_studio --create-launcher
+```
+
+#### Platform Specifics & Setup:
+
+##### Linux (Ubuntu, Debian, Fedora, GNOME/KDE)
+* **What it does**: Creates an `OpalStudio.desktop` launcher directly on your `~/Desktop`.
+* **Terminal Logs Visibility**: The launcher is pre-configured with `Terminal=true` so that a terminal window automatically opens alongside the GUI. This allows you to monitor background image processing logs, AI model loading progress, and any warning or error outputs in real-time.
+* **Making it Runnable (Crucial Step)**: Modern Linux desktop environments require desktop files on the desktop to be explicitly trusted before running.
+  1. Navigate to your Desktop.
+  2. **Right-click** on the newly created **Opal Studio** icon.
+  3. Select **"Allow Launching"** (or mark it as trusted/executable in your environment).
+  4. The standard shortcut icon will transform into the application icon, and you can now double-click it to run.
+
+##### Windows
+* **What it does**: It automatically creates a native Windows Desktop Shortcut (`Opal Studio.lnk`) using the Windows Script Host shell.
+* It maps the shortcut to either the installed `opal-studio` command-line utility or the exact python interpreter of your currently activated virtual environment (running `python -m opal_studio`).
+
+##### macOS
+* Desktop launcher creation is not natively supported on macOS yet, but you can launch the app normally from the terminal.
+
+
+
+
 
 ## License
 

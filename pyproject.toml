@@ -23,8 +23,8 @@ dependencies = [
     "tensorflow-io-gcs-filesystem==0.26.0",
     "protobuf==3.20.3",
     "spektral==1.0.6",
-    "torch==2.1.2",
-    "torchvision==0.16.2",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
     "einops==0.8.2",
     "deepcell==0.12.10",
     "deepcell-toolbox==0.12.1",
@@ -56,6 +56,7 @@ dependencies = [
     "mgen==1.2.1",
     "ncolor==1.5.3",
     "pywin32==311; sys_platform == 'win32'",
+    "setuptools>=68.0,<70.0.0",
 ]
 
 [project.scripts]

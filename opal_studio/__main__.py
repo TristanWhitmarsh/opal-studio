@@ -14,13 +14,28 @@ if "--create-launcher" in sys.argv:
     try:
         print("[opal-studio] Creating launcher...")
         
-        # Try to find icon
+        # Try to find icon and convert to .ico on Windows
         icon_path = ""
         try:
             import opal_studio
-            icon_path = os.path.join(os.path.dirname(opal_studio.__file__), "icon.png")
-            if not os.path.exists(icon_path):
-                icon_path = ""
+            pkg_dir = os.path.dirname(opal_studio.__file__)
+            png_path = os.path.join(pkg_dir, "icon.png")
+            ico_path = os.path.join(pkg_dir, "icon.ico")
+            
+            if os.path.exists(png_path):
+                if platform.system() == "Windows" and not os.path.exists(ico_path):
+                    try:
+                        from PySide6.QtGui import QImage
+                        img = QImage(png_path)
+                        if not img.isNull():
+                            img.save(ico_path, "ICO")
+                    except Exception as e:
+                        print(f"[opal-studio] Could not convert PNG to ICO: {e}")
+                
+                if platform.system() == "Windows" and os.path.exists(ico_path):
+                    icon_path = ico_path
+                else:
+                    icon_path = png_path
         except ImportError:
             pass
 
@@ -36,9 +51,14 @@ if "--create-launcher" in sys.argv:
             if not exe_path:
                 exe_path = sys.executable
                 shortcut.Arguments = "-m opal_studio"
+                # Set working directory to project root so python can find the package if not installed
+                pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                shortcut.WorkingDirectory = pkg_root
+            else:
+                shortcut.Arguments = ""
+                shortcut.WorkingDirectory = os.path.expanduser("~")
             
-            shortcut.Targetpath = exe_path
-            shortcut.WorkingDirectory = os.path.expanduser("~")
+            shortcut.TargetPath = exe_path
             if icon_path:
                 shortcut.IconLocation = icon_path
             
@@ -47,7 +67,9 @@ if "--create-launcher" in sys.argv:
 
         elif platform.system() == "Linux":
             home = os.path.expanduser("~")
-            desktop_path = os.path.join(home, "Desktop", "OpalStudio.desktop")
+            desktop_dir = os.path.join(home, "Desktop")
+            os.makedirs(desktop_dir, exist_ok=True)
+            desktop_path = os.path.join(desktop_dir, "OpalStudio.desktop")
             
             activate_script = os.path.join(sys.prefix, "bin", "activate")
             if os.path.exists(activate_script):
@@ -70,7 +92,7 @@ Name=Opal Studio
 Comment=Launch Opal Studio Viewer
 Exec={exec_cmd}
 Icon={icon_str}
-Terminal=false
+Terminal=true
 """)
             os.chmod(desktop_path, 0o755)
             print(f"[opal-studio] Linux Launcher created at: {desktop_path}")
