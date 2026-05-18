@@ -685,6 +685,16 @@ class InstanSegTab(QWidget):
         self._pixel_size.setFixedWidth(60)
         self._pixel_size.setToolTip("The resolution of the image in micrometers per pixel (\u03bcm/px). Used to scale the model's receptive field to the physical size of cells.")
         form.addRow("Pixel Size (\u03bcm):", self._pixel_size)
+
+        self._fill_holes = QCheckBox("Fill holes")
+        self._fill_holes.setChecked(False)
+        self._fill_holes.setToolTip("Fill internal holes in detected cell masks.")
+        form.addRow(self._fill_holes)
+
+        self._keep_largest = QCheckBox("Keep largest component")
+        self._keep_largest.setChecked(False)
+        self._keep_largest.setToolTip("If a cell ID is fragmented, only keep the largest connected component.")
+        form.addRow(self._keep_largest)
         
         layout.addLayout(form)
 
@@ -726,6 +736,8 @@ class InstanSegTab(QWidget):
             "model_name": self._model_combo.currentText(),
             "model_path": self._model_combo.currentData(),
             "pixel_size": float(self._pixel_size.text() or 1.0),
+            "fill_holes": self._fill_holes.isChecked(),
+            "keep_largest": self._keep_largest.isChecked(),
         })
 
 class MesmerTab(QWidget):

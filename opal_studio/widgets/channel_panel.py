@@ -110,7 +110,7 @@ class ChannelPanel(QWidget):
         bright_layout.addWidget(bright_label)
 
         self._bright_slider = QSlider(Qt.Orientation.Horizontal)
-        self._bright_slider.setRange(1, 5000)  # 0.01 to 4.0
+        self._bright_slider.setRange(1, 1000)  # 0.01 to 4.0
         self._bright_slider.setValue(100)     # 1.0 initial
         self._bright_slider.valueChanged.connect(self._on_brightness_changed)
         bright_layout.addWidget(self._bright_slider)

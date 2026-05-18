@@ -50,6 +50,36 @@ def ensure_instanseg_py39_compat():
         tiling_py.write_text(wanted + text, encoding="utf-8")
 
 
+def _postprocess_labels(labels, fill_holes=False, keep_largest=False):
+    """
+    Optional post-processing for label images.
+    fill_holes: fills internal holes in each object mask.
+    keep_largest: if an object ID is fragmented, only the largest component is kept.
+    """
+    if not (fill_holes or keep_largest):
+        return labels
+    
+    from scipy.ndimage import binary_fill_holes, label as cc_label
+    new_labels = np.zeros_like(labels)
+    unique_ids = np.unique(labels)
+    
+    for idx in unique_ids:
+        if idx == 0: continue
+        mask = (labels == idx)
+        
+        if fill_holes:
+            mask = binary_fill_holes(mask)
+            
+        if keep_largest:
+            labeled_comp, num = cc_label(mask)
+            if num > 1:
+                sizes = np.bincount(labeled_comp.ravel())
+                largest = sizes[1:].argmax() + 1
+                mask = (labeled_comp == largest)
+        
+        new_labels[mask] = idx
+    return new_labels
+
 def run_segmentation_task_pipe(conn, params, input_channels_data):
     """
     Worker function to run segmentation in a separate process.
@@ -163,8 +193,18 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                 tensor = torch.from_numpy(raw_input).unsqueeze(0).float()
                 tensor = torch.stack([percentile_normalize(tensor[0])]).to(device)
                 
+                import torch.nn.functional as F
+                h, w = tensor.shape[-2:]
+                pad_h = (32 - h % 32) % 32
+                pad_w = (32 - w % 32) % 32
+                if pad_h > 0 or pad_w > 0:
+                    tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode='reflect')
+                
                 with torch.no_grad():
                     embeddings = backbone(tensor)
+                
+                if pad_h > 0 or pad_w > 0:
+                    embeddings = embeddings[..., :h, :w]
                     
                 postprocessor = InstanSegPostProcessor(
                     n_sigma=2, dim_coords=2, dim_seeds=1,
@@ -179,6 +219,14 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                     )
                     
                 cell_mask = instance_map[0].cpu().numpy().astype(np.int32)
+                
+                # Apply post-processing
+                cell_mask = _postprocess_labels(
+                    cell_mask, 
+                    fill_holes=params.get("fill_holes", False),
+                    keep_largest=params.get("keep_largest", False)
+                )
+                
                 results.append((cell_mask, f"InstanSeg ({model_name})", False))
                 
             else:
@@ -205,6 +253,23 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                     labels_tensor = labels_tensor.numpy()
                 
                 labels_tensor = np.squeeze(labels_tensor)
+                
+                # Apply post-processing to each channel if needed
+                if params.get("fill_holes") or params.get("keep_largest"):
+                    if labels_tensor.ndim == 3:
+                        for i in range(labels_tensor.shape[0]):
+                            labels_tensor[i] = _postprocess_labels(
+                                labels_tensor[i], 
+                                fill_holes=params.get("fill_holes"),
+                                keep_largest=params.get("keep_largest")
+                            )
+                    else:
+                        labels_tensor = _postprocess_labels(
+                            labels_tensor, 
+                            fill_holes=params.get("fill_holes"),
+                            keep_largest=params.get("keep_largest")
+                        )
+
                 if labels_tensor.ndim == 3:
                     # First channel is nuclei, rest are cells
                     results.append((labels_tensor[0], "InstanSeg Nuclei", False))
