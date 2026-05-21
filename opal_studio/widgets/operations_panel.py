@@ -163,7 +163,7 @@ class EqualizeTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -234,7 +234,7 @@ class FilterTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -300,7 +300,7 @@ class MergeTab(QWidget):
         self._channel2_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel1_combo.addItem(ch.name, i)
                 self._channel2_combo.addItem(ch.name, i)
         
@@ -387,7 +387,7 @@ class StarDistTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -489,7 +489,7 @@ class CellposeTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -603,7 +603,7 @@ class OmniposeTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -713,7 +713,7 @@ class InstanSegTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -920,7 +920,7 @@ class MesmerTab(QWidget):
         self._membrane_combo.addItem("None", -1)
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._nuclear_combo.addItem(ch.name, i)
                 self._membrane_combo.addItem(ch.name, i)
         
@@ -1048,7 +1048,7 @@ class WatershedTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask:
+            if not ch.is_mask and not getattr(ch, "is_region", False):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -1640,6 +1640,7 @@ class OperationsPanel(QWidget):
         self.stop_loading()
         self._radio_full.setChecked(True)
         self._radio_new_mask.setChecked(True)
+        self._radio_selected_region.setChecked(False)
         
         # Optionally: Collapse all sections to start fresh
         # (Though some users might prefer them staying open, defaults are usually best)
@@ -1676,15 +1677,22 @@ class OperationsPanel(QWidget):
         region_lay = QHBoxLayout()
         region_lay.setContentsMargins(12, 5, 12, 5)
         self._radio_full = QRadioButton("Full image")
-        self._radio_visible = QRadioButton("Visible region only")
+        self._radio_visible = QRadioButton("Visible region")
+        self._radio_selected_region = QRadioButton("Selected region")
         self._radio_full.setChecked(True)
+        self._radio_selected_region.setToolTip(
+            "Run segmentation inside the bounding box of the currently selected region polygon.\n"
+            "Only cells fully contained within the region polygon will be added to the mask."
+        )
         
         self._region_group = QButtonGroup(self)
         self._region_group.addButton(self._radio_full)
         self._region_group.addButton(self._radio_visible)
+        self._region_group.addButton(self._radio_selected_region)
         
         region_lay.addWidget(self._radio_full)
         region_lay.addWidget(self._radio_visible)
+        region_lay.addWidget(self._radio_selected_region)
         region_lay.addStretch()
         panel.addLayout(region_lay)
 
@@ -1847,15 +1855,51 @@ class OperationsPanel(QWidget):
 
     def _on_run_segmentation(self, params):
         target_mode = "new" if self._radio_new_mask.isChecked() else "overwrite"
-        params["region_mode"] = "full" if self._radio_full.isChecked() else "visible"
+        if self._radio_full.isChecked():
+            params["region_mode"] = "full"
+        elif self._radio_visible.isChecked():
+            params["region_mode"] = "visible"
+        else:
+            params["region_mode"] = "selected_region"
         params["target_mode"] = target_mode
-        
-        if target_mode == "overwrite":
-            sel_ch = self._channel_model.selected_channel()
-            if not sel_ch or not (sel_ch.is_mask or sel_ch.is_cell_mask or sel_ch.is_type_mask):
-                QMessageBox.warning(self, "No mask selected", "Please select a mask channel to overwrite.")
+
+        # Validate selected region mode — find any selected region channel
+        if params["region_mode"] == "selected_region":
+            region_ch = None
+            for i, ch in enumerate(self._channel_model._channels):
+                if ch.selected and getattr(ch, 'is_region', False):
+                    region_ch = ch
+                    params["region_channel_index"] = i
+                    break
+            if region_ch is None:
+                QMessageBox.warning(
+                    self, "No region selected",
+                    "Please select a region channel (drawn polygon) before running segmentation in 'Selected region' mode."
+                )
                 return
-            params["target_mask_index"] = self._channel_model._channels.index(sel_ch)
+
+        # Validate overwrite mode
+        if target_mode == "overwrite":
+            # When in selected_region mode the region is the selected channel,
+            # so look for any mask channel rather than requiring it to be "selected".
+            if params["region_mode"] == "selected_region":
+                mask_ch = None
+                for i, ch in enumerate(self._channel_model._channels):
+                    if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
+                        mask_ch = ch
+                        params["target_mask_index"] = i
+                        break
+                if mask_ch is None:
+                    QMessageBox.warning(self, "No mask found",
+                        "No mask channel found to overwrite. Please create a mask first.")
+                    return
+            else:
+                # Normal case: require a mask to be the selected channel
+                sel_ch = self._channel_model.selected_channel()
+                if not sel_ch or not (sel_ch.is_mask or sel_ch.is_cell_mask or sel_ch.is_type_mask):
+                    QMessageBox.warning(self, "No mask selected", "Please select a mask channel to overwrite.")
+                    return
+                params["target_mask_index"] = self._channel_model._channels.index(sel_ch)
 
         self._stardist_tab.setEnabled(False)
         self._cellpose_tab.setEnabled(False)

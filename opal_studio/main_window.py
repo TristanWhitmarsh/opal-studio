@@ -137,6 +137,11 @@ class MainWindow(QMainWindow):
         self.preprocessingError.connect(self._on_segmentation_error)
         self._canvas.pixelHovered.connect(self._on_pixel_hovered)
 
+        # Connect drawing signals between panel and canvas
+        self._channel_panel._draw_btn.toggled.connect(self._canvas.set_draw_mode)
+        self._channel_panel._simplification_spin.valueChanged.connect(self._canvas.set_simplification_epsilon)
+        self._canvas.regionDrawn.connect(self._on_region_drawn)
+
         # Layout
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self._channel_panel)
@@ -158,11 +163,11 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(0, 0) # channel
         self._splitter.setStretchFactor(1, 1) # canvas
         self._splitter.setStretchFactor(2, 0) # operations
-        self._splitter.setSizes([300, 680, 300])
+        self._splitter.setSizes([300, 630, 350])
         self._splitter.setCollapsible(0, False)  # channel panel cannot vanish
         self._splitter.setCollapsible(2, False)  # operations panel cannot vanish
         self._channel_panel.setMinimumWidth(180)
-        self._ops_panel.setMinimumWidth(180)
+        self._ops_panel.setMinimumWidth(220)
         
         self.setCentralWidget(self._splitter)
 
@@ -650,6 +655,31 @@ class MainWindow(QMainWindow):
                 
                 v_top, v_bottom, v_left, v_right = 0, 0, 0, 0
                 full_shape = None
+
+                # ---- Selected region: resolve bounding box and polygon --------
+                region_polygon = None   # QPolygonF
+                r_top = r_bottom = r_left = r_right = 0
+                if region_mode == "selected_region":
+                    region_ch_idx = params.get("region_channel_index")
+                    if region_ch_idx is None:
+                        raise ValueError("No region channel index provided for 'selected_region' mode.")
+                    region_ch = self._channel_model.channel(region_ch_idx)
+                    if not region_ch.contour_data:
+                        raise ValueError("The selected region has no polygon data.")
+                    # Region channels store their polygon in contour_data[1]["polygons"][0]
+                    first_entry = region_ch.contour_data.get(1, {})
+                    polys = first_entry.get("polygons", [])
+                    if not polys:
+                        raise ValueError("The selected region polygon is empty.")
+                    region_polygon = polys[0]
+                    bbox = first_entry.get("bbox")  # [y0, x0, y1, x1]
+                    if bbox:
+                        r_top, r_left, r_bottom, r_right = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    else:
+                        xs = [region_polygon.at(i).x() for i in range(region_polygon.count())]
+                        ys = [region_polygon.at(i).y() for i in range(region_polygon.count())]
+                        r_top, r_bottom = int(min(ys)), int(max(ys))
+                        r_left, r_right = int(min(xs)), int(max(xs))
                 
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
@@ -667,6 +697,14 @@ class MainWindow(QMainWindow):
                         if v_top >= v_bottom or v_left >= v_right:
                             raise ValueError("Visible region is completely outside the image.")
                         raw = raw[v_top:v_bottom, v_left:v_right]
+                    elif region_mode == "selected_region":
+                        r_top = int(max(0, r_top))
+                        r_left = int(max(0, r_left))
+                        r_bottom = int(min(full_shape[0], r_bottom))
+                        r_right = int(min(full_shape[1], r_right))
+                        if r_top >= r_bottom or r_left >= r_right:
+                            raise ValueError("Selected region bounding box is outside the image.")
+                        raw = raw[r_top:r_bottom, r_left:r_right]
 
                     # Normalize for deep learning models to prevent NMS hangs or junk results
                     # Subsample for percentile calculation if image is large
@@ -679,6 +717,40 @@ class MainWindow(QMainWindow):
                     input_channels_data.append(data)
                     x = data if x is None else x + data
                 
+                def _cell_centroid_in_polygon(labels_crop, poly, offset_y, offset_x):
+                    """
+                    Keep only cells whose centroid (in full-image coords) lies inside `poly`.
+                    Returns a filtered label array (same shape as labels_crop).
+                    """
+                    from scipy.ndimage import find_objects
+                    from PySide6.QtCore import QPointF, Qt
+
+                    cell_ids = np.unique(labels_crop)
+                    cell_ids = cell_ids[cell_ids > 0]
+                    if len(cell_ids) == 0:
+                        return labels_crop
+
+                    locs = find_objects(labels_crop)
+                    ids_to_keep = []
+                    for cell_id in cell_ids:
+                        loc = locs[cell_id - 1]
+                        if loc is None:
+                            continue
+                        binary = (labels_crop[loc] == cell_id)
+                        ys, xs = np.where(binary)
+                        if len(ys) == 0:
+                            continue
+                        cy = float(np.mean(ys)) + loc[0].start + offset_y
+                        cx = float(np.mean(xs)) + loc[1].start + offset_x
+                        if poly.containsPoint(QPointF(cx, cy), Qt.FillRule.OddEvenFill):
+                            ids_to_keep.append(cell_id)
+
+                    if len(ids_to_keep) == len(cell_ids):
+                        return labels_crop
+                    keep_set = set(ids_to_keep)
+                    mask_keep = np.vectorize(lambda v: v if v in keep_set else 0)(labels_crop).astype(labels_crop.dtype)
+                    return mask_keep
+
                 def process_and_emit(out_labels, out_name, out_is_cell):
                     if out_labels is None: return
                     target_idx = -1
@@ -723,6 +795,48 @@ class MainWindow(QMainWindow):
                             # New mask, apply zeros outside
                             full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
                             full_labels[v_top:v_bottom, v_left:v_right] = out_labels
+                            final_labels = full_labels
+
+                    elif region_mode == "selected_region":
+                        from PySide6.QtCore import Qt
+                        # Filter: keep only cells whose centroid is inside the polygon
+                        if out_labels.max() > 0 and region_polygon is not None:
+                            out_labels = _cell_centroid_in_polygon(out_labels, region_polygon, r_top, r_left)
+
+                        if existing_labels is not None:
+                            # Remove existing cells whose centroids are inside the region polygon
+                            if region_polygon is not None:
+                                from PySide6.QtCore import QPointF
+                                from scipy.ndimage import find_objects
+                                locs = find_objects(existing_labels)
+                                ids_in_region = []
+                                for cell_id_m1, loc in enumerate(locs):
+                                    if loc is None:
+                                        continue
+                                    cell_id = cell_id_m1 + 1
+                                    binary = (existing_labels[loc] == cell_id)
+                                    ys, xs = np.where(binary)
+                                    if len(ys) == 0:
+                                        continue
+                                    cy = float(np.mean(ys)) + loc[0].start
+                                    cx = float(np.mean(xs)) + loc[1].start
+                                    if region_polygon.containsPoint(QPointF(cx, cy), Qt.FillRule.OddEvenFill):
+                                        ids_in_region.append(cell_id)
+                                if ids_in_region:
+                                    mask_remove = np.isin(existing_labels, ids_in_region)
+                                    existing_labels[mask_remove] = 0
+
+                            # Merge new detections into existing mask
+                            if out_labels.max() > 0:
+                                max_id = existing_labels.max()
+                                mask_new = out_labels > 0
+                                existing_labels[r_top:r_bottom, r_left:r_right][mask_new] = out_labels[mask_new] + max_id
+                            final_labels = existing_labels
+                        else:
+                            # New mask: place results at region bounding box, zeros elsewhere
+                            full_labels = np.zeros(full_shape, dtype=out_labels.dtype)
+                            if out_labels.max() > 0:
+                                full_labels[r_top:r_bottom, r_left:r_right] = out_labels
                             final_labels = full_labels
                     else:
                         final_labels = out_labels
@@ -1346,6 +1460,8 @@ class MainWindow(QMainWindow):
                 val = ch.processed_data[y, x]
             elif (ch.is_mask or ch.is_cell_mask) and ch.mask_data is not None:
                 val = ch.mask_data[y, x]
+            elif getattr(ch, 'is_region', False):
+                val = "Region"
             elif ch.index >= 0:
                 try:
                     tile = get_tile(self._image, 0, ch.index, slice(y, y+1), slice(x, x+1))
@@ -1363,6 +1479,51 @@ class MainWindow(QMainWindow):
                 self._status.showMessage(f"X: {x}, Y: {y}")
         else:
             self._status.clearMessage()
+
+    @Slot(list)
+    def _on_region_drawn(self, points: list[QPointF]):
+        if not points:
+            return
+            
+        xs = [pt.x() for pt in points]
+        ys = [pt.y() for pt in points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        from PySide6.QtGui import QPolygonF
+        qpoly = QPolygonF(points)
+        
+        contour_data = {
+            1: {
+                "polygons": [qpoly],
+                "bbox": [min_y, min_x, max_y, max_x]
+            }
+        }
+        
+        regions_count = sum(1 for ch in self._channel_model._channels if getattr(ch, 'is_region', False))
+        
+        from opal_studio.channel_model import generate_spaced_colors
+        colors = generate_spaced_colors(regions_count + 1)
+        rgb = colors[regions_count % len(colors)]
+        row_color = QColor(*rgb)
+        
+        region_name = self._channel_model.get_unique_name("Region ")
+        
+        new_ch = Channel(
+            name=region_name,
+            color=row_color,
+            visible=True,
+            is_region=True,
+            contour_data=contour_data,
+            index=-1
+        )
+        self._channel_model.add_channel(new_ch)
+        
+        new_idx = self._channel_model.rowCount() - 1
+        idx_qt = self._channel_model.index(new_idx)
+        self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
+        
+        self.statusBar().showMessage(f"Created region: {region_name}", 3000)
 
     def closeEvent(self, event):
         super().closeEvent(event)

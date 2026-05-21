@@ -70,17 +70,27 @@ if "--create-launcher" in sys.argv:
             desktop_dir = os.path.join(home, "Desktop")
             os.makedirs(desktop_dir, exist_ok=True)
             desktop_path = os.path.join(desktop_dir, "OpalStudio.desktop")
-            
+
+            # Prepend CUDA lib64 to LD_LIBRARY_PATH if present on this machine so
+            # TensorFlow (Mesmer) can find libcudart / libcublas / libcudnn etc.
+            # os.path.isdir returns False when the path doesn't exist, making this
+            # a safe no-op on desktops or clusters without a system CUDA install.
+            cuda_lib = "/usr/local/cuda/lib64"
+            if os.path.isdir(cuda_lib):
+                cuda_export = f"export LD_LIBRARY_PATH={cuda_lib}:$LD_LIBRARY_PATH && "
+            else:
+                cuda_export = ""
+
             activate_script = os.path.join(sys.prefix, "bin", "activate")
             if os.path.exists(activate_script):
-                # Ensure the environment is activated so env vars are correct
-                exec_cmd = f'bash -c "source \'{activate_script}\' && python -m opal_studio"'
+                # venv / conda env with a standard activate script (Jupiter 3, etc.)
+                exec_cmd = f"bash -c \"{cuda_export}source '{activate_script}' && python -m opal_studio\""
             else:
                 import shutil
                 exe_path = shutil.which("opal-studio")
                 if not exe_path:
                     exe_path = f"{sys.executable} -m opal_studio"
-                exec_cmd = exe_path
+                exec_cmd = f'bash -c "{cuda_export}{exe_path}"' if cuda_export else exe_path
 
             icon_str = icon_path if icon_path else "utilities-terminal"
             

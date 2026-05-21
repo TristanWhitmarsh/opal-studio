@@ -110,6 +110,7 @@ class Channel:
     source_marker: str = ""
     pos_lut: np.ndarray | None = None
     random_contour_colors: bool = True
+    is_region: bool = False
 
 
 class ChannelListModel(QAbstractListModel):
@@ -187,7 +188,7 @@ class ChannelListModel(QAbstractListModel):
     def set_all_visible(self, visible: bool, include_masks: bool = True):
         self.beginResetModel()
         for ch in self._channels:
-            if not include_masks and (ch.is_mask or ch.is_cell_mask or ch.is_type_mask):
+            if not include_masks and (ch.is_mask or ch.is_cell_mask or ch.is_type_mask or ch.is_region):
                 continue
             ch.visible = visible
         self.endResetModel()

@@ -26,10 +26,10 @@ class RangeSlider(QWidget):
     rangeChanged = Signal(float, float)
 
     # Appearance
-    HANDLE_W = 10
-    HANDLE_H = 18
-    TRACK_H = 6
-    SIDE_MARGIN = 5
+    HANDLE_W = 12
+    HANDLE_H = 12
+    TRACK_H = 4
+    SIDE_MARGIN = 0
     MIN_HEIGHT = 24
 
     def __init__(self, parent=None):
@@ -93,24 +93,24 @@ class RangeSlider(QWidget):
 
         tr = self._track_rect()
 
-        # Track background
+        # Track background (clean light grey matching Alpha track)
         p.setPen(Qt.PenStyle.NoPen)
-        track_color = self.palette().color(QPalette.ColorGroup.Active, QPalette.ColorRole.Mid)
+        track_color = QColor(215, 215, 215)
         p.setBrush(track_color)
-        p.drawRoundedRect(tr, 3, 3)
+        p.drawRoundedRect(tr, 2, 2)
 
-        # Active range fill (neutral highlight color)
+        # Active range fill (standard system blue highlight, clean and thin)
         x1 = self._val_to_x(self._min_val)
         x2 = self._val_to_x(self._max_val)
         active = QRect(x1, tr.y(), max(x2 - x1, 1), tr.height())
 
         fill_color = self.palette().color(QPalette.ColorRole.Highlight)
         p.setBrush(fill_color)
-        p.drawRoundedRect(active, 3, 3)
+        p.drawRoundedRect(active, 2, 2)
 
-        # Handles
-        handle_brush = self.palette().color(QPalette.ColorGroup.Active, QPalette.ColorRole.Button)
-        handle_pen = QPen(self.palette().color(QPalette.ColorGroup.Active, QPalette.ColorRole.Dark), 1)
+        # Handles (clean off-white background with thin medium grey border matching QSlider)
+        handle_brush = QColor(250, 250, 250)
+        handle_pen = QPen(QColor(190, 190, 190), 1)
         
         for val in (self._min_val, self._max_val):
             hx = self._val_to_x(val) - self.HANDLE_W // 2
@@ -118,7 +118,7 @@ class RangeSlider(QWidget):
             handle_rect = QRect(hx, hy, self.HANDLE_W, self.HANDLE_H)
             p.setBrush(handle_brush)
             p.setPen(handle_pen)
-            p.drawRoundedRect(handle_rect, 3, 3)
+            p.drawEllipse(handle_rect)
 
         p.end()
 

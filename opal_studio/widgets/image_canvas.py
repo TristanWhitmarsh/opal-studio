@@ -52,8 +52,9 @@ from typing import Optional
 from PySide6.QtCore import (
     Qt, QPointF, QRectF, QThread, Signal, QObject, Slot, QTimer,
 )
-from PySide6.QtGui import QImage, QPainter, QWheelEvent, QMouseEvent, QColor
+from PySide6.QtGui import QImage, QPainter, QWheelEvent, QMouseEvent, QColor, QPolygonF
 from PySide6.QtWidgets import QWidget, QSizePolicy
+import numpy as np
 
 from opal_studio.channel_model import ChannelListModel
 from opal_studio.image_loader import (
@@ -174,6 +175,7 @@ class ImageCanvas(QWidget):
 
     ZOOM_FACTOR = 1.15
     pixelHovered = Signal(int, int)
+    regionDrawn = Signal(list)
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
@@ -236,6 +238,15 @@ class ImageCanvas(QWidget):
 
         self._model.channels_changed.connect(self._on_channels_changed)
 
+        # Draw region mode states
+        self._draw_mode = False
+        self._drawing = False
+        self._drawn_points = []
+        self._simplification_epsilon = 1.0
+        self._dragging_point = False
+        self._drag_point_info = None
+        self._hovered_point_info = None
+
         # Ensure the worker thread is cleanly stopped when the application
         # exits, regardless of whether closeEvent is triggered.
         from PySide6.QtWidgets import QApplication
@@ -283,6 +294,69 @@ class ImageCanvas(QWidget):
         self._channel_version += 1
         self._schedule_render(immediate_progressive=False)
         self.update()
+
+    @Slot(bool)
+    def set_draw_mode(self, enabled: bool):
+        self._draw_mode = enabled
+        if not enabled:
+            self._drawing = False
+            self._drawn_points = []
+            self._dragging_point = False
+            self._drag_point_info = None
+            self._hovered_point_info = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    @Slot(float)
+    def set_simplification_epsilon(self, val: float):
+        self._simplification_epsilon = val
+
+    def _simplify_contour(self, points: list[QPointF], epsilon: float) -> list[QPointF]:
+        """Apply Ramer-Douglas-Peucker (RDP) algorithm to simplify the contour."""
+        if len(points) <= 2 or epsilon <= 0.0:
+            return points
+
+        pts = [(pt.x(), pt.y()) for pt in points]
+        
+        def rdp(coords, eps):
+            if len(coords) <= 2:
+                return coords
+                
+            dmax = 0.0
+            index = 0
+            end = len(coords) - 1
+            
+            p1 = np.array(coords[0])
+            p2 = np.array(coords[end])
+            line_vec = p2 - p1
+            line_len = np.linalg.norm(line_vec)
+            
+            if line_len < 1e-9:
+                for i in range(1, end):
+                    d = np.linalg.norm(np.array(coords[i]) - p1)
+                    if d > dmax:
+                        index = i
+                        dmax = d
+            else:
+                line_unit = line_vec / line_len
+                for i in range(1, end):
+                    p = np.array(coords[i])
+                    v = p - p1
+                    proj = np.dot(v, line_unit)
+                    d = np.linalg.norm(v - proj * line_unit)
+                    if d > dmax:
+                        index = i
+                        dmax = d
+                        
+            if dmax > eps:
+                results1 = rdp(coords[:index+1], eps)
+                results2 = rdp(coords[index:], eps)
+                return results1[:-1] + results2
+            else:
+                return [coords[0], coords[end]]
+
+        simplified_pts = rdp(pts, epsilon)
+        return [QPointF(x, y) for (x, y) in simplified_pts]
 
     # ── Viewport helpers ──────────────────────────────────────────────────────
 
@@ -500,10 +574,20 @@ class ImageCanvas(QWidget):
             p.scale(spp, spp)
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+            # Draw currently drawing line if active
+            if getattr(self, "_draw_mode", False) and getattr(self, "_drawing", False) and len(self._drawn_points) > 1:
+                pen = p.pen()
+                pen.setWidth(3)
+                pen.setCosmetic(True)
+                pen.setColor(QColor(255, 255, 0)) # Yellow for drawing
+                p.setPen(pen)
+                p.drawPolyline(QPolygonF(self._drawn_points))
+
             import random as py_random
             rng = py_random.Random()
             for ch in self._model.visible_channels():
-                if (ch.is_mask or ch.is_cell_mask) and ch.contour_visible and ch.contour_data:
+                is_r = getattr(ch, "is_region", False)
+                if ((ch.is_mask or ch.is_cell_mask) and ch.contour_visible and ch.contour_data) or (is_r and ch.visible and ch.contour_data):
                     pen = p.pen()
                     pen.setWidth(3)
                     pen.setCosmetic(True)
@@ -513,7 +597,9 @@ class ImageCanvas(QWidget):
                         if (bbox[2] < vpt.top()    or bbox[0] > vpt.bottom() or
                                 bbox[3] < vpt.left() or bbox[1] > vpt.right()):
                             continue
-                        if ch.is_mask:
+                        if is_r:
+                            col = ch.color
+                        elif ch.is_mask:
                             if ch.random_contour_colors:
                                 rng.seed(int(lid))
                                 col = QColor.fromRgbF(rng.random(), rng.random(), rng.random())
@@ -531,6 +617,19 @@ class ImageCanvas(QWidget):
                         p.setPen(pen)
                         for qpoly in data["polygons"]:
                             p.drawPolyline(qpoly)
+
+            # Draw region handles/vertices if in draw mode
+            if getattr(self, "_draw_mode", False):
+                for ch in self._model.visible_channels():
+                    if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
+                        for lid, data in ch.contour_data.items():
+                            for poly in data["polygons"]:
+                                for pt in poly:
+                                    # Solid circle filled with region color (no white outline)
+                                    p.setPen(ch.color)
+                                    p.setBrush(ch.color)
+                                    p.drawEllipse(pt, 4.0 / spp, 4.0 / spp)
+
             p.restore()
             p.end()
 
@@ -575,7 +674,22 @@ class ImageCanvas(QWidget):
     # ── Pan ───────────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
+        if getattr(self, "_draw_mode", False) and event.button() == Qt.MouseButton.LeftButton:
+            if getattr(self, "_hovered_point_info", None) is not None:
+                self._dragging_point = True
+                self._drag_point_info = self._hovered_point_info
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            else:
+                self._drawing = True
+                self._drawn_points = []
+                
+                spp = self._screen_pixels_per_image_pixel()
+                mx, my = event.position().x(), event.position().y()
+                img_x = self._viewport.left() + mx / spp
+                img_y = self._viewport.top() + my / spp
+                self._drawn_points.append(QPointF(img_x, img_y))
+                self.update()
+        elif event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
             self._panning = True
             self._pan_start = event.position()
             self._viewport_at_pan_start = QRectF(self._viewport)
@@ -589,7 +703,37 @@ class ImageCanvas(QWidget):
                 int(self._viewport.left() + mx / spp),
                 int(self._viewport.top()  + my / spp),
             )
-        if self._panning:
+            
+        if getattr(self, "_draw_mode", False) and getattr(self, "_dragging_point", False):
+            mx, my = event.position().x(), event.position().y()
+            img_x = self._viewport.left() + mx / spp
+            img_y = self._viewport.top() + my / spp
+            
+            ch, lid, poly_idx, pt_idx = self._drag_point_info
+            polygons = ch.contour_data[lid]["polygons"]
+            poly = polygons[poly_idx]
+            
+            new_pt = QPointF(img_x, img_y)
+            poly[pt_idx] = new_pt
+            if pt_idx == 0:
+                poly[len(poly) - 1] = new_pt
+            elif pt_idx == len(poly) - 1:
+                poly[0] = new_pt
+                
+            xs = [pt.x() for pt in poly]
+            ys = [pt.y() for pt in poly]
+            ch.contour_data[lid]["bbox"] = [min(ys), min(xs), max(ys), max(xs)]
+            
+            self._model.channels_changed.emit()
+            self.update()
+        elif getattr(self, "_draw_mode", False) and getattr(self, "_drawing", False):
+            mx, my = event.position().x(), event.position().y()
+            img_x = self._viewport.left() + mx / spp
+            img_y = self._viewport.top() + my / spp
+            
+            self._drawn_points.append(QPointF(img_x, img_y))
+            self.update()
+        elif self._panning:
             delta = event.position() - self._pan_start
             dx = -delta.x() / spp
             dy = -delta.y() / spp
@@ -601,9 +745,47 @@ class ImageCanvas(QWidget):
             )
             self._schedule_render(immediate_progressive=True)
             self.update()
+        elif getattr(self, "_draw_mode", False):
+            if spp > 0:
+                mx, my = event.position().x(), event.position().y()
+                hovered = None
+                best_dist = 8.0
+                
+                for ch in self._model._channels:
+                    if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
+                        for lid, data in ch.contour_data.items():
+                            for poly_idx, poly in enumerate(data["polygons"]):
+                                for pt_idx, pt in enumerate(poly):
+                                    sx = (pt.x() - self._viewport.left()) * spp
+                                    sy = (pt.y() - self._viewport.top()) * spp
+                                    
+                                    dist = math.hypot(mx - sx, my - sy)
+                                    if dist < best_dist:
+                                        best_dist = dist
+                                        hovered = (ch, lid, poly_idx, pt_idx)
+                                        
+                if hovered is not None:
+                    self._hovered_point_info = hovered
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                else:
+                    self._hovered_point_info = None
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        if self._panning:
+        if getattr(self, "_draw_mode", False) and getattr(self, "_dragging_point", False):
+            self._dragging_point = False
+            self._drag_point_info = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+        elif getattr(self, "_draw_mode", False) and getattr(self, "_drawing", False):
+            self._drawing = False
+            if len(self._drawn_points) >= 3:
+                self._drawn_points.append(self._drawn_points[0])
+                simplified = self._simplify_contour(self._drawn_points, getattr(self, "_simplification_epsilon", 1.0))
+                self.regionDrawn.emit(simplified)
+            self._drawn_points = []
+            self.update()
+        elif self._panning:
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
 

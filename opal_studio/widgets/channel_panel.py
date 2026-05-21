@@ -164,8 +164,15 @@ class ChannelPanel(QWidget):
         self._channel_tab = QWidget()
         self._channel_tab_layout = QVBoxLayout(self._channel_tab)
         self._channel_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self._channel_tab_layout.setSpacing(0)
         
         self._channel_tab_layout.addWidget(self._header_area)
+        
+        # Divider line
+        channel_line = QFrame()
+        channel_line.setFrameShape(QFrame.Shape.HLine)
+        channel_line.setFrameShadow(QFrame.Shadow.Sunken)
+        self._channel_tab_layout.addWidget(channel_line)
 
         self._channel_scroll = QScrollArea()
         self._channel_scroll.setWidgetResizable(True)
@@ -187,6 +194,7 @@ class ChannelPanel(QWidget):
         self._mask_tab = QWidget()
         self._mask_tab_layout = QVBoxLayout(self._mask_tab)
         self._mask_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self._mask_tab_layout.setSpacing(0)
 
         # Mask Header Area
         self._mask_header = QWidget()
@@ -204,6 +212,12 @@ class ChannelPanel(QWidget):
         m_head_layout.addLayout(m_op_layout)
         
         self._mask_tab_layout.addWidget(self._mask_header)
+        
+        # Divider line
+        mask_line = QFrame()
+        mask_line.setFrameShape(QFrame.Shape.HLine)
+        mask_line.setFrameShadow(QFrame.Shadow.Sunken)
+        self._mask_tab_layout.addWidget(mask_line)
 
         self._mask_scroll = QScrollArea()
         self._mask_scroll.setWidgetResizable(True)
@@ -226,6 +240,7 @@ class ChannelPanel(QWidget):
         self._cell_tab = QWidget()
         self._cell_tab_layout = QVBoxLayout(self._cell_tab)
         self._cell_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self._cell_tab_layout.setSpacing(0)
 
         self._cell_header = QWidget()
         self._cell_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -238,6 +253,12 @@ class ChannelPanel(QWidget):
         self._cell_opacity_slider.valueChanged.connect(self._on_header_cell_opacity_changed)
         cell_header_layout.addWidget(self._cell_opacity_slider)
         self._cell_tab_layout.addWidget(self._cell_header)
+        
+        # Divider line
+        cell_line = QFrame()
+        cell_line.setFrameShape(QFrame.Shape.HLine)
+        cell_line.setFrameShadow(QFrame.Shadow.Sunken)
+        self._cell_tab_layout.addWidget(cell_line)
 
         self._cell_scroll = QScrollArea()
         self._cell_scroll.setWidgetResizable(True)
@@ -260,6 +281,7 @@ class ChannelPanel(QWidget):
         self._type_tab = QWidget()
         self._type_tab_layout = QVBoxLayout(self._type_tab)
         self._type_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self._type_tab_layout.setSpacing(0)
 
         self._type_header = QWidget()
         self._type_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -287,6 +309,12 @@ class ChannelPanel(QWidget):
         type_header_layout.addLayout(opacity_layout)
         
         self._type_tab_layout.addWidget(self._type_header)
+        
+        # Divider line
+        type_line = QFrame()
+        type_line.setFrameShape(QFrame.Shape.HLine)
+        type_line.setFrameShadow(QFrame.Shadow.Sunken)
+        self._type_tab_layout.addWidget(type_line)
 
         self._type_scroll = QScrollArea()
         self._type_scroll.setWidgetResizable(True)
@@ -304,6 +332,64 @@ class ChannelPanel(QWidget):
         self._type_tab_layout.addWidget(self._type_scroll)
         self._tabs.addTab(self._type_tab, self._spacer_icon, "Types")
         self._type_layout.addStretch()
+
+        # Tab 5: Regions
+        self._region_tab = QWidget()
+        self._region_tab_layout = QVBoxLayout(self._region_tab)
+        self._region_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self._region_tab_layout.setSpacing(0)
+
+        # Region Header Area
+        self._region_header = QWidget()
+        self._region_header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        region_header_layout = QHBoxLayout(self._region_header)
+        region_header_layout.setContentsMargins(8, 8, 8, 8)
+        
+        # Draw Region Button
+        self._draw_btn = QPushButton()
+        self._draw_btn.setCheckable(True)
+        self._draw_btn.setIcon(QIcon(str(icons_dir / "draw.png")))
+        self._draw_btn.setIconSize(QSize(16, 16))
+        self._draw_btn.setToolTip("Draw a region in the image")
+        self._draw_btn.setFixedSize(28, 28)
+        
+        region_header_layout.addWidget(self._draw_btn)
+        
+        # Simplification value next to the button
+        region_header_layout.addWidget(QLabel("Simplification:"))
+        from PySide6.QtWidgets import QDoubleSpinBox
+        self._simplification_spin = QDoubleSpinBox()
+        self._simplification_spin.setRange(0.0, 100.0)
+        self._simplification_spin.setValue(1.0)
+        self._simplification_spin.setSingleStep(0.5)
+        self._simplification_spin.setFixedWidth(60)
+        region_header_layout.addWidget(self._simplification_spin)
+        
+        region_header_layout.addStretch()
+        self._region_tab_layout.addWidget(self._region_header)
+        
+        # Divider line
+        region_line = QFrame()
+        region_line.setFrameShape(QFrame.Shape.HLine)
+        region_line.setFrameShadow(QFrame.Shadow.Sunken)
+        self._region_tab_layout.addWidget(region_line)
+
+        self._region_scroll = QScrollArea()
+        self._region_scroll.setWidgetResizable(True)
+        self._region_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._region_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        self._region_container = QWidget()
+        self._region_container.setBackgroundRole(QPalette.ColorRole.Base)
+        self._region_container.setAutoFillBackground(True)
+        self._region_layout = QVBoxLayout(self._region_container)
+        self._region_layout.setContentsMargins(6, 6, 6, 6)
+        self._region_layout.setSpacing(6)
+        self._region_scroll.setWidget(self._region_container)
+        
+        self._region_tab_layout.addWidget(self._region_scroll)
+        self._tabs.addTab(self._region_tab, self._spacer_icon, "Regions")
+        self._region_layout.addStretch()
 
         self._row_widgets: list[QWidget] = []
 
@@ -346,10 +432,16 @@ class ChannelPanel(QWidget):
             item = self._type_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
 
+        while self._region_layout.count():
+            item = self._region_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
         for row in range(self._model.rowCount()):
             ch = self._model.channel(row)
             widget = self._make_row(row, ch)
-            if ch.is_type_mask:
+            if getattr(ch, 'is_region', False):
+                self._region_layout.addWidget(widget)
+            elif ch.is_type_mask:
                 self._type_layout.addWidget(widget)
             elif ch.is_cell_mask:
                 self._cell_layout.addWidget(widget)
@@ -363,6 +455,7 @@ class ChannelPanel(QWidget):
         self._mask_layout.addStretch()
         self._cell_layout.addStretch()
         self._type_layout.addStretch()
+        self._region_layout.addStretch()
 
     def _make_row(self, row: int, ch: Channel) -> QWidget:
         frame = ClickableFrame()
@@ -394,7 +487,9 @@ class ChannelPanel(QWidget):
         eye_btn.setCheckable(True)
         eye_btn.setChecked(ch.visible)
         
-        if ch.is_mask or ch.is_cell_mask:
+        if getattr(ch, 'is_region', False):
+            eye_btn.setIcon(self._contour_open_icon if ch.visible else self._contour_closed_icon)
+        elif ch.is_mask or ch.is_cell_mask:
             eye_btn.setIcon(self._eye_open_icon if ch.visible else self._eye_closed_icon)
         else:
             eye_btn.setIcon(self._eye_open_icon if ch.visible else self._dash_icon)
@@ -404,7 +499,7 @@ class ChannelPanel(QWidget):
         top.addWidget(eye_btn)
 
         # Contour toggle (only for masks)
-        if ch.is_mask or ch.is_cell_mask:
+        if (ch.is_mask or ch.is_cell_mask) and not getattr(ch, 'is_region', False):
             contour_btn = QPushButton()
             contour_btn.setFixedSize(24, 24)
             contour_btn.setCheckable(True)
@@ -433,8 +528,8 @@ class ChannelPanel(QWidget):
         name.setToolTip(ch.name)  # full name on hover
         top.addWidget(name)
 
-        # Delete button for mask or processed channel
-        if ch.is_mask or ch.is_processed:
+        # Delete button for mask, processed channel, or region
+        if ch.is_mask or ch.is_processed or getattr(ch, 'is_region', False):
             del_btn = QPushButton()
             del_btn.setIcon(self._delete_icon)
             del_btn.setIconSize(QSize(16, 16))
@@ -535,7 +630,9 @@ class ChannelPanel(QWidget):
                     eye_btn = top_layout.itemAt(0).widget()
                     if isinstance(eye_btn, QPushButton):
                         eye_btn.setChecked(ch.visible)
-                        if ch.is_mask or ch.is_cell_mask:
+                        if getattr(ch, 'is_region', False):
+                            eye_btn.setIcon(self._contour_open_icon if ch.visible else self._contour_closed_icon)
+                        elif ch.is_mask or ch.is_cell_mask:
                             eye_btn.setIcon(self._eye_open_icon if ch.visible else self._eye_closed_icon)
                         else:
                             eye_btn.setIcon(self._eye_open_icon if ch.visible else self._dash_icon)

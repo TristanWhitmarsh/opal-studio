@@ -53,8 +53,8 @@ If you have downloaded/built a `.whl` distribution file (e.g. `opal_studio-0.1.0
 pip install opal_studio-0.1.0-py3-none-any.whl
 ```
 
-#### University Cluster / Server Installation (CUDA 11.8 Compatibility)
-If you are installing on a university cluster or remote GPU server with an older CUDA driver (compatible with CUDA 11.8), execute the following commands in sequence to set up the environment, resolve all library dependency conflicts, and create the launcher:
+#### Jupiter 3 — Virtual Environment (CUDA 11.8)
+If you are installing on **Jupiter 3** (or any cluster node with a CUDA 11.8-compatible driver using a pre-existing virtual environment), execute the following commands in sequence:
 
 ```bash
 source /storage/scratch.space/envs/opal-env/bin/activate
@@ -63,6 +63,22 @@ pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorc
 pip install "numpy==1.26.4" "requests>=2.31"
 python -m opal_studio --create-launcher
 ```
+
+#### Jupiter 4 — Conda Environment
+If you are installing on **Jupiter 4**, activate the dedicated conda environment and install the wheel directly:
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate /storage/scratch.space/envs/opal-env-j4
+PIP_REQUIRE_VIRTUALENV=0 pip install opal_studio-0.1.0-py3-none-any.whl
+```
+
+> **Mesmer / TensorFlow GPU on Jupiter 4**  
+> TensorFlow looks for `libcudart.so.11.0`, `libcublas.so.11`, `libcudnn.so.8`, etc. in `LD_LIBRARY_PATH`, but the default environment only adds the `compat/` and `CUPTI/` CUDA sub-directories — not the main `/usr/local/cuda/lib64/` directory where those libraries actually live. Without this path TensorFlow silently falls back to CPU, producing visibly degraded Mesmer results.  
+> Add the following line **before** launching Opal Studio (or add it to your `~/.bashrc`):
+> ```bash
+> export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+> ```
 
 ---
 
@@ -98,6 +114,16 @@ To launch Opal Studio, activate your environment and execute the application mod
 
 ```bash
 conda activate opal-env
+python -m opal_studio
+```
+
+#### Jupiter 4
+On Jupiter 4, expose the main CUDA libraries before launching so that TensorFlow (used by Mesmer) can use the GPU:
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate /storage/scratch.space/envs/opal-env-j4
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 python -m opal_studio
 ```
 
@@ -140,12 +166,13 @@ Opal Studio features a comprehensive, multi-engine segmentation panel on the rig
 * **Select the Channel**: Choose the input channel (e.g., DNA, DAPI, or another nuclear marker) from the **Channel** dropdown.
 
 #### Region and Target Options
-* **Full image vs. Visible region only**:
+* **Full image vs. Visible region vs. Selected region**:
   * **Full image**: Runs the chosen segmentation engine over the entire image.
-  * **Visible region only**: Perfect for rapid testing. It segments only the portion of the image currently visible on your canvas.
+  * **Visible region**: Perfect for rapid testing. It segments only the portion of the image currently visible on your canvas.
+  * **Selected region**: Runs segmentation inside the bounding box of the currently selected region polygon (drawn in the Regions tab). Only cells whose centroid falls inside the polygon are added to the mask.
 * **New mask vs. Overwrite selected mask**:
   * **New mask**: Generates a brand-new mask channel in the left panel.
-  * **Overwrite selected mask**: Overwrites the active, highlighted mask channel, allowing you to rapidly iterate and adjust parameters without cluttering your channels.
+  * **Overwrite selected mask**: Overwrites the active, highlighted mask channel, allowing you to rapidly iterate and adjust parameters without cluttering your channels. When using **Selected region**, any existing cells inside the region are removed first, then the new detections are merged in.
 * **Smart Border Handling**: When segmenting sub-regions, the backend automatically handles border cell segmentations. Cells that are cut off or touch boundaries are smartly handled and clipped, preventing edge artifacts and ensuring clean masks when tiling or zooming.
 
 ---

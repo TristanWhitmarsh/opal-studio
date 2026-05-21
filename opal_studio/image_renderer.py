@@ -276,7 +276,8 @@ def _render_viewport_multichannel(
 
     # Scale factor for additive blending
     intensity_channels = [c for c in channels if not c.is_mask
-                          and not c.is_cell_mask and not c.is_type_mask]
+                          and not c.is_cell_mask and not c.is_type_mask
+                          and not getattr(c, 'is_region', False)]
     scale = brightness / len(intensity_channels) if intensity_channels else brightness
 
     # Channels that need a disk page read: everything that doesn't have
@@ -286,6 +287,7 @@ def _render_viewport_multichannel(
     disk_channels = [c for c in channels
                      if not c.is_mask and not c.is_cell_mask
                      and not c.is_type_mask
+                     and not getattr(c, 'is_region', False)
                      and not (c.is_processed and c.processed_data is not None)]
 
     # ── Parallel fetch: one page.asarray()[slice] per channel ────────────
@@ -316,6 +318,8 @@ def _render_viewport_multichannel(
     canvas = np.zeros((height, width, 3), dtype=np.float32)
 
     for ch in sorted(channels, key=_composite_order):
+        if getattr(ch, 'is_region', False):
+            continue
         if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
             if not ch.visible or ch.mask_data is None:
                 continue
@@ -367,13 +371,16 @@ def _render_multichannel(
         return _blank_qimage(max(1, out_h), max(1, out_w))
 
     intensity_channels = [c for c in channels if not c.is_mask
-                          and not c.is_cell_mask and not c.is_type_mask]
+                          and not c.is_cell_mask and not c.is_type_mask
+                          and not getattr(c, 'is_region', False)]
     scale = brightness / len(intensity_channels) if intensity_channels else brightness
 
     h, w = 0, 0
     canvas = None
 
     for ch in sorted(channels, key=_composite_order):
+        if getattr(ch, 'is_region', False):
+            continue
         if (ch.is_mask or ch.is_cell_mask or ch.is_type_mask) and ch.mask_data is not None:
             ds = img.levels[level_idx].downsample
             sy = slice(int(vy.start * ds), int(vy.stop * ds))
