@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QFrame, QSizePolicy,
     QComboBox, QLineEdit, QPushButton, QProgressBar,
     QFormLayout, QMessageBox, QCheckBox, QRadioButton, QButtonGroup,
-    QHBoxLayout, QScrollArea, QTabWidget, QToolButton,
+    QHBoxLayout, QGridLayout, QScrollArea, QTabWidget, QToolButton,
     QListWidget, QListWidgetItem, QAbstractItemView
 )
 from PySide6.QtGui import QDoubleValidator, QIntValidator, QPixmap, QIcon
@@ -63,6 +63,7 @@ class OperationsTabWidget(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
         self.setElideMode(Qt.TextElideMode.ElideNone)
         self.setUsesScrollButtons(True)
         self.setTabBarAutoHide(False)
@@ -1759,7 +1760,7 @@ class OperationsPanel(QWidget):
         self._container_layout.addWidget(panel)
 
         # Region mode toggle
-        region_lay = QHBoxLayout()
+        region_lay = QGridLayout()
         region_lay.setContentsMargins(12, 5, 12, 5)
         self._radio_full = QRadioButton("Full image")
         self._radio_visible = QRadioButton("Visible region")
@@ -1775,14 +1776,13 @@ class OperationsPanel(QWidget):
         self._region_group.addButton(self._radio_visible)
         self._region_group.addButton(self._radio_selected_region)
         
-        region_lay.addWidget(self._radio_full)
-        region_lay.addWidget(self._radio_visible)
-        region_lay.addWidget(self._radio_selected_region)
-        region_lay.addStretch()
+        region_lay.addWidget(self._radio_full, 0, 0)
+        region_lay.addWidget(self._radio_visible, 0, 1)
+        region_lay.addWidget(self._radio_selected_region, 1, 0, 1, 2)
         panel.addLayout(region_lay)
 
         # Target mask toggle
-        target_lay = QHBoxLayout()
+        target_lay = QVBoxLayout()
         target_lay.setContentsMargins(12, 0, 12, 5)
         self._radio_new_mask = QRadioButton("New mask")
         self._radio_overwrite = QRadioButton("Overwrite selected mask")
@@ -1794,7 +1794,6 @@ class OperationsPanel(QWidget):
         
         target_lay.addWidget(self._radio_new_mask)
         target_lay.addWidget(self._radio_overwrite)
-        target_lay.addStretch()
         panel.addLayout(target_lay)
 
         self._seg_tabs = OperationsTabWidget()
