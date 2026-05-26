@@ -564,20 +564,108 @@ class MainWindow(QMainWindow):
                         data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
                     
                     if params.get("is_filter"):
-                        import cv2
                         filter_type = params["filter_type"]
-                        filter_value = params["filter_value"]
                         
                         if filter_type == 'median':
+                            filter_value = params["filter_value"]
                             suffix = "_Median"
                             # Use a disk/elliptical footprint for smoother results
                             footprint = disk(max(1, filter_value // 2))
                             x = ndi.median_filter(data, footprint=footprint, mode='reflect')
                         elif filter_type == 'opening':
+                            filter_value = params["filter_value"]
                             suffix = "_Open"
                             # The user expects this filter to perform noise removal (subtraction).
                             # Mathematically, this is an Opening operation.
                             x = opening(data, footprint=disk(max(1, filter_value // 2)))
+                        elif filter_type == 'equalize':
+                            from skimage import exposure
+                            suffix = "_Equal"
+                            
+                            # 1. Get raw values at percentiles for rescaling
+                            p_low_val = np.percentile(data, params["p_low"])
+                            p_high_val = np.percentile(data, params["p_high"])
+                            diff = p_high_val - p_low_val if p_high_val > p_low_val else 1.0
+                            
+                            # 2. Normalize to [0, 1]
+                            x = (data - p_low_val) / diff
+                            x = np.clip(x, 0.0, 1.0)
+                            
+                            # 3. Apply CLAHE
+                            if params["apply_clahe"]:
+                                x = exposure.equalize_adapthist(x, kernel_size=params["clahe_kernel"], clip_limit=params["clahe_clip"]).astype(np.float32)
+                            
+                            # 4. Rescale back to original intensity range
+                            x = x * diff + p_low_val
+                        elif filter_type == 'subtract background':
+                            from scipy.ndimage import gaussian_filter
+                            from skimage.restoration import rolling_ball
+                            suffix = "_BkgSub"
+                            sigma = params["sigma"]
+                            radius = params["radius"]
+                            image_gauss = gaussian_filter(data, sigma)
+                            bkg = rolling_ball(image_gauss, radius=radius)
+                            x = data - bkg
+                        elif filter_type == 'remove hotpixels':
+                            import ctypes
+                            from pathlib import Path
+                            from scipy import LowLevelCallable
+                            
+                            threshold = params["threshold"]
+                            npass = params["npass"]
+                            filter_size = params["filter_size"]
+                            
+                            pwd = Path(__file__).parent.resolve()
+                            lib_path = None
+                            for pattern in ["nice_filters*.so", "nice_filters*.dll", "nice_filters*.pyd", "nice_filters*.dylib"]:
+                                matches = list(pwd.glob(pattern))
+                                if not matches:
+                                    matches = list(pwd.parent.glob(pattern))
+                                if matches:
+                                    lib_path = matches[0]
+                                    break
+                            
+                            mad_filter_llc = None
+                            if lib_path:
+                                try:
+                                    clib = ctypes.cdll.LoadLibrary(str(lib_path))
+                                    clib.mad_filter.restype = ctypes.c_int
+                                    clib.mad_filter.argtypes = (
+                                        ctypes.POINTER(ctypes.c_double),
+                                        ctypes.c_long,
+                                        ctypes.POINTER(ctypes.c_double),
+                                        ctypes.c_void_p,
+                                    )
+                                    mad_filter_llc = LowLevelCallable(clib.mad_filter)
+                                except Exception as e:
+                                    print(f"Failed to load clib: {e}")
+                            
+                            def py_mad_filter(buffer):
+                                return np.median(np.abs(buffer - np.median(buffer)))
+                            
+                            img = data.copy()
+                            for _ in range(npass):
+                                img_b = ndi.median_filter(img, size=[filter_size, filter_size])
+                                if mad_filter_llc is not None:
+                                    img_r = 1.48 * ndi.generic_filter(
+                                        img, mad_filter_llc, [filter_size, filter_size]
+                                    )
+                                else:
+                                    img_r = 1.48 * ndi.generic_filter(
+                                        img, py_mad_filter, [filter_size, filter_size]
+                                    )
+                                difference = np.abs(img - img_b)
+                                filtered = np.where(difference > threshold * img_r, img_b, img)
+                                img = filtered
+                            x = img
+                            suffix = "_Hotpix"
+                        elif filter_type == 'intensity rescale':
+                            from skimage import exposure
+                            p1 = params["p1"]
+                            p2 = params["p2"]
+                            p2_val, p98_val = np.percentile(data, (p1, p2))
+                            x = exposure.rescale_intensity(data, in_range=(p2_val, p98_val))
+                            suffix = "_Rescale"
                         else:
                             suffix = f"_{filter_type.capitalize()}"
                             x = data
@@ -1008,7 +1096,8 @@ class MainWindow(QMainWindow):
                     
                     carray = np.stack(labels_list)
                     merit = params.get("merit", "pop")
-                    joint_mask, method_mask = UBM(carray).form_um(merit=merit, nsize=80)
+                    nsize = params.get("nsize", 40)
+                    joint_mask, method_mask = UBM(carray).form_um(merit=merit, nsize=nsize)
                     mask_result = joint_mask.astype(np.int32)
                     
                     merit_suffixes = {"pop": "_Count", "j1": "_Jac", "cstd": "_Var"}

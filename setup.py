@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="opal-studio",
-    version="0.1.0",
+    version="0.1.1",
     description="Cross-platform spatial omics analysis toolkit",
     author="Tristan Whitmarsh",
     packages=find_packages(),

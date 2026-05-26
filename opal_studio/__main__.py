@@ -81,16 +81,11 @@ if "--create-launcher" in sys.argv:
             else:
                 cuda_export = ""
 
-            activate_script = os.path.join(sys.prefix, "bin", "activate")
-            if os.path.exists(activate_script):
-                # venv / conda env with a standard activate script (Jupiter 3, etc.)
-                exec_cmd = f"bash -c \"{cuda_export}source '{activate_script}' && python -m opal_studio\""
-            else:
-                import shutil
-                exe_path = shutil.which("opal-studio")
-                if not exe_path:
-                    exe_path = f"{sys.executable} -m opal_studio"
-                exec_cmd = f'bash -c "{cuda_export}{exe_path}"' if cuda_export else exe_path
+            # Always use the current Python interpreter directly rather than the
+            # `opal-studio` console script, whose shebang may be hardcoded to the
+            # original installer's home directory and inaccessible to other users.
+            python = sys.executable
+            exec_cmd = f'bash -c "{cuda_export}{python} -m opal_studio"'
 
             icon_str = icon_path if icon_path else "utilities-terminal"
             

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opal-studio"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cross-platform IMC and H&E OME-TIFF image viewer"
 authors = [
     {name = "Tristan"}

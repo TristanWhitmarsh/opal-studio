@@ -97,95 +97,8 @@ class OperationsTabWidget(QTabWidget):
         hint.setHeight(self.sizeHint().height())
         return hint
 
-class EqualizeTab(QWidget):
-    """Percentile normalization and CLAHE equalization."""
-    runRequested = Signal(dict)
-
-    def __init__(self, channel_model, parent=None):
-        super().__init__(parent)
-        self._channel_model = channel_model
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(6)
-
-        form = QFormLayout()
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        form.setHorizontalSpacing(4)
-        
-        # Channel Selector
-        self._channel_combo = QComboBox()
-        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._channel_combo.setMinimumWidth(50)
-        form.addRow("Channel:", self._channel_combo)
-
-        # Percentiles
-        self.p_low = QLineEdit("1.0")
-        self.p_low.setValidator(QDoubleValidator(0, 100, 2))
-        self.p_high = QLineEdit("99.8")
-        self.p_high.setValidator(QDoubleValidator(0, 100, 2))
-        self.p_low.setFixedWidth(50)
-        self.p_high.setFixedWidth(50)
-        
-        p_lay = QHBoxLayout()
-        p_lay.addWidget(self.p_low)
-        p_lay.addWidget(QLabel(" - "))
-        p_lay.addWidget(self.p_high)
-        p_lay.addStretch()
-        form.addRow("Range:", p_lay)
-
-        # CLAHE (Always on, just show parameters)
-        self.clahe_clip = QLineEdit("0.05")
-        self.clahe_clip.setValidator(QDoubleValidator(0.001, 1.0, 3))
-        self.clahe_clip.setFixedWidth(60)
-        form.addRow("Clip:", self.clahe_clip)
-        
-        self.clahe_kernel = QLineEdit("20")
-        self.clahe_kernel.setValidator(QIntValidator(8, 256))
-        self.clahe_kernel.setFixedWidth(60)
-        form.addRow("Kernel:", self.clahe_kernel)
-
-        layout.addLayout(form)
-        
-        self._run_btn = QPushButton("Run Equalize")
-        self._run_btn.clicked.connect(self._on_run)
-        layout.addWidget(self._run_btn)
-        layout.addStretch()
-
-        self._refresh_channels()
-        self._channel_model.modelReset.connect(self._refresh_channels)
-        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
-        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
-
-    def _refresh_channels(self):
-        current = self._channel_combo.currentText()
-        self._channel_combo.clear()
-        for i in range(self._channel_model.rowCount()):
-            ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
-                self._channel_combo.addItem(ch.name, i)
-        idx = self._channel_combo.findText(current)
-        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
-
-    def _on_run(self):
-        if self._channel_combo.currentIndex() < 0: return
-        self.runRequested.emit({
-            "is_filter": False,
-            "channel_index": self._channel_combo.currentData(),
-            "p_low": float(self.p_low.text() or 1.0),
-            "p_high": float(self.p_high.text() or 99.8),
-            "apply_clahe": True,
-            "clahe_clip": float(self.clahe_clip.text() or 0.02),
-            "clahe_kernel": (int(self.clahe_kernel.text() or 50), int(self.clahe_kernel.text() or 50))
-        })
-
-    def setEnabled(self, enabled):
-        super().setEnabled(enabled)
-        self._run_btn.setEnabled(enabled)
-
 class FilterTab(QWidget):
-    """Smoothing and morphological filters."""
+    """Smoothing, normalization, and custom image filters."""
     runRequested = Signal(dict)
 
     def __init__(self, channel_model, parent=None):
@@ -209,15 +122,130 @@ class FilterTab(QWidget):
         self.filter_type = QComboBox()
         self.filter_type.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.filter_type.setMinimumWidth(50)
-        self.filter_type.addItems(["Median", "Opening"])
+        self.filter_type.addItems([
+            "Median",
+            "Opening",
+            "Equalize",
+            "Subtract Background",
+            "Remove Hotpixels",
+            "Intensity Rescale"
+        ])
+        self.filter_type.currentIndexChanged.connect(self._on_filter_type_changed)
         form.addRow("Type:", self.filter_type)
         
+        layout.addLayout(form)
+
+        # 1. Median / Opening container
+        self.median_container = QWidget()
+        med_lay = QFormLayout(self.median_container)
+        med_lay.setContentsMargins(0, 0, 0, 0)
+        med_lay.setSpacing(6)
+        med_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        med_lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        med_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.filter_value = QLineEdit("3")
         self.filter_value.setValidator(QIntValidator(1, 101))
         self.filter_value.setFixedWidth(60)
-        form.addRow("Size:", self.filter_value)
+        med_lay.addRow("Size:", self.filter_value)
+        layout.addWidget(self.median_container)
+
+        # 2. Equalize container
+        self.equalize_container = QWidget()
+        eq_lay = QFormLayout(self.equalize_container)
+        eq_lay.setContentsMargins(0, 0, 0, 0)
+        eq_lay.setSpacing(6)
+        eq_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        eq_lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        eq_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         
-        layout.addLayout(form)
+        self.p_low = QLineEdit("1.0")
+        self.p_low.setValidator(QDoubleValidator(0, 100, 2))
+        self.p_high = QLineEdit("99.8")
+        self.p_high.setValidator(QDoubleValidator(0, 100, 2))
+        self.p_low.setFixedWidth(50)
+        self.p_high.setFixedWidth(50)
+        p_lay = QHBoxLayout()
+        p_lay.addWidget(self.p_low)
+        p_lay.addWidget(QLabel(" - "))
+        p_lay.addWidget(self.p_high)
+        p_lay.addStretch()
+        eq_lay.addRow("Range:", p_lay)
+        
+        self.clahe_clip = QLineEdit("0.05")
+        self.clahe_clip.setValidator(QDoubleValidator(0.001, 1.0, 3))
+        self.clahe_clip.setFixedWidth(60)
+        eq_lay.addRow("Clip:", self.clahe_clip)
+        
+        self.clahe_kernel = QLineEdit("20")
+        self.clahe_kernel.setValidator(QIntValidator(8, 256))
+        self.clahe_kernel.setFixedWidth(60)
+        eq_lay.addRow("Kernel:", self.clahe_kernel)
+        layout.addWidget(self.equalize_container)
+
+        # 3. Subtract Background container
+        self.subtract_bkg_container = QWidget()
+        sub_lay = QFormLayout(self.subtract_bkg_container)
+        sub_lay.setContentsMargins(0, 0, 0, 0)
+        sub_lay.setSpacing(6)
+        sub_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        sub_lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        sub_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        
+        self.bkg_sigma = QLineEdit("3")
+        self.bkg_sigma.setValidator(QDoubleValidator(0.1, 100.0, 2))
+        self.bkg_sigma.setFixedWidth(60)
+        sub_lay.addRow("Sigma:", self.bkg_sigma)
+        
+        self.bkg_radius = QLineEdit("15")
+        self.bkg_radius.setValidator(QIntValidator(1, 1000))
+        self.bkg_radius.setFixedWidth(60)
+        sub_lay.addRow("Radius:", self.bkg_radius)
+        layout.addWidget(self.subtract_bkg_container)
+
+        # 4. Remove Hotpixels container
+        self.remove_hotpixels_container = QWidget()
+        hot_lay = QFormLayout(self.remove_hotpixels_container)
+        hot_lay.setContentsMargins(0, 0, 0, 0)
+        hot_lay.setSpacing(6)
+        hot_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        hot_lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        hot_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        
+        self.hot_threshold = QLineEdit("10")
+        self.hot_threshold.setValidator(QDoubleValidator(0.1, 1000.0, 2))
+        self.hot_threshold.setFixedWidth(60)
+        hot_lay.addRow("Threshold:", self.hot_threshold)
+        
+        self.hot_npass = QLineEdit("3")
+        self.hot_npass.setValidator(QIntValidator(1, 20))
+        self.hot_npass.setFixedWidth(60)
+        hot_lay.addRow("Passes (npass):", self.hot_npass)
+        
+        self.hot_filter_size = QLineEdit("5")
+        self.hot_filter_size.setValidator(QIntValidator(1, 101))
+        self.hot_filter_size.setFixedWidth(60)
+        hot_lay.addRow("Filter Size:", self.hot_filter_size)
+        layout.addWidget(self.remove_hotpixels_container)
+
+        # 5. Intensity Rescale container
+        self.rescale_container = QWidget()
+        rescale_lay = QFormLayout(self.rescale_container)
+        rescale_lay.setContentsMargins(0, 0, 0, 0)
+        rescale_lay.setSpacing(6)
+        rescale_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        rescale_lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        rescale_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        
+        self.rescale_p1 = QLineEdit("2")
+        self.rescale_p1.setValidator(QDoubleValidator(0, 100, 2))
+        self.rescale_p1.setFixedWidth(60)
+        rescale_lay.addRow("P1 percentile:", self.rescale_p1)
+        
+        self.rescale_p2 = QLineEdit("98")
+        self.rescale_p2.setValidator(QDoubleValidator(0, 100, 2))
+        self.rescale_p2.setFixedWidth(60)
+        rescale_lay.addRow("P2 percentile:", self.rescale_p2)
+        layout.addWidget(self.rescale_container)
         
         self._run_btn = QPushButton("Run Filter")
         self._run_btn.clicked.connect(self._on_run)
@@ -225,6 +253,7 @@ class FilterTab(QWidget):
         layout.addStretch()
 
         self._refresh_channels()
+        self._on_filter_type_changed() # Initialize visible parameters
         self._channel_model.modelReset.connect(self._refresh_channels)
         self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
@@ -239,14 +268,65 @@ class FilterTab(QWidget):
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
+    def _on_filter_type_changed(self):
+        text = self.filter_type.currentText().lower()
+        
+        # Hide all parameter containers
+        self.median_container.setVisible(False)
+        self.equalize_container.setVisible(False)
+        self.subtract_bkg_container.setVisible(False)
+        self.remove_hotpixels_container.setVisible(False)
+        self.rescale_container.setVisible(False)
+        
+        if text in ["median", "opening"]:
+            self.median_container.setVisible(True)
+        elif text == "equalize":
+            self.equalize_container.setVisible(True)
+        elif text == "subtract background":
+            self.subtract_bkg_container.setVisible(True)
+        elif text == "remove hotpixels":
+            self.remove_hotpixels_container.setVisible(True)
+        elif text == "intensity rescale":
+            self.rescale_container.setVisible(True)
+            
+        # Update widget and parent sizes
+        self.updateGeometry()
+        if self.parent():
+            self.parent().updateGeometry()
+            if self.parent().parent():
+                self.parent().parent().updateGeometry()
+
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
-        self.runRequested.emit({
+        
+        filter_type = self.filter_type.currentText().lower()
+        params = {
             "is_filter": True,
             "channel_index": self._channel_combo.currentData(),
-            "filter_type": self.filter_type.currentText().lower(),
-            "filter_value": int(self.filter_value.text() or 3)
-        })
+            "filter_type": filter_type
+        }
+        
+        if filter_type in ["median", "opening"]:
+            params["filter_value"] = int(self.filter_value.text() or 3)
+        elif filter_type == "equalize":
+            params["p_low"] = float(self.p_low.text() or 1.0)
+            params["p_high"] = float(self.p_high.text() or 99.8)
+            params["apply_clahe"] = True
+            params["clahe_clip"] = float(self.clahe_clip.text() or 0.05)
+            k_val = int(self.clahe_kernel.text() or 20)
+            params["clahe_kernel"] = (k_val, k_val)
+        elif filter_type == "subtract background":
+            params["sigma"] = float(self.bkg_sigma.text() or 3.0)
+            params["radius"] = int(self.bkg_radius.text() or 15)
+        elif filter_type == "remove hotpixels":
+            params["threshold"] = float(self.hot_threshold.text() or 10.0)
+            params["npass"] = int(self.hot_npass.text() or 3)
+            params["filter_size"] = int(self.hot_filter_size.text() or 5)
+        elif filter_type == "intensity rescale":
+            params["p1"] = float(self.rescale_p1.text() or 2.0)
+            params["p2"] = float(self.rescale_p2.text() or 98.0)
+            
+        self.runRequested.emit(params)
 
     def setEnabled(self, enabled):
         super().setEnabled(enabled)
@@ -1249,6 +1329,13 @@ class CellSamplerTab(QWidget):
         self._strategy_combo.addItem("Min area variance", "cstd")
         form.addRow("Strategy:", self._strategy_combo)
 
+        # Window Size Parameter
+        self._nsize_edit = QLineEdit("40")
+        self._nsize_edit.setValidator(QIntValidator(1, 10000))
+        self._nsize_edit.setFixedWidth(80)
+        self._nsize_edit.setToolTip("Local window size (in pixels) for comparing masks. Default is 40.")
+        form.addRow("Window Size (px):", self._nsize_edit)
+
         layout.addLayout(form)
 
         # Run Button
@@ -1292,6 +1379,7 @@ class CellSamplerTab(QWidget):
         self.runRequested.emit({
             "mask_indices": selected_indices,
             "merit": self._strategy_combo.currentData(),
+            "nsize": int(self._nsize_edit.text() or 40),
             "tool": "cell_sampler"
         })
 
@@ -1653,20 +1741,17 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Pre-processing", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        # Tabs for Equalize vs Filter vs Merge
+        # Tabs for Filter vs Merge
         self._pre_tabs = OperationsTabWidget()
         self._pre_tabs.setIconSize(QSize(1, 24))
-        self._equalize_tab = EqualizeTab(self._channel_model)
         self._filter_tab = FilterTab(self._channel_model)
         self._merge_tab = MergeTab(self._channel_model)
         
-        self._equalize_tab.runRequested.connect(self._on_run_preprocessing)
         self._filter_tab.runRequested.connect(self._on_run_preprocessing)
         self._merge_tab.runRequested.connect(self._on_run_preprocessing)
         
         self._pre_tabs.addTab(self._merge_tab, self._spacer_icon, "Merge")
         self._pre_tabs.addTab(self._filter_tab, self._spacer_icon, "Filter")
-        self._pre_tabs.addTab(self._equalize_tab, self._spacer_icon, "Equalize")
         panel.addWidget(self._pre_tabs)
 
     def _setup_segmentation_section(self):
@@ -1848,7 +1933,6 @@ class OperationsPanel(QWidget):
 
 
     def _on_run_preprocessing(self, params):
-        self._equalize_tab.setEnabled(False)
         self._filter_tab.setEnabled(False)
         self._progress.setVisible(True); self._progress.setRange(0, 0)
         self.runPreprocessingRequested.emit(params)
@@ -1942,7 +2026,6 @@ class OperationsPanel(QWidget):
         self.runCellIdentificationRequested.emit()
 
     def stop_loading(self):
-        self._equalize_tab.setEnabled(True)
         self._filter_tab.setEnabled(True)
         self._stardist_tab.setEnabled(True)
         self._cellpose_tab.setEnabled(True)
