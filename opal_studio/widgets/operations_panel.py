@@ -126,7 +126,7 @@ class FilterTab(QWidget):
         self.filter_type.addItems([
             "Median",
             "Opening",
-            "Equalize",
+            "CLAHE",
             "Subtract Background",
             "Remove Hotpixels",
             "Intensity Rescale"
@@ -281,7 +281,7 @@ class FilterTab(QWidget):
         
         if text in ["median", "opening"]:
             self.median_container.setVisible(True)
-        elif text == "equalize":
+        elif text == "clahe":
             self.equalize_container.setVisible(True)
         elif text == "subtract background":
             self.subtract_bkg_container.setVisible(True)
@@ -309,7 +309,7 @@ class FilterTab(QWidget):
         
         if filter_type in ["median", "opening"]:
             params["filter_value"] = int(self.filter_value.text() or 3)
-        elif filter_type == "equalize":
+        elif filter_type == "clahe":
             params["p_low"] = float(self.p_low.text() or 1.0)
             params["p_high"] = float(self.p_high.text() or 99.8)
             params["apply_clahe"] = True
@@ -1670,6 +1670,324 @@ class ThresholdPositivityTab(QWidget):
         self._get_btn.setEnabled(enabled)
 
 
+class ClusteringTab(QWidget):
+    """Sub-widget for cell clustering parameters."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(4)
+
+        # Mask selector
+        self._mask_combo = QComboBox()
+        self._mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._mask_combo.setMinimumWidth(50)
+        self._mask_combo.setToolTip("Select a mask where each cell has a unique integer label (or cells are separated).")
+        form.addRow("Mask:", self._mask_combo)
+
+        # Method selector
+        self._method_combo = QComboBox()
+        self._method_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._method_combo.setMinimumWidth(50)
+        self._method_combo.addItems(["Leiden", "Louvain", "PhenoGraph", "FlowSOM", "KMeans", "Hierarchical", "DBSCAN"])
+        self._method_combo.currentIndexChanged.connect(self._on_method_changed)
+        form.addRow("Method:", self._method_combo)
+
+        # Normalization selector
+        self._norm_combo = QComboBox()
+        self._norm_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._norm_combo.setMinimumWidth(50)
+        self._norm_combo.addItem("Yeo-Johnson", "yeo-johnson")
+        self._norm_combo.addItem("Arcsinh", "arcsinh")
+        self._norm_combo.addItem("Log-Z", "log-z")
+        self._norm_combo.addItem("Z-score", "zscore")
+        self._norm_combo.addItem("Min-Max", "minmax")
+        self._norm_combo.addItem("None", "none")
+        self._norm_combo.setToolTip(
+            "Normalization applied to per-cell mean intensities before clustering.\n"
+            "Yeo-Johnson: power transform + Z-score (handles skewed data well).\n"
+            "Arcsinh: arcsinh(x / cofactor) + Z-score (common for mass cytometry).\n"
+            "Log-Z: log1p + Z-score for skewed channels, Z-score for others.\n"
+            "Z-score: zero mean, unit variance per channel.\n"
+            "Min-Max: scale each channel to [0, 1].\n"
+            "None: use raw mean intensities."
+        )
+        self._norm_combo.currentIndexChanged.connect(self._on_norm_changed)
+        form.addRow("Normalize:", self._norm_combo)
+
+        layout.addLayout(form)
+
+        # ── Arcsinh normalization parameter ────────────────────────────────
+        self._arcsinh_container = QWidget()
+        arc_lay = QFormLayout(self._arcsinh_container)
+        arc_lay.setContentsMargins(0, 0, 0, 0)
+        arc_lay.setSpacing(6)
+        arc_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        arc_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        arc_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._arcsinh_cofactor = QLineEdit("5")
+        self._arcsinh_cofactor.setValidator(QDoubleValidator(0.01, 10000.0, 2))
+        self._arcsinh_cofactor.setFixedWidth(60)
+        self._arcsinh_cofactor.setToolTip("Cofactor divisor for arcsinh transform. Common values: 5 (CyTOF), 150 (fluorescence).")
+        arc_lay.addRow("Cofactor:", self._arcsinh_cofactor)
+        layout.addWidget(self._arcsinh_container)
+
+        # ── Log-Z normalization parameter ─────────────────────────────────
+        self._logz_container = QWidget()
+        logz_lay = QFormLayout(self._logz_container)
+        logz_lay.setContentsMargins(0, 0, 0, 0)
+        logz_lay.setSpacing(6)
+        logz_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        logz_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        logz_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._logz_skewness = QLineEdit("1")
+        self._logz_skewness.setValidator(QDoubleValidator(0.0, 100.0, 2))
+        self._logz_skewness.setFixedWidth(60)
+        self._logz_skewness.setToolTip("Channels with abs(skewness) above this threshold get log1p before Z-score.")
+        logz_lay.addRow("Skew threshold:", self._logz_skewness)
+        layout.addWidget(self._logz_container)
+
+        # ── Leiden parameters ──────────────────────────────────────────────
+        self._leiden_container = QWidget()
+        lei_lay = QFormLayout(self._leiden_container)
+        lei_lay.setContentsMargins(0, 0, 0, 0)
+        lei_lay.setSpacing(6)
+        lei_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        lei_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        lei_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._leiden_resolution = QLineEdit("0.5")
+        self._leiden_resolution.setValidator(QDoubleValidator(0.01, 100.0, 2))
+        self._leiden_resolution.setFixedWidth(60)
+        self._leiden_resolution.setToolTip("Resolution parameter for Leiden. Higher values produce more clusters.")
+        lei_lay.addRow("Resolution:", self._leiden_resolution)
+        layout.addWidget(self._leiden_container)
+
+        # ── Louvain parameters ─────────────────────────────────────────────
+        self._louvain_container = QWidget()
+        lou_lay = QFormLayout(self._louvain_container)
+        lou_lay.setContentsMargins(0, 0, 0, 0)
+        lou_lay.setSpacing(6)
+        lou_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        lou_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        lou_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._louvain_resolution = QLineEdit("0.5")
+        self._louvain_resolution.setValidator(QDoubleValidator(0.01, 100.0, 2))
+        self._louvain_resolution.setFixedWidth(60)
+        self._louvain_resolution.setToolTip("Resolution parameter for Louvain. Higher values produce more clusters.")
+        lou_lay.addRow("Resolution:", self._louvain_resolution)
+        layout.addWidget(self._louvain_container)
+
+        # ── PhenoGraph parameters ──────────────────────────────────────────
+        self._phenograph_container = QWidget()
+        pg_lay = QFormLayout(self._phenograph_container)
+        pg_lay.setContentsMargins(0, 0, 0, 0)
+        pg_lay.setSpacing(6)
+        pg_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        pg_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        pg_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._phenograph_k = QLineEdit("30")
+        self._phenograph_k.setValidator(QIntValidator(5, 500))
+        self._phenograph_k.setFixedWidth(60)
+        self._phenograph_k.setToolTip("Number of nearest neighbours for the k-NN graph.")
+        pg_lay.addRow("k neighbours:", self._phenograph_k)
+        layout.addWidget(self._phenograph_container)
+
+        # ── FlowSOM parameters ─────────────────────────────────────────────
+        self._flowsom_container = QWidget()
+        fs_lay = QFormLayout(self._flowsom_container)
+        fs_lay.setContentsMargins(0, 0, 0, 0)
+        fs_lay.setSpacing(6)
+        fs_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        fs_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        fs_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._flowsom_xdim = QLineEdit("10")
+        self._flowsom_xdim.setValidator(QIntValidator(2, 50))
+        self._flowsom_xdim.setFixedWidth(60)
+        self._flowsom_xdim.setToolTip("SOM grid X dimension.")
+        fs_lay.addRow("Grid X:", self._flowsom_xdim)
+
+        self._flowsom_ydim = QLineEdit("10")
+        self._flowsom_ydim.setValidator(QIntValidator(2, 50))
+        self._flowsom_ydim.setFixedWidth(60)
+        self._flowsom_ydim.setToolTip("SOM grid Y dimension.")
+        fs_lay.addRow("Grid Y:", self._flowsom_ydim)
+
+        self._flowsom_n_clusters = QLineEdit("10")
+        self._flowsom_n_clusters.setValidator(QIntValidator(2, 200))
+        self._flowsom_n_clusters.setFixedWidth(60)
+        self._flowsom_n_clusters.setToolTip("Number of metaclusters to produce from the SOM nodes.")
+        fs_lay.addRow("Metaclusters:", self._flowsom_n_clusters)
+        layout.addWidget(self._flowsom_container)
+
+        # ── Hierarchical parameters ────────────────────────────────────────
+        self._hierarchical_container = QWidget()
+        hc_lay = QFormLayout(self._hierarchical_container)
+        hc_lay.setContentsMargins(0, 0, 0, 0)
+        hc_lay.setSpacing(6)
+        hc_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        hc_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        hc_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._hc_n_clusters = QLineEdit("5")
+        self._hc_n_clusters.setValidator(QIntValidator(2, 1000))
+        self._hc_n_clusters.setFixedWidth(60)
+        self._hc_n_clusters.setToolTip("Number of clusters to produce.")
+        hc_lay.addRow("Clusters:", self._hc_n_clusters)
+
+        self._hc_linkage = QComboBox()
+        self._hc_linkage.addItems(["ward", "complete", "average", "single"])
+        self._hc_linkage.setToolTip("Linkage criterion. 'ward' minimises variance and requires Euclidean metric.")
+        self._hc_linkage.currentIndexChanged.connect(self._on_hc_linkage_changed)
+        hc_lay.addRow("Linkage:", self._hc_linkage)
+
+        self._hc_metric = QComboBox()
+        self._hc_metric.addItems(["euclidean", "cosine", "manhattan"])
+        self._hc_metric.setToolTip("Distance metric. Ignored when linkage is 'ward' (always Euclidean).")
+        hc_lay.addRow("Metric:", self._hc_metric)
+        layout.addWidget(self._hierarchical_container)
+
+        # ── DBSCAN parameters ─────────────────────────────────────────────
+        self._dbscan_container = QWidget()
+        db_lay = QFormLayout(self._dbscan_container)
+        db_lay.setContentsMargins(0, 0, 0, 0)
+        db_lay.setSpacing(6)
+        db_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        db_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        db_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._dbscan_eps = QLineEdit("2.0")
+        self._dbscan_eps.setValidator(QDoubleValidator(0.01, 1000.0, 2))
+        self._dbscan_eps.setFixedWidth(60)
+        self._dbscan_eps.setToolTip("Maximum distance between two samples to be considered neighbours.")
+        db_lay.addRow("Epsilon:", self._dbscan_eps)
+
+        self._dbscan_min_samples = QLineEdit("100")
+        self._dbscan_min_samples.setValidator(QIntValidator(1, 100000))
+        self._dbscan_min_samples.setFixedWidth(60)
+        self._dbscan_min_samples.setToolTip("Minimum number of points required to form a dense region.")
+        db_lay.addRow("Min samples:", self._dbscan_min_samples)
+        layout.addWidget(self._dbscan_container)
+
+        # ── KMeans parameters ─────────────────────────────────────────────
+        self._kmeans_container = QWidget()
+        km_lay = QFormLayout(self._kmeans_container)
+        km_lay.setContentsMargins(0, 0, 0, 0)
+        km_lay.setSpacing(6)
+        km_lay.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        km_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        km_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._kmeans_n_clusters = QLineEdit("5")
+        self._kmeans_n_clusters.setValidator(QIntValidator(2, 1000))
+        self._kmeans_n_clusters.setFixedWidth(60)
+        self._kmeans_n_clusters.setToolTip("Number of clusters to form.")
+        km_lay.addRow("Clusters:", self._kmeans_n_clusters)
+        layout.addWidget(self._kmeans_container)
+
+        # Run button
+        self._run_btn = QPushButton("Run Clustering")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+        layout.addStretch()
+
+        self._refresh_masks()
+        self._on_method_changed()
+        self._on_norm_changed()
+        self._channel_model.modelReset.connect(self._refresh_masks)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_masks())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_masks())
+
+    def _refresh_masks(self):
+        current = self._mask_combo.currentText()
+        self._mask_combo.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_mask:
+                self._mask_combo.addItem(ch.name, i)
+        idx = self._mask_combo.findText(current)
+        if idx >= 0: self._mask_combo.setCurrentIndex(idx)
+
+    def _on_method_changed(self):
+        method = self._method_combo.currentText().lower()
+        self._leiden_container.setVisible(method == "leiden")
+        self._louvain_container.setVisible(method == "louvain")
+        self._phenograph_container.setVisible(method == "phenograph")
+        self._flowsom_container.setVisible(method == "flowsom")
+        self._dbscan_container.setVisible(method == "dbscan")
+        self._kmeans_container.setVisible(method == "kmeans")
+        self._hierarchical_container.setVisible(method == "hierarchical")
+
+    def _on_hc_linkage_changed(self):
+        """Disable the metric combo when ward linkage is selected (always Euclidean)."""
+        is_ward = self._hc_linkage.currentText() == "ward"
+        self._hc_metric.setEnabled(not is_ward)
+        if is_ward:
+            self._hc_metric.setCurrentIndex(0)  # euclidean
+
+    def _on_norm_changed(self):
+        norm = self._norm_combo.currentData()
+        self._arcsinh_container.setVisible(norm == "arcsinh")
+        self._logz_container.setVisible(norm == "log-z")
+
+    def _on_run(self):
+        if self._mask_combo.currentIndex() < 0:
+            return
+        method = self._method_combo.currentText().lower()
+        norm = self._norm_combo.currentData()
+        params = {
+            "mask_index": self._mask_combo.currentData(),
+            "method": method,
+            "normalization": norm,
+        }
+        # Normalization-specific params
+        if norm == "arcsinh":
+            params["cofactor"] = float(self._arcsinh_cofactor.text() or 5)
+        elif norm == "log-z":
+            params["skewness_threshold"] = float(self._logz_skewness.text() or 1)
+        # Method-specific params
+        if method == "leiden":
+            params["resolution"] = float(self._leiden_resolution.text() or 0.5)
+        elif method == "louvain":
+            params["resolution"] = float(self._louvain_resolution.text() or 0.5)
+        elif method == "phenograph":
+            params["k"] = int(self._phenograph_k.text() or 30)
+        elif method == "flowsom":
+            params["xdim"] = int(self._flowsom_xdim.text() or 10)
+            params["ydim"] = int(self._flowsom_ydim.text() or 10)
+            params["n_clusters"] = int(self._flowsom_n_clusters.text() or 10)
+        elif method == "dbscan":
+            params["eps"] = float(self._dbscan_eps.text() or 2.0)
+            params["min_samples"] = int(self._dbscan_min_samples.text() or 100)
+        elif method == "kmeans":
+            params["n_clusters"] = int(self._kmeans_n_clusters.text() or 5)
+        elif method == "hierarchical":
+            params["n_clusters"] = int(self._hc_n_clusters.text() or 5)
+            params["linkage"] = self._hc_linkage.currentText()
+            params["metric"] = self._hc_metric.currentText()
+        self.runRequested.emit(params)
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._run_btn.setEnabled(enabled)
+
+
 class OperationsPanel(QWidget):
     """Right-side panel with collapsible sections for Pre-processing and Segmentation."""
 
@@ -1679,6 +1997,7 @@ class OperationsPanel(QWidget):
     runMaskProcessingRequested = Signal(dict)
     runCellPositivityRequested = Signal(dict)
     runCellIdentificationRequested = Signal()
+    runClusteringRequested = Signal(dict)
     runThresholdComputeRequested = Signal(dict)
     applyThresholdRequested = Signal(dict)
     segmentationFinished = Signal(object)
@@ -1760,8 +2079,7 @@ class OperationsPanel(QWidget):
         self._container_layout.addWidget(panel)
 
         # Region mode toggle
-        region_lay = QGridLayout()
-        region_lay.setContentsMargins(12, 5, 12, 5)
+        region_lay = QHBoxLayout()
         self._radio_full = QRadioButton("Full image")
         self._radio_visible = QRadioButton("Visible region")
         self._radio_selected_region = QRadioButton("Selected region")
@@ -1770,30 +2088,31 @@ class OperationsPanel(QWidget):
             "Run segmentation inside the bounding box of the currently selected region polygon.\n"
             "Only cells fully contained within the region polygon will be added to the mask."
         )
-        
+
         self._region_group = QButtonGroup(self)
         self._region_group.addButton(self._radio_full)
         self._region_group.addButton(self._radio_visible)
         self._region_group.addButton(self._radio_selected_region)
-        
-        region_lay.addWidget(self._radio_full, 0, 0)
-        region_lay.addWidget(self._radio_visible, 0, 1)
-        region_lay.addWidget(self._radio_selected_region, 1, 0, 1, 2)
+
+        region_lay.addWidget(self._radio_full)
+        region_lay.addWidget(self._radio_visible)
+        region_lay.addWidget(self._radio_selected_region)
+        region_lay.addStretch()
         panel.addLayout(region_lay)
 
         # Target mask toggle
-        target_lay = QVBoxLayout()
-        target_lay.setContentsMargins(12, 0, 12, 5)
+        target_lay = QHBoxLayout()
         self._radio_new_mask = QRadioButton("New mask")
         self._radio_overwrite = QRadioButton("Overwrite selected mask")
         self._radio_new_mask.setChecked(True)
-        
+
         self._target_group = QButtonGroup(self)
         self._target_group.addButton(self._radio_new_mask)
         self._target_group.addButton(self._radio_overwrite)
-        
+
         target_lay.addWidget(self._radio_new_mask)
         target_lay.addWidget(self._radio_overwrite)
+        target_lay.addStretch()
         panel.addLayout(target_lay)
 
         self._seg_tabs = OperationsTabWidget()
@@ -1921,13 +2240,11 @@ class OperationsPanel(QWidget):
         gating_lay.addStretch()
 
         # Clustering Tab
-        clustering_tab = QWidget()
-        clustering_lay = QVBoxLayout(clustering_tab)
-        clustering_lay.addWidget(QLabel("Clustering features coming soon..."))
-        clustering_lay.addStretch()
+        self._clustering_tab = ClusteringTab(self._channel_model)
+        self._clustering_tab.runRequested.connect(self._on_run_clustering)
 
         self._ident_tabs.addTab(gating_tab, self._spacer_icon, "Gating")
-        self._ident_tabs.addTab(clustering_tab, self._spacer_icon, "Clustering")
+        self._ident_tabs.addTab(self._clustering_tab, self._spacer_icon, "Clustering")
         panel.addWidget(self._ident_tabs)
 
 
@@ -2024,6 +2341,11 @@ class OperationsPanel(QWidget):
         self._progress.setVisible(True); self._progress.setRange(0, 0)
         self.runCellIdentificationRequested.emit()
 
+    def _on_run_clustering(self, params):
+        self._clustering_tab.setEnabled(False)
+        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self.runClusteringRequested.emit(params)
+
     def stop_loading(self):
         self._filter_tab.setEnabled(True)
         self._stardist_tab.setEnabled(True)
@@ -2038,6 +2360,7 @@ class OperationsPanel(QWidget):
         self._pos_run_btn.setEnabled(True)
         self._thresh_tab.setEnabled(True)
         self._ident_run_btn.setEnabled(True)
+        self._clustering_tab.setEnabled(True)
         self._progress.setVisible(False)
 
     @Slot(int, int)

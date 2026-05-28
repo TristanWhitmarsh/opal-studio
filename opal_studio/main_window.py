@@ -35,7 +35,7 @@ from opal_studio.widgets.phenotyping_tab import PhenotypingTab
 
 import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt, find_objects
-from skimage.segmentation import watershed, find_boundaries
+from skimage.segmentation import find_boundaries
 from skimage.measure import find_contours
 from skimage.morphology import white_tophat, opening, closing, disk
 
@@ -71,6 +71,7 @@ def expand_labels_watershed(labels, expansion_pixels=6):
                     markers[center[0], center[1]] = cell_id
 
     # 4. Apply watershed with explicit types for Cython compatibility
+    from skimage.segmentation import watershed
     expanded_labels = watershed(
         elevation.astype(np.float32),
         markers=markers.astype(np.int32),
@@ -125,6 +126,7 @@ class MainWindow(QMainWindow):
         self._ops_panel.runMaskProcessingRequested.connect(self._run_mask_expansion)
         self._ops_panel.runCellPositivityRequested.connect(self._run_cell_positivity)
         self._ops_panel.runCellIdentificationRequested.connect(self._run_cell_identification)
+        self._ops_panel.runClusteringRequested.connect(self._run_clustering)
         self._ops_panel.runThresholdComputeRequested.connect(self._run_threshold_compute)
         self._ops_panel.applyThresholdRequested.connect(self._apply_threshold_positivity)
         self.operationProgress.connect(self._ops_panel.set_progress_info)
@@ -578,7 +580,7 @@ class MainWindow(QMainWindow):
                             # The user expects this filter to perform noise removal (subtraction).
                             # Mathematically, this is an Opening operation.
                             x = opening(data, footprint=disk(max(1, filter_value // 2)))
-                        elif filter_type == 'equalize':
+                        elif filter_type == 'clahe':
                             from skimage import exposure
                             suffix = "_Equal"
                             
@@ -607,57 +609,13 @@ class MainWindow(QMainWindow):
                             bkg = rolling_ball(image_gauss, radius=radius)
                             x = data - bkg
                         elif filter_type == 'remove hotpixels':
-                            import ctypes
-                            from pathlib import Path
-                            from scipy import LowLevelCallable
-                            
-                            threshold = params["threshold"]
-                            npass = params["npass"]
-                            filter_size = params["filter_size"]
-                            
-                            pwd = Path(__file__).parent.resolve()
-                            lib_path = None
-                            for pattern in ["nice_filters*.so", "nice_filters*.dll", "nice_filters*.pyd", "nice_filters*.dylib"]:
-                                matches = list(pwd.glob(pattern))
-                                if not matches:
-                                    matches = list(pwd.parent.glob(pattern))
-                                if matches:
-                                    lib_path = matches[0]
-                                    break
-                            
-                            mad_filter_llc = None
-                            if lib_path:
-                                try:
-                                    clib = ctypes.cdll.LoadLibrary(str(lib_path))
-                                    clib.mad_filter.restype = ctypes.c_int
-                                    clib.mad_filter.argtypes = (
-                                        ctypes.POINTER(ctypes.c_double),
-                                        ctypes.c_long,
-                                        ctypes.POINTER(ctypes.c_double),
-                                        ctypes.c_void_p,
-                                    )
-                                    mad_filter_llc = LowLevelCallable(clib.mad_filter)
-                                except Exception as e:
-                                    print(f"Failed to load clib: {e}")
-                            
-                            def py_mad_filter(buffer):
-                                return np.median(np.abs(buffer - np.median(buffer)))
-                            
-                            img = data.copy()
-                            for _ in range(npass):
-                                img_b = ndi.median_filter(img, size=[filter_size, filter_size])
-                                if mad_filter_llc is not None:
-                                    img_r = 1.48 * ndi.generic_filter(
-                                        img, mad_filter_llc, [filter_size, filter_size]
-                                    )
-                                else:
-                                    img_r = 1.48 * ndi.generic_filter(
-                                        img, py_mad_filter, [filter_size, filter_size]
-                                    )
-                                difference = np.abs(img - img_b)
-                                filtered = np.where(difference > threshold * img_r, img_b, img)
-                                img = filtered
-                            x = img
+                            from opal_studio.remove_hotpixels import run as remove_hotpixels_run
+                            x = remove_hotpixels_run(
+                                data,
+                                threshold=params["threshold"],
+                                npass=params["npass"],
+                                filter_size=params["filter_size"],
+                            )
                             suffix = "_Hotpix"
                         elif filter_type == 'intensity rescale':
                             from skimage import exposure
@@ -933,12 +891,7 @@ class MainWindow(QMainWindow):
                     self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx, None, True, None)
 
                 if method == "watershed":
-                    from skimage.filters import gaussian
-                    from skimage.filters import threshold_local as sk_threshold_local
-                    from skimage.filters import threshold_otsu as sk_threshold_otsu
-                    from skimage.measure import label as sk_label
-                    from skimage.morphology import local_maxima
-                    from skimage.segmentation import expand_labels, watershed as sk_watershed
+                    from opal_studio.watershed import _voronoi_otsu_labeling, _gauss_otsu_labeling
 
                     labeller = params.get("labeller", "voronoi")
                     spot_sigma = params.get("spot_sigma", 2)
@@ -953,25 +906,18 @@ class MainWindow(QMainWindow):
                     )
 
                     if labeller == "voronoi":
-                        blurred_spots = gaussian(nuclei_gauss, spot_sigma)
-                        spot_centroids = local_maxima(blurred_spots)
-                        blurred_outline = gaussian(nuclei_gauss, outline_sigma)
-                        blurred_outline = (
-                            (blurred_outline - blurred_outline.min())
-                            / (blurred_outline.max() - blurred_outline.min() + 1e-8)
-                            * 255
+                        labels = _voronoi_otsu_labeling(
+                            nuclei_gauss,
+                            spot_sigma=spot_sigma,
+                            outline_sigma=outline_sigma,
+                            threshold=threshold,
                         )
-                        sk_thresh = sk_threshold_local(blurred_outline, 101, offset=0)
-                        thresh_offset = (threshold - 1.0) * 255 * 0.1
-                        binary_otsu = blurred_outline > sk_thresh + thresh_offset
-                        remaining_spots = spot_centroids * binary_otsu
-                        labeled_spots = sk_label(remaining_spots)
-                        labels = sk_watershed(binary_otsu, labeled_spots, mask=binary_otsu)
                     elif labeller == "gauss":
-                        blurred_outline = gaussian(nuclei_gauss, outline_sigma)
-                        sk_thresh = sk_threshold_otsu(blurred_outline)
-                        binary_otsu = blurred_outline > threshold * sk_thresh
-                        labels = sk_label(binary_otsu)
+                        labels = _gauss_otsu_labeling(
+                            nuclei_gauss,
+                            outline_sigma=outline_sigma,
+                            threshold=threshold,
+                        )
 
                     if min_mean_intensity > x.min():
                         cell_ids = np.unique(labels)
@@ -1519,6 +1465,181 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(f"Identification Error: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @Slot(dict)
+    def _run_clustering(self, params: dict):
+        """Perform cell clustering based on per-cell mean intensities."""
+        if not self._image:
+            self._ops_panel.stop_loading()
+            return
+
+        mask_idx = params["mask_index"]
+        mask_ch = self._channel_model.channel(mask_idx)
+        labels = mask_ch.mask_data
+        if labels is None:
+            self._ops_panel.stop_loading()
+            return
+
+        def _run():
+            try:
+                from opal_studio.image_loader import _get_yx
+                from opal_studio.clustering import (
+                    normalize_data, run_leiden, run_louvain, run_dbscan,
+                    run_kmeans, run_phenograph, run_flowsom, run_hierarchical,
+                )
+                from opal_studio.channel_model import generate_spaced_colors
+
+                # Resolve label map: use aux labels if available, or re-label binary
+                working_labels = labels
+                if mask_ch.processed_data is not None:
+                    working_labels = mask_ch.processed_data
+                elif labels.max() == 1:
+                    from skimage.measure import label
+                    working_labels = label(labels).astype(np.int32)
+
+                cell_ids = np.unique(working_labels)
+                cell_ids = cell_ids[cell_ids > 0]
+                if len(cell_ids) == 0:
+                    self.segmentationError.emit("No cells found in the selected mask.")
+                    return
+
+                max_label = int(working_labels.max())
+                h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
+
+                # ── Compute per-cell mean intensity for every image channel ──
+                channel_names = []
+                means_columns = []
+
+                for i in range(self._channel_model.rowCount()):
+                    ch = self._channel_model.channel(i)
+                    if ch.is_mask or ch.is_cell_mask or ch.is_type_mask or ch.is_region:
+                        continue
+
+                    if ch.is_processed and ch.processed_data is not None:
+                        data = ch.processed_data.astype(np.float32)
+                    else:
+                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+
+                    dh, dw = data.shape[:2]
+                    crop_h, crop_w = min(h, dh), min(w, dw)
+                    lab_crop = working_labels[:crop_h, :crop_w]
+                    dat_crop = data[:crop_h, :crop_w]
+
+                    means_list = ndi.mean(dat_crop, labels=lab_crop, index=cell_ids)
+                    if not isinstance(means_list, np.ndarray):
+                        means_list = np.array([means_list])
+                    means_list = np.nan_to_num(means_list)
+
+                    channel_names.append(ch.name)
+                    means_columns.append(means_list)
+
+                if len(means_columns) == 0:
+                    self.segmentationError.emit("No image channels found for clustering.")
+                    return
+
+                # Shape: (n_cells, n_channels)
+                cell_means = np.column_stack(means_columns).astype(np.float32)
+
+                # ── Normalize ────────────────────────────────────────────────
+                norm_method = params.get("normalization", "zscore")
+                cell_means_norm = normalize_data(
+                    cell_means,
+                    method=norm_method,
+                    cofactor=params.get("cofactor", 5),
+                    skewness_threshold=params.get("skewness_threshold", 1),
+                )
+
+                # ── Cluster ──────────────────────────────────────────────────
+                method = params["method"]
+                if method == "leiden":
+                    cluster_labels, n_clusters = run_leiden(
+                        cell_means_norm,
+                        resolution=params.get("resolution", 0.5),
+                    )
+                elif method == "louvain":
+                    cluster_labels, n_clusters = run_louvain(
+                        cell_means_norm,
+                        resolution=params.get("resolution", 0.5),
+                    )
+                elif method == "phenograph":
+                    cluster_labels, n_clusters = run_phenograph(
+                        cell_means_norm,
+                        k=params.get("k", 30),
+                    )
+                elif method == "flowsom":
+                    cluster_labels, n_clusters = run_flowsom(
+                        cell_means_norm,
+                        xdim=params.get("xdim", 10),
+                        ydim=params.get("ydim", 10),
+                        n_clusters=params.get("n_clusters", 10),
+                    )
+                elif method == "dbscan":
+                    cluster_labels, n_clusters = run_dbscan(
+                        cell_means_norm,
+                        eps=params.get("eps", 2.0),
+                        min_samples=params.get("min_samples", 100),
+                    )
+                elif method == "kmeans":
+                    cluster_labels, n_clusters = run_kmeans(
+                        cell_means_norm,
+                        n_clusters=params.get("n_clusters", 5),
+                    )
+                elif method == "hierarchical":
+                    cluster_labels, n_clusters = run_hierarchical(
+                        cell_means_norm,
+                        n_clusters=params.get("n_clusters", 5),
+                        linkage=params.get("linkage", "ward"),
+                        metric=params.get("metric", "euclidean"),
+                    )
+                else:
+                    self.segmentationError.emit(f"Unknown clustering method: {method}")
+                    return
+
+                # ── Build a type mask per cluster and emit ────────────────────
+                unique_clusters = np.unique(cluster_labels)
+                # For DBSCAN, -1 means noise
+                real_clusters = unique_clusters[unique_clusters >= 0]
+                colors = generate_spaced_colors(len(real_clusters) + 5)
+
+                # Build a cell_id -> cluster_label lookup
+                # cell_ids[j] has cluster cluster_labels[j]
+                id_to_cluster = np.full(max_label + 1, -1, dtype=np.int32)
+                for j, cid in enumerate(cell_ids):
+                    id_to_cluster[cid] = cluster_labels[j]
+
+                for ci, cluster_id in enumerate(real_clusters):
+                    # Binary mask: pixels belonging to cells in this cluster
+                    member_ids = cell_ids[cluster_labels == cluster_id]
+                    member_set = np.zeros(max_label + 1, dtype=bool)
+                    member_set[member_ids] = True
+                    type_data = member_set[working_labels].astype(np.uint8)
+
+                    cluster_name = f"Cluster {cluster_id}"
+                    color_rgb = colors[ci % len(colors)]
+                    row_color = QColor(*color_rgb)
+
+                    self.segmentationResultReady.emit(
+                        type_data, cluster_name, False, row_color, None, "", True, -1, None, False, None
+                    )
+                    self.operationProgress.emit(ci + 1, len(real_clusters))
+
+                # Handle DBSCAN noise as a separate "Noise" type
+                noise_ids = cell_ids[cluster_labels == -1] if -1 in cluster_labels else np.array([])
+                if len(noise_ids) > 0:
+                    noise_set = np.zeros(max_label + 1, dtype=bool)
+                    noise_set[noise_ids] = True
+                    noise_data = noise_set[working_labels].astype(np.uint8)
+                    self.segmentationResultReady.emit(
+                        noise_data, "Noise", False, QColor(128, 128, 128), None, "", True, -1, None, False, None
+                    )
+
+                self.operationFinished.emit(len(real_clusters))
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.segmentationError.emit(f"Clustering Error: {e}")
 
         threading.Thread(target=_run, daemon=True).start()
 
