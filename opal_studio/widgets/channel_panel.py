@@ -274,7 +274,7 @@ class ChannelPanel(QWidget):
         self._cell_scroll.setWidget(self._cell_container)
         
         self._cell_tab_layout.addWidget(self._cell_scroll)
-        self._tabs.addTab(self._cell_tab, self._spacer_icon, "Cells")
+        self._tabs.addTab(self._cell_tab, self._spacer_icon, "Positivity")
         self._cell_layout.addStretch()
 
         # Tab 4: Types
@@ -457,6 +457,13 @@ class ChannelPanel(QWidget):
         self._type_layout.addStretch()
         self._region_layout.addStretch()
 
+        has_types = any(ch.is_type_mask for ch in self._model._channels)
+        self._type_opacity_slider.setEnabled(has_types)
+        if has_types:
+            self._type_opacity_slider.blockSignals(True)
+            self._type_opacity_slider.setValue(int(self._model.type_opacity * 100))
+            self._type_opacity_slider.blockSignals(False)
+
     def _make_row(self, row: int, ch: Channel) -> QWidget:
         frame = ClickableFrame()
         frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -575,7 +582,8 @@ class ChannelPanel(QWidget):
         # Reset all header context-aware controls
         self._sel_group.setEnabled(False)
         self._mask_opacity_slider.setEnabled(False)
-        self._type_opacity_slider.setEnabled(False)
+        has_types = any(c.is_type_mask for c in self._model._channels)
+        self._type_opacity_slider.setEnabled(has_types)
         
         if not ch.is_mask and not ch.is_cell_mask and not ch.is_type_mask:
             # Traditional Channel tab controls
@@ -603,19 +611,18 @@ class ChannelPanel(QWidget):
 
         elif ch.is_type_mask:
             # Type tab controls
-            self._type_opacity_slider.setEnabled(True)
             self._type_opacity_slider.blockSignals(True)
-            self._type_opacity_slider.setValue(int(ch.range_max * 100))
+            self._type_opacity_slider.setValue(int(self._model.type_opacity * 100))
             self._type_opacity_slider.blockSignals(False)
 
     def _on_data_changed(self, top_left, bottom_right, roles):
         row = top_left.row()
-        if ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles or ChannelListModel.SelectedRole in roles:
+        if not roles or ChannelListModel.NameRole in roles or ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles or ChannelListModel.SelectedRole in roles:
             if 0 <= row < len(self._row_widgets):
                 ch = self._model.channel(row)
                 frame = self._row_widgets[row]
                 
-                if ChannelListModel.SelectedRole in roles:
+                if not roles or ChannelListModel.SelectedRole in roles:
                     pal = frame.palette()
                     color = frame.style().standardPalette().color(QPalette.ColorRole.Window)
                     if ch.selected:
@@ -625,6 +632,14 @@ class ChannelPanel(QWidget):
                     
                 try:
                     top_layout = frame.layout().itemAt(0).layout()
+                    
+                    if not roles or ChannelListModel.NameRole in roles:
+                        for i in range(top_layout.count()):
+                            w = top_layout.itemAt(i).widget()
+                            if isinstance(w, ElidedLabel):
+                                w.setText(ch.name)
+                                w.setToolTip(ch.name)
+                                break
                     
                     # 1. Update Eye Toggle
                     eye_btn = top_layout.itemAt(0).widget()
@@ -698,7 +713,4 @@ class ChannelPanel(QWidget):
             self._model.setData(idx, val/100.0, ChannelListModel.RangeMaxRole)
 
     def _on_header_type_opacity_changed(self, val: int):
-        ch = self._model.selected_channel()
-        if ch:
-            idx = self._model.index(self._model._channels.index(ch))
-            self._model.setData(idx, val/100.0, ChannelListModel.RangeMaxRole)
+        self._model.type_opacity = val / 100.0

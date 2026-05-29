@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, QPoint, QRect
 from PySide6.QtGui import QColor, QBrush, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -47,7 +47,9 @@ class PhenotypingTab(QWidget):
 
         # --- NEW STYLING CODE ---
         self._table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._table.verticalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._table.verticalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self._table.verticalHeader().setVisible(True)
         self._table.horizontalHeader().setSectionsMovable(True)
 
         self._table.setStyleSheet("""
@@ -64,6 +66,9 @@ class PhenotypingTab(QWidget):
                 border: 1px solid #d0d0d0;
             }
         """)
+        self._table.horizontalHeader().sectionDoubleClicked.connect(self._rename_cell_type)
+        self._table.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.horizontalHeader().customContextMenuRequested.connect(self._on_header_context_menu)
         # -------------------------
 
         layout.addWidget(self._table)
@@ -85,6 +90,72 @@ class PhenotypingTab(QWidget):
         self._cell_types.append(cell_type)
         self._cell_type_input.clear()
         self._refresh_table_ui()
+
+    @Slot(int)
+    def _rename_cell_type(self, logical_index: int):
+        from PySide6.QtWidgets import QLineEdit
+        if logical_index < 0 or logical_index >= len(self._cell_types):
+            return
+            
+        header = self._table.horizontalHeader()
+        viewport = header.viewport()
+        
+        rect = QRect(
+            header.sectionViewportPosition(logical_index),
+            0,
+            header.sectionSize(logical_index),
+            header.height()
+        )
+        
+        old_name = self._cell_types[logical_index]
+        
+        edit = QLineEdit(viewport)
+        edit.setStyleSheet("QLineEdit { border: 2px solid #0078d7; padding: 2px; background: white; color: black; }")
+        edit.setGeometry(rect)
+        edit.setText(old_name)
+        edit.selectAll()
+        edit.setFocus()
+        
+        def finish_edit():
+            new_name = edit.text().strip()
+            if new_name and new_name != old_name and new_name not in self._cell_types:
+                self._cell_types[logical_index] = new_name
+                # Update state dictionary keys
+                new_states = {}
+                for (ch, ct), val in self._cell_states.items():
+                    if ct == old_name:
+                        new_states[(ch, new_name)] = val
+                    else:
+                        new_states[(ch, ct)] = val
+                self._cell_states = new_states
+                self._refresh_table_ui()
+            edit.deleteLater()
+            
+        edit.editingFinished.connect(finish_edit)
+        edit.show()
+
+    @Slot(QPoint)
+    def _on_header_context_menu(self, pos: QPoint):
+        header = self._table.horizontalHeader()
+        logical_index = header.logicalIndexAt(pos)
+        if logical_index < 0 or logical_index >= len(self._cell_types):
+            return
+            
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui import QAction
+        
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete Cell Type")
+        
+        action = menu.exec(header.mapToGlobal(pos))
+        if action == delete_action:
+            cell_type = self._cell_types[logical_index]
+            self._cell_types.pop(logical_index)
+            # Remove from cell states dictionary
+            keys_to_remove = [k for k in self._cell_states.keys() if k[1] == cell_type]
+            for k in keys_to_remove:
+                del self._cell_states[k]
+            self._refresh_table_ui()
 
     @Slot()
     def _refresh_rows(self):
@@ -219,6 +290,5 @@ class PhenotypingTab(QWidget):
         """Reset all phenotyping definitions and states."""
         self._cell_states = {}
         self._cell_types = []
-        self._channel_names = []
-        self._refresh_table_ui()
+        self._refresh_rows()
 

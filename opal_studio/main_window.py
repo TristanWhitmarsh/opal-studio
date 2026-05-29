@@ -32,6 +32,7 @@ from opal_studio.widgets.channel_panel import ChannelPanel
 from opal_studio.widgets.image_canvas import ImageCanvas
 from opal_studio.widgets.operations_panel import OperationsPanel
 from opal_studio.widgets.phenotyping_tab import PhenotypingTab
+from opal_studio.widgets.clustering_heatmap_tab import ClusteringHeatmapTab
 
 import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt, find_objects
@@ -103,6 +104,7 @@ class MainWindow(QMainWindow):
     operationProgress = Signal(int, int)
     operationFinished = Signal(int)
     thresholdMeansReady = Signal(object, object, object, int)  # labels, cell_means dict, otsu dict, mask_model_idx
+    clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
 
     def __init__(self):
         super().__init__()
@@ -119,6 +121,7 @@ class MainWindow(QMainWindow):
         self._canvas = ImageCanvas(self._channel_model)
         self._ops_panel = OperationsPanel(self._channel_model, self)
         self._phenotyping_tab = PhenotypingTab(self._channel_model)
+        self._clustering_heatmap_tab = ClusteringHeatmapTab()
 
         # Signals
         self._ops_panel.runSegmentationRequested.connect(self._start_segmentation)
@@ -132,6 +135,8 @@ class MainWindow(QMainWindow):
         self.operationProgress.connect(self._ops_panel.set_progress_info)
         self.operationFinished.connect(self._on_operation_complete)
         self.thresholdMeansReady.connect(self._on_threshold_means_ready)
+        self.clusteringHeatmapReady.connect(self._on_clustering_heatmap_ready)
+        self._clustering_heatmap_tab.clusterRenamed.connect(self._on_cluster_renamed)
         
         self.segmentationResultReady.connect(self._on_segmentation_complete)
         self.segmentationError.connect(self._on_segmentation_error)
@@ -158,6 +163,7 @@ class MainWindow(QMainWindow):
         self._center_tabs.setIconSize(QSize(1, 24))
         self._center_tabs.addTab(self._canvas, spacer_icon, "Image")
         self._center_tabs.addTab(self._phenotyping_tab, spacer_icon, "Phenotyping")
+        self._center_tabs.addTab(self._clustering_heatmap_tab, spacer_icon, "Clustering")
         self._splitter.addWidget(self._center_tabs)
         
         self._splitter.addWidget(self._ops_panel)
@@ -266,6 +272,7 @@ class MainWindow(QMainWindow):
             self._canvas.set_image(img)
             self._ops_panel.reset()
             self._phenotyping_tab.clear()
+            self._clustering_heatmap_tab.clear()
             self._status.showMessage(f"Loaded SpatialData: {Path(path).name}", 5000)
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -294,6 +301,7 @@ class MainWindow(QMainWindow):
             self._canvas.set_image(img)
             self._ops_panel.reset()
             self._phenotyping_tab.clear()
+            self._clustering_heatmap_tab.clear()
             self._status.showMessage(f"Loaded: {Path(path).name}", 5000)
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -1482,6 +1490,12 @@ class MainWindow(QMainWindow):
             self._ops_panel.stop_loading()
             return
 
+        # Remove any existing type masks (clusters) from previous runs
+        for i in range(self._channel_model.rowCount() - 1, -1, -1):
+            ch = self._channel_model.channel(i)
+            if ch.is_type_mask:
+                self._channel_model.remove_channel(i)
+
         def _run():
             try:
                 from opal_studio.image_loader import _get_yx
@@ -1497,8 +1511,9 @@ class MainWindow(QMainWindow):
                     working_labels = mask_ch.processed_data
                 elif labels.max() == 1:
                     from skimage.measure import label
-                    working_labels = label(labels).astype(np.int32)
-
+                    working_labels = label(labels)
+                
+                working_labels = working_labels.astype(np.int32)
                 cell_ids = np.unique(working_labels)
                 cell_ids = cell_ids[cell_ids > 0]
                 if len(cell_ids) == 0:
@@ -1635,6 +1650,18 @@ class MainWindow(QMainWindow):
                         noise_data, "Noise", False, QColor(128, 128, 128), None, "", True, -1, None, False, None
                     )
 
+                # ── Emit heatmap data ─────────────────────────────────────
+                # Compute per-cluster mean of the ORIGINAL (pre-norm) data
+                heatmap = np.zeros((len(real_clusters), len(channel_names)), dtype=np.float32)
+                for ci, cluster_id in enumerate(real_clusters):
+                    member_mask = cluster_labels == cluster_id
+                    if np.any(member_mask):
+                        heatmap[ci] = cell_means[member_mask].mean(axis=0)
+
+                self.clusteringHeatmapReady.emit(
+                    list(real_clusters), channel_names, heatmap
+                )
+
                 self.operationFinished.emit(len(real_clusters))
 
             except Exception as e:
@@ -1647,6 +1674,23 @@ class MainWindow(QMainWindow):
         self._ops_panel.stop_loading()
         # count might be total markers or total types
         self.statusBar().showMessage(f"Task complete. Processed {count} items.", 5000)
+
+    @Slot(object, object, object)
+    def _on_clustering_heatmap_ready(self, cluster_ids, channel_names, heatmap_data):
+        """Populate the clustering heatmap tab."""
+        self._clustering_heatmap_tab.set_heatmap(cluster_ids, channel_names, heatmap_data)
+
+    @Slot(int, str)
+    def _on_cluster_renamed(self, cluster_id: int, new_name: str):
+        """Rename the type mask channel that corresponds to a cluster."""
+        old_name = f"Cluster {cluster_id}"
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_type_mask and ch.name == old_name:
+                ch.name = new_name
+                idx_qt = self._channel_model.index(i)
+                self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+                break
 
     def _on_segmentation_error(self, message):
         self._ops_panel.stop_loading()

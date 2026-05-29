@@ -89,3 +89,9 @@ zarr==2.18.2
 numexpr==2.10.2
 
 seaborn==0.13.2
+
+# ── Clustering (Phenotyping) ──────────────────────────────────────────────────
+scanpy==1.10.3
+louvain==0.8.2
+flowsom==0.2.1
+PhenoGraph==1.5.7
