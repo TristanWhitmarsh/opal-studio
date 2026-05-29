@@ -33,6 +33,7 @@ from opal_studio.widgets.image_canvas import ImageCanvas
 from opal_studio.widgets.operations_panel import OperationsPanel
 from opal_studio.widgets.phenotyping_tab import PhenotypingTab
 from opal_studio.widgets.clustering_heatmap_tab import ClusteringHeatmapTab
+from opal_studio.widgets.scatter_plot_tab import ScatterPlotTab
 
 import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt, find_objects
@@ -105,6 +106,8 @@ class MainWindow(QMainWindow):
     operationFinished = Signal(int)
     thresholdMeansReady = Signal(object, object, object, int)  # labels, cell_means dict, otsu dict, mask_model_idx
     clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
+    clusteringDimReductionReady = Signal(object, object, object, object)  # tsne_coords, umap_coords, cluster_labels, cluster_colors
+    clusteringMetricsReady = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -122,6 +125,9 @@ class MainWindow(QMainWindow):
         self._ops_panel = OperationsPanel(self._channel_model, self)
         self._phenotyping_tab = PhenotypingTab(self._channel_model)
         self._clustering_heatmap_tab = ClusteringHeatmapTab()
+        self._tsne_tab = ScatterPlotTab("t-SNE")
+        self._umap_tab = ScatterPlotTab("UMAP")
+        self._active_cluster_ids: list[int] = []
 
         # Signals
         self._ops_panel.runSegmentationRequested.connect(self._start_segmentation)
@@ -136,7 +142,10 @@ class MainWindow(QMainWindow):
         self.operationFinished.connect(self._on_operation_complete)
         self.thresholdMeansReady.connect(self._on_threshold_means_ready)
         self.clusteringHeatmapReady.connect(self._on_clustering_heatmap_ready)
+        self.clusteringDimReductionReady.connect(self._on_dim_reduction_ready)
+        self.clusteringMetricsReady.connect(self._ops_panel.set_clustering_metrics)
         self._clustering_heatmap_tab.clusterRenamed.connect(self._on_cluster_renamed)
+        self._channel_model.dataChanged.connect(self._on_channel_data_changed)
         
         self.segmentationResultReady.connect(self._on_segmentation_complete)
         self.segmentationError.connect(self._on_segmentation_error)
@@ -163,7 +172,9 @@ class MainWindow(QMainWindow):
         self._center_tabs.setIconSize(QSize(1, 24))
         self._center_tabs.addTab(self._canvas, spacer_icon, "Image")
         self._center_tabs.addTab(self._phenotyping_tab, spacer_icon, "Phenotyping")
-        self._center_tabs.addTab(self._clustering_heatmap_tab, spacer_icon, "Clustering")
+        self._center_tabs.addTab(self._clustering_heatmap_tab, spacer_icon, "Heatmap")
+        self._center_tabs.addTab(self._tsne_tab, spacer_icon, "t-SNE")
+        self._center_tabs.addTab(self._umap_tab, spacer_icon, "UMAP")
         self._splitter.addWidget(self._center_tabs)
         
         self._splitter.addWidget(self._ops_panel)
@@ -1495,6 +1506,8 @@ class MainWindow(QMainWindow):
             ch = self._channel_model.channel(i)
             if ch.is_type_mask:
                 self._channel_model.remove_channel(i)
+        self._tsne_tab.clear()
+        self._umap_tab.clear()
 
         def _run():
             try:
@@ -1526,10 +1539,13 @@ class MainWindow(QMainWindow):
                 # ── Compute per-cell mean intensity for every image channel ──
                 channel_names = []
                 means_columns = []
+                selected_channels = set(params.get("selected_channels") or [])
 
                 for i in range(self._channel_model.rowCount()):
                     ch = self._channel_model.channel(i)
                     if ch.is_mask or ch.is_cell_mask or ch.is_type_mask or ch.is_region:
+                        continue
+                    if selected_channels and i not in selected_channels:
                         continue
 
                     if ch.is_processed and ch.processed_data is not None:
@@ -1566,44 +1582,63 @@ class MainWindow(QMainWindow):
                     skewness_threshold=params.get("skewness_threshold", 1),
                 )
 
+                # ── PCA (always for DBSCAN, optional for others) ─────────────
+                use_pca = params.get("use_pca", False) or method == "dbscan"
+                pca_n_used: int | None = None
+                pca_auto = False
+                if use_pca:
+                    from sklearn.decomposition import PCA as _PCA
+                    from opal_studio.dimensionality_reduction import parallel_analysis_n_components
+                    override = params.get("pca_components")  # None = use PA
+                    if override is None:
+                        n_comp = parallel_analysis_n_components(cell_means_norm)
+                        pca_auto = True
+                    else:
+                        n_comp = override
+                    n_comp = min(n_comp, cell_means_norm.shape[1], cell_means_norm.shape[0] - 1)
+                    n_comp = max(1, n_comp)
+                    cell_means_clust = _PCA(n_components=n_comp, random_state=42).fit_transform(cell_means_norm)
+                    pca_n_used = n_comp
+                else:
+                    cell_means_clust = cell_means_norm
+
                 # ── Cluster ──────────────────────────────────────────────────
-                method = params["method"]
                 if method == "leiden":
                     cluster_labels, n_clusters = run_leiden(
-                        cell_means_norm,
+                        cell_means_clust,
                         resolution=params.get("resolution", 0.5),
                     )
                 elif method == "louvain":
                     cluster_labels, n_clusters = run_louvain(
-                        cell_means_norm,
+                        cell_means_clust,
                         resolution=params.get("resolution", 0.5),
                     )
                 elif method == "phenograph":
                     cluster_labels, n_clusters = run_phenograph(
-                        cell_means_norm,
+                        cell_means_clust,
                         k=params.get("k", 30),
                     )
                 elif method == "flowsom":
                     cluster_labels, n_clusters = run_flowsom(
-                        cell_means_norm,
+                        cell_means_clust,
                         xdim=params.get("xdim", 10),
                         ydim=params.get("ydim", 10),
                         n_clusters=params.get("n_clusters", 10),
                     )
                 elif method == "dbscan":
                     cluster_labels, n_clusters = run_dbscan(
-                        cell_means_norm,
-                        eps=params.get("eps", 2.0),
-                        min_samples=params.get("min_samples", 100),
+                        cell_means_clust,
+                        eps=params.get("eps", None),
+                        min_samples=params.get("min_samples", 10),
                     )
                 elif method == "kmeans":
                     cluster_labels, n_clusters = run_kmeans(
-                        cell_means_norm,
+                        cell_means_clust,
                         n_clusters=params.get("n_clusters", 5),
                     )
                 elif method == "hierarchical":
                     cluster_labels, n_clusters = run_hierarchical(
-                        cell_means_norm,
+                        cell_means_clust,
                         n_clusters=params.get("n_clusters", 5),
                         linkage=params.get("linkage", "ward"),
                         metric=params.get("metric", "euclidean"),
@@ -1662,6 +1697,75 @@ class MainWindow(QMainWindow):
                     list(real_clusters), channel_names, heatmap
                 )
 
+                # ── Dimensionality reduction (t-SNE & UMAP) ──────────────────
+                cluster_colors_map = {
+                    int(cluster_id): colors[ci % len(colors)]
+                    for ci, cluster_id in enumerate(real_clusters)
+                }
+                # Noise cluster (-1) gets grey
+                if -1 in cluster_labels:
+                    cluster_colors_map[-1] = (128, 128, 128)
+
+                from opal_studio.dimensionality_reduction import run_tsne, run_umap
+                tsne_coords = run_tsne(cell_means_clust)
+                umap_coords = run_umap(cell_means_clust)
+
+                self.clusteringDimReductionReady.emit(
+                    tsne_coords, umap_coords, cluster_labels, cluster_colors_map
+                )
+
+                # ── Clustering quality metrics ────────────────────────────────
+                from sklearn.metrics import (
+                    silhouette_score, davies_bouldin_score, calinski_harabasz_score
+                )
+                valid_mask = cluster_labels >= 0
+                X_valid = cell_means_clust[valid_mask]
+                y_valid = cluster_labels[valid_mask]
+                n_unique = len(np.unique(y_valid))
+
+                lines = []
+                lines.append(f"Cells: {len(cell_ids):,}  |  Clusters: {len(real_clusters)}")
+                if pca_n_used is not None:
+                    pa_note = "Horn's PA, correlation shuffle" if pca_auto else "manual override"
+                    lines.append(f"PCA: {pca_n_used}/{cell_means_norm.shape[1]} components ({pa_note})")
+                if -1 in cluster_labels:
+                    n_noise = int((cluster_labels == -1).sum())
+                    lines.append(f"Noise (DBSCAN): {n_noise:,} cells ({100*n_noise/len(cell_ids):.1f}%)")
+                lines.append("")
+                lines.append("Quality Metrics")
+                lines.append("-" * 32)
+
+                if n_unique >= 2:
+                    # Subsample silhouette for large datasets to stay responsive
+                    MAX_SIL = 10_000
+                    if len(X_valid) > MAX_SIL:
+                        rng = np.random.default_rng(42)
+                        idx = rng.choice(len(X_valid), MAX_SIL, replace=False)
+                        sil = silhouette_score(X_valid[idx], y_valid[idx])
+                        lines.append(f"Silhouette Score:          {sil:+.3f}  (subsample {MAX_SIL:,})")
+                    else:
+                        sil = silhouette_score(X_valid, y_valid)
+                        lines.append(f"Silhouette Score:          {sil:+.3f}")
+                    lines.append(f"  ↑ higher is better  (−1 to 1)")
+                    db = davies_bouldin_score(X_valid, y_valid)
+                    lines.append(f"Davies-Bouldin Index:      {db:.3f}")
+                    lines.append(f"  ↓ lower is better")
+                    ch = calinski_harabasz_score(X_valid, y_valid)
+                    lines.append(f"Calinski-Harabasz Index: {ch:,.1f}")
+                    lines.append(f"  ↑ higher is better")
+                else:
+                    lines.append("(need ≥ 2 clusters for quality metrics)")
+
+                lines.append("")
+                lines.append("Cluster Sizes")
+                lines.append("-" * 32)
+                n_total = len(cell_ids)
+                for cluster_id in real_clusters:
+                    n = int((cluster_labels == cluster_id).sum())
+                    lines.append(f"  Cluster {cluster_id}: {n:>6,} cells  ({100*n/n_total:.1f}%)")
+
+                self.clusteringMetricsReady.emit("\n".join(lines))
+
                 self.operationFinished.emit(len(real_clusters))
 
             except Exception as e:
@@ -1679,6 +1783,45 @@ class MainWindow(QMainWindow):
     def _on_clustering_heatmap_ready(self, cluster_ids, channel_names, heatmap_data):
         """Populate the clustering heatmap tab."""
         self._clustering_heatmap_tab.set_heatmap(cluster_ids, channel_names, heatmap_data)
+
+    @Slot(object, object, object, object)
+    def _on_dim_reduction_ready(self, tsne_coords, umap_coords, cluster_labels, cluster_colors):
+        """Populate the t-SNE and UMAP scatter plot tabs."""
+        # Store ordering for later color-sync when the user changes cluster colors
+        self._active_cluster_ids = sorted(k for k in cluster_colors if k >= 0)
+        if -1 in cluster_colors:
+            self._active_cluster_ids.append(-1)
+
+        self._tsne_tab.set_data(tsne_coords, cluster_labels, cluster_colors)
+        if umap_coords is not None:
+            self._umap_tab.set_data(umap_coords, cluster_labels, cluster_colors)
+
+    @Slot(object, object, object)
+    def _on_channel_data_changed(self, top_left, bottom_right, roles):
+        from opal_studio.channel_model import ChannelListModel
+        if roles and ChannelListModel.ColorRole not in roles:
+            return
+        row = top_left.row()
+        ch = self._channel_model.channel(row)
+        if ch and ch.is_type_mask:
+            self._sync_scatter_colors()
+
+    def _sync_scatter_colors(self):
+        """Rebuild the cluster→color map from current type mask channels and repaint."""
+        if not self._active_cluster_ids:
+            return
+        new_colors: dict[int, tuple] = {}
+        type_idx = 0
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_type_mask:
+                if type_idx < len(self._active_cluster_ids):
+                    cid = self._active_cluster_ids[type_idx]
+                    new_colors[cid] = (ch.color.red(), ch.color.green(), ch.color.blue())
+                type_idx += 1
+        if new_colors:
+            self._tsne_tab.update_colors(new_colors)
+            self._umap_tab.update_colors(new_colors)
 
     @Slot(int, str)
     def _on_cluster_renamed(self, cluster_id: int, new_name: str):

@@ -136,14 +136,17 @@ def run_leiden(data, resolution=0.5):
     return labels, n_clusters
 
 
-def run_dbscan(data, eps=2.0, min_samples=100):
+def run_dbscan(data, eps=None, min_samples=10):
     """DBSCAN density-based clustering.
 
     Parameters
     ----------
     data : ndarray, shape (n_cells, n_channels)
-    eps : float
-        Maximum distance between two samples in a neighbourhood.
+        Should be PCA-reduced before calling; pass raw normalised data
+        only if n_channels is small.
+    eps : float or None
+        Neighbourhood radius.  When None, estimated as the 90th percentile
+        of each cell's distance to its min_samples-th nearest neighbour.
     min_samples : int
         Minimum points in a neighbourhood to form a core point.
 
@@ -155,11 +158,19 @@ def run_dbscan(data, eps=2.0, min_samples=100):
         Number of clusters (excluding noise).
     """
     from sklearn.cluster import DBSCAN
+    from sklearn.neighbors import NearestNeighbors
+
+    if eps is None or eps <= 0:
+        k = min(min_samples, len(data) - 1)
+        nn = NearestNeighbors(n_neighbors=k, algorithm="auto").fit(data)
+        distances, _ = nn.kneighbors(data)
+        eps = float(np.percentile(distances[:, -1], 90))
+        logger.info("DBSCAN auto-eps: %.4f (90th pct of %d-NN distances)", eps, k)
 
     db = DBSCAN(eps=eps, min_samples=min_samples)
     labels = db.fit_predict(data)
     n_clusters = len(set(labels) - {-1})
-    logger.info("DBSCAN: %d clusters (eps=%.2f, min_samples=%d)",
+    logger.info("DBSCAN: %d clusters (eps=%.4f, min_samples=%d)",
                 n_clusters, eps, min_samples)
     return labels, n_clusters
 
@@ -238,11 +249,12 @@ def run_phenograph(data, k=30):
 
 
 def run_flowsom(data, xdim=10, ydim=10, n_clusters=10):
-    """FlowSOM clustering (Van Gassen et al., 2015).
+    """FlowSOM-style clustering (Van Gassen et al., 2015).
 
-    Trains a self-organising map (SOM) on the data and then applies
-    consensus metaclustering to group SOM nodes into a smaller number
-    of metaclusters.
+    Step 1 – SOM quantisation: MiniBatchKMeans with (xdim * ydim) nodes
+             assigns every cell to its nearest prototype.
+    Step 2 – Metaclustering: AgglomerativeClustering groups the SOM node
+             centres into *n_clusters* metaclusters.
 
     Parameters
     ----------
@@ -257,26 +269,20 @@ def run_flowsom(data, xdim=10, ydim=10, n_clusters=10):
     labels : ndarray of int, shape (n_cells,)
     n_clusters : int
     """
-    from flowsom import FlowSOM
-    import anndata as ad
+    from sklearn.cluster import MiniBatchKMeans, AgglomerativeClustering
 
-    # FlowSOM expects an AnnData object
-    adata = ad.AnnData(data.astype(np.float32))
-    # Column names required by flowsom
-    adata.var_names = [f"ch_{i}" for i in range(data.shape[1])]
+    n_nodes = min(xdim * ydim, len(data))
+    n_meta  = min(n_clusters, n_nodes)
 
-    fsom = FlowSOM(
-        adata,
-        cols_to_use=list(range(data.shape[1])),
-        xdim=xdim,
-        ydim=ydim,
-        n_clusters=n_clusters,
-        seed=42,
-    )
-    labels = fsom.metacluster_labels
-    n_out = len(np.unique(labels))
-    logger.info("FlowSOM: %d metaclusters (grid=%dx%d, requested=%d)",
-                n_out, xdim, ydim, n_clusters)
+    som = MiniBatchKMeans(n_clusters=n_nodes, random_state=42, n_init=3)
+    cell_to_node = som.fit_predict(data)
+
+    meta = AgglomerativeClustering(n_clusters=n_meta)
+    node_labels = meta.fit_predict(som.cluster_centers_)
+
+    labels = node_labels[cell_to_node]
+    n_out  = len(np.unique(labels))
+    logger.info("FlowSOM: %d metaclusters (grid=%dx%d)", n_out, xdim, ydim)
     return labels, n_out
 
 

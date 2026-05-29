@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox, QLineEdit, QPushButton, QProgressBar,
     QFormLayout, QMessageBox, QCheckBox, QRadioButton, QButtonGroup,
     QHBoxLayout, QGridLayout, QScrollArea, QTabWidget, QToolButton,
-    QListWidget, QListWidgetItem, QAbstractItemView
+    QListWidget, QListWidgetItem, QAbstractItemView, QPlainTextEdit
 )
 from PySide6.QtGui import QDoubleValidator, QIntValidator, QPixmap, QIcon
 
@@ -1681,6 +1681,28 @@ class ClusteringTab(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
 
+        # ── Channel selector ───────────────────────────────────────────────
+        ch_header = QHBoxLayout()
+        ch_header.setSpacing(4)
+        ch_header.addWidget(QLabel("Channels:"))
+        ch_header.addStretch()
+        self._ch_all_btn = QPushButton("All")
+        self._ch_all_btn.setFixedWidth(34)
+        self._ch_none_btn = QPushButton("None")
+        self._ch_none_btn.setFixedWidth(40)
+        ch_header.addWidget(self._ch_all_btn)
+        ch_header.addWidget(self._ch_none_btn)
+        layout.addLayout(ch_header)
+
+        self._channel_list = QListWidget()
+        self._channel_list.setFixedHeight(120)
+        self._channel_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._channel_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(self._channel_list)
+
+        self._ch_all_btn.clicked.connect(lambda: self._set_all_channels(True))
+        self._ch_none_btn.clicked.connect(lambda: self._set_all_channels(False))
+
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
@@ -1728,6 +1750,32 @@ class ClusteringTab(QWidget):
 
         layout.addLayout(form)
 
+        # ── PCA pre-processing ─────────────────────────────────────────────
+        pca_row = QHBoxLayout()
+        pca_row.setSpacing(6)
+        self._pca_check = QCheckBox("PCA")
+        self._pca_check.setToolTip(
+            "Reduce dimensionality with PCA before clustering.\n"
+            "Number of components is chosen automatically via Horn's parallel\n"
+            "analysis (shuffle correlation matrix, 100 shuffles, 95th percentile).\n"
+            "Type a number in the field to override.\n"
+            "Always applied for DBSCAN regardless of this setting."
+        )
+        self._pca_n_override = QLineEdit("")
+        self._pca_n_override.setPlaceholderText("# components")
+        self._pca_n_override.setFixedWidth(90)
+        self._pca_n_override.setValidator(QIntValidator(1, 200))
+        self._pca_n_override.setToolTip(
+            "Override number of PCA components.\n"
+            "Leave blank to determine automatically via Horn's parallel analysis."
+        )
+        self._pca_n_override.setVisible(False)
+        pca_row.addWidget(self._pca_check)
+        pca_row.addWidget(self._pca_n_override)
+        pca_row.addStretch()
+        self._pca_check.toggled.connect(self._pca_n_override.setVisible)
+        layout.addLayout(pca_row)
+
         # ── Arcsinh normalization parameter ────────────────────────────────
         self._arcsinh_container = QWidget()
         arc_lay = QFormLayout(self._arcsinh_container)
@@ -1738,7 +1786,7 @@ class ClusteringTab(QWidget):
         arc_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self._arcsinh_cofactor = QLineEdit("5")
-        self._arcsinh_cofactor.setValidator(QDoubleValidator(0.01, 10000.0, 2))
+        self._arcsinh_cofactor.setValidator(QDoubleValidator(0.0001, 10000.0, 4))
         self._arcsinh_cofactor.setFixedWidth(60)
         self._arcsinh_cofactor.setToolTip("Cofactor divisor for arcsinh transform. Common values: 5 (CyTOF), 150 (fluorescence).")
         arc_lay.addRow("Cofactor:", self._arcsinh_cofactor)
@@ -1754,7 +1802,7 @@ class ClusteringTab(QWidget):
         logz_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self._logz_skewness = QLineEdit("1")
-        self._logz_skewness.setValidator(QDoubleValidator(0.0, 100.0, 2))
+        self._logz_skewness.setValidator(QDoubleValidator(0.0, 100.0, 4))
         self._logz_skewness.setFixedWidth(60)
         self._logz_skewness.setToolTip("Channels with abs(skewness) above this threshold get log1p before Z-score.")
         logz_lay.addRow("Skew threshold:", self._logz_skewness)
@@ -1770,7 +1818,7 @@ class ClusteringTab(QWidget):
         lei_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self._leiden_resolution = QLineEdit("0.5")
-        self._leiden_resolution.setValidator(QDoubleValidator(0.01, 100.0, 2))
+        self._leiden_resolution.setValidator(QDoubleValidator(0.0001, 100.0, 4))
         self._leiden_resolution.setFixedWidth(60)
         self._leiden_resolution.setToolTip("Resolution parameter for Leiden. Higher values produce more clusters.")
         lei_lay.addRow("Resolution:", self._leiden_resolution)
@@ -1786,7 +1834,7 @@ class ClusteringTab(QWidget):
         lou_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self._louvain_resolution = QLineEdit("0.5")
-        self._louvain_resolution.setValidator(QDoubleValidator(0.01, 100.0, 2))
+        self._louvain_resolution.setValidator(QDoubleValidator(0.0001, 100.0, 4))
         self._louvain_resolution.setFixedWidth(60)
         self._louvain_resolution.setToolTip("Resolution parameter for Louvain. Higher values produce more clusters.")
         lou_lay.addRow("Resolution:", self._louvain_resolution)
@@ -1872,16 +1920,26 @@ class ClusteringTab(QWidget):
         db_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         db_lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
-        self._dbscan_eps = QLineEdit("2.0")
-        self._dbscan_eps.setValidator(QDoubleValidator(0.01, 1000.0, 2))
+        self._dbscan_eps = QLineEdit("")
+        self._dbscan_eps.setPlaceholderText("Auto")
+        self._dbscan_eps.setValidator(QDoubleValidator(0.0001, 1000.0, 4))
         self._dbscan_eps.setFixedWidth(60)
-        self._dbscan_eps.setToolTip("Maximum distance between two samples to be considered neighbours.")
+        self._dbscan_eps.setToolTip(
+            "Neighbourhood radius (Euclidean distance in normalised feature space).\n"
+            "Leave blank to auto-estimate from the k-NN distance distribution\n"
+            "(90th percentile of each cell's distance to its min_samples-th\n"
+            "nearest neighbour). Override if too many cells become noise."
+        )
         db_lay.addRow("Epsilon:", self._dbscan_eps)
 
-        self._dbscan_min_samples = QLineEdit("100")
+        self._dbscan_min_samples = QLineEdit("10")
         self._dbscan_min_samples.setValidator(QIntValidator(1, 100000))
         self._dbscan_min_samples.setFixedWidth(60)
-        self._dbscan_min_samples.setToolTip("Minimum number of points required to form a dense region.")
+        self._dbscan_min_samples.setToolTip(
+            "Minimum number of neighbours within epsilon for a point to be a core point.\n"
+            "Lower values produce more (smaller) clusters.\n"
+            "Typical range: 5–50."
+        )
         db_lay.addRow("Min samples:", self._dbscan_min_samples)
         layout.addWidget(self._dbscan_container)
 
@@ -1905,14 +1963,63 @@ class ClusteringTab(QWidget):
         self._run_btn = QPushButton("Run Clustering")
         self._run_btn.clicked.connect(self._on_run)
         layout.addWidget(self._run_btn)
+
+        # Metrics output
+        self._metrics_output = QPlainTextEdit()
+        self._metrics_output.setReadOnly(True)
+        self._metrics_output.setPlaceholderText("Clustering metrics will appear here after running.")
+        self._metrics_output.setMinimumHeight(120)
+        self._metrics_output.setMaximumHeight(300)
+        self._metrics_output.setStyleSheet("""
+            QPlainTextEdit {
+                font-family: monospace;
+                font-size: 11px;
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """)
+        layout.addWidget(self._metrics_output)
         layout.addStretch()
 
+        self._refresh_channels()
         self._refresh_masks()
         self._on_method_changed()
         self._on_norm_changed()
+        self._channel_model.modelReset.connect(self._refresh_channels)
         self._channel_model.modelReset.connect(self._refresh_masks)
+        self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
         self._channel_model.rowsInserted.connect(lambda: self._refresh_masks())
+        self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_masks())
+        self._channel_model.dataChanged.connect(lambda *_: self._refresh_channels())
+
+    def _refresh_channels(self):
+        checked_names = set()
+        first_populate = self._channel_list.count() == 0
+        if not first_populate:
+            for i in range(self._channel_list.count()):
+                item = self._channel_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    checked_names.add(item.text())
+        self._channel_list.clear()
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_mask or ch.is_cell_mask or ch.is_type_mask or getattr(ch, 'is_region', False):
+                continue
+            item = QListWidgetItem(ch.name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checked = True if first_populate else ch.name in checked_names
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self._channel_list.addItem(item)
+
+    def _set_all_channels(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(self._channel_list.count()):
+            self._channel_list.item(i).setCheckState(state)
 
     def _refresh_masks(self):
         current = self._mask_combo.currentText()
@@ -1933,6 +2040,8 @@ class ClusteringTab(QWidget):
         self._dbscan_container.setVisible(method == "dbscan")
         self._kmeans_container.setVisible(method == "kmeans")
         self._hierarchical_container.setVisible(method == "hierarchical")
+        # Default PCA on for DBSCAN (required), off for others
+        self._pca_check.setChecked(method == "dbscan")
 
     def _on_hc_linkage_changed(self):
         """Disable the metric combo when ward linkage is selected (always Euclidean)."""
@@ -1951,10 +2060,18 @@ class ClusteringTab(QWidget):
             return
         method = self._method_combo.currentText().lower()
         norm = self._norm_combo.currentData()
+        selected_channels = []
+        for i in range(self._channel_list.count()):
+            item = self._channel_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected_channels.append(item.data(Qt.ItemDataRole.UserRole))
         params = {
             "mask_index": self._mask_combo.currentData(),
             "method": method,
             "normalization": norm,
+            "use_pca": self._pca_check.isChecked(),
+            "pca_components": int(self._pca_n_override.text()) if self._pca_n_override.text().strip() else None,
+            "selected_channels": selected_channels,
         }
         # Normalization-specific params
         if norm == "arcsinh":
@@ -1973,8 +2090,9 @@ class ClusteringTab(QWidget):
             params["ydim"] = int(self._flowsom_ydim.text() or 10)
             params["n_clusters"] = int(self._flowsom_n_clusters.text() or 10)
         elif method == "dbscan":
-            params["eps"] = float(self._dbscan_eps.text() or 2.0)
-            params["min_samples"] = int(self._dbscan_min_samples.text() or 100)
+            eps_text = self._dbscan_eps.text().strip()
+            params["eps"] = float(eps_text) if eps_text else None
+            params["min_samples"] = int(self._dbscan_min_samples.text() or 10)
         elif method == "kmeans":
             params["n_clusters"] = int(self._kmeans_n_clusters.text() or 5)
         elif method == "hierarchical":
@@ -1982,6 +2100,9 @@ class ClusteringTab(QWidget):
             params["linkage"] = self._hc_linkage.currentText()
             params["metric"] = self._hc_metric.currentText()
         self.runRequested.emit(params)
+
+    def set_metrics(self, text: str) -> None:
+        self._metrics_output.setPlainText(text)
 
     def setEnabled(self, enabled):
         super().setEnabled(enabled)
@@ -2362,6 +2483,9 @@ class OperationsPanel(QWidget):
         self._ident_run_btn.setEnabled(True)
         self._clustering_tab.setEnabled(True)
         self._progress.setVisible(False)
+
+    def set_clustering_metrics(self, text: str) -> None:
+        self._clustering_tab.set_metrics(text)
 
     @Slot(int, int)
     def set_progress_info(self, val, total):

@@ -207,6 +207,10 @@ class ClusteringHeatmapTab(QWidget):
         self._table.setVerticalHeaderLabels(row_labels)
         self._table.setHorizontalHeaderLabels(col_labels)
 
+        if n_clusters == 0:
+            self._table.blockSignals(False)
+            return
+
         # Per-channel min/max for colour normalisation (across all clusters)
         # heatmap_data is (n_clusters, n_channels)
         ch_min = self._heatmap_data.min(axis=0)
