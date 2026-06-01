@@ -65,15 +65,6 @@ For external users or standard installations, you can install Opal Studio by clo
 ### 2. University Server Installation (Darkroom Setup)
 If you are working on **Darkroom** (our university JupyterLab setup), you have to start the remote Linux desktop, open a terminal, and run:
 
-**First-time installation** (only needed once when a new version is released):
-```bash
-source /opt/conda/etc/profile.d/conda.sh
-conda activate /storage/scratch.space/envs/opal-env-j4
-PIP_REQUIRE_VIRTUALENV=0 pip install opal_studio-0.1.3-py3-none-any.whl
-python -m opal_studio --create-launcher
-```
-
-**Launching after installation**:
 ```bash
 source /opt/conda/etc/profile.d/conda.sh
 conda activate /storage/scratch.space/envs/opal-env-j4

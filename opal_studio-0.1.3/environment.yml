@@ -1,0 +1,12 @@
+name: opal-all
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - cudatoolkit=11.2
+  - cudnn=8.1
+  - pip:
+    - -r requirements.txt
+
