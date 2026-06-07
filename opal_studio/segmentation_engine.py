@@ -170,18 +170,26 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                 from instanseg.utils.loss.instanseg_loss import InstanSeg as InstanSegPostProcessor
                 from instanseg.utils.model_loader import load_model
                 from instanseg.utils.utils import percentile_normalize
-                
+                import torch.nn.functional as F
+
                 result = load_model(str(model_path))
                 backbone = result[0] if isinstance(result, (tuple, list)) else result
                 backbone.eval()
                 backbone = backbone.to(device)
-                
+
+                postprocessor = InstanSegPostProcessor(
+                    n_sigma=2, dim_coords=2, dim_seeds=1,
+                    cells_and_nuclei=False, device=device,
+                )
+                postprocessor.initialize_pixel_classifier(backbone)
+                postprocessor.pixel_classifier = postprocessor.pixel_classifier.to(device)
+
                 n_in = 1
                 for name, module in backbone.named_modules():
                     if isinstance(module, torch.nn.Conv2d):
                         n_in = module.in_channels
                         break
-                
+
                 raw = x
                 if raw.ndim == 2 and n_in > 1:
                     raw_input = np.stack([raw] * n_in, axis=0)
@@ -189,44 +197,67 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                     raw_input = raw[np.newaxis, ...]
                 else:
                     raw_input = raw
-                    
-                tensor = torch.from_numpy(raw_input).unsqueeze(0).float()
-                tensor = torch.stack([percentile_normalize(tensor[0])]).to(device)
-                
-                import torch.nn.functional as F
-                h, w = tensor.shape[-2:]
-                pad_h = (32 - h % 32) % 32
-                pad_w = (32 - w % 32) % 32
-                if pad_h > 0 or pad_w > 0:
-                    tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode='reflect')
-                
-                with torch.no_grad():
-                    embeddings = backbone(tensor)
-                
-                if pad_h > 0 or pad_w > 0:
-                    embeddings = embeddings[..., :h, :w]
-                    
-                postprocessor = InstanSegPostProcessor(
-                    n_sigma=2, dim_coords=2, dim_seeds=1,
-                    cells_and_nuclei=False, device=device,
-                )
-                postprocessor.initialize_pixel_classifier(backbone)
-                postprocessor.pixel_classifier = postprocessor.pixel_classifier.to(device)
-                
-                with torch.no_grad():
-                    instance_map = postprocessor.postprocessing(
-                        embeddings[0], device=device, classifier=postprocessor.pixel_classifier,
-                    )
-                    
-                cell_mask = instance_map[0].cpu().numpy().astype(np.int32)
-                
-                # Apply post-processing
+
+                TILE_SIZE = 128
+                OVERLAP = 16
+                H, W = raw_input.shape[-2], raw_input.shape[-1]
+
+                def _run_tile(patch_np):
+                    t = torch.from_numpy(patch_np).unsqueeze(0).float()
+                    t = torch.stack([percentile_normalize(t[0])]).to(device)
+                    ph, pw = t.shape[-2], t.shape[-1]
+                    pad_h = (32 - ph % 32) % 32
+                    pad_w = (32 - pw % 32) % 32
+                    if pad_h or pad_w:
+                        pad_mode = 'reflect' if ph > pad_h and pw > pad_w else 'constant'
+                        t = F.pad(t, (0, pad_w, 0, pad_h), mode=pad_mode)
+                    with torch.no_grad():
+                        emb = backbone(t)
+                    if pad_h or pad_w:
+                        emb = emb[..., :ph, :pw]
+                    with torch.no_grad():
+                        inst = postprocessor.postprocessing(
+                            emb[0], device=device, classifier=postprocessor.pixel_classifier,
+                        )
+                    return inst[0].cpu().numpy().astype(np.int32)
+
+                if H <= TILE_SIZE and W <= TILE_SIZE:
+                    cell_mask = _run_tile(raw_input)
+                else:
+                    cell_mask = np.zeros((H, W), dtype=np.int32)
+                    next_id = 1
+                    stride = TILE_SIZE - OVERLAP
+                    ys = list(range(0, H, stride))
+                    xs = list(range(0, W, stride))
+                    for y0 in ys:
+                        for x0 in xs:
+                            y1 = min(y0 + TILE_SIZE, H)
+                            x1 = min(x0 + TILE_SIZE, W)
+                            patch = raw_input[..., y0:y1, x0:x1]
+                            tile_labels = _run_tile(patch)
+                            # Only keep cells whose centroid falls in the non-overlap
+                            # inner region to avoid duplicates at tile borders.
+                            inner_y0 = OVERLAP // 2 if y0 > 0 else 0
+                            inner_x0 = OVERLAP // 2 if x0 > 0 else 0
+                            inner_y1 = (y1 - y0) - (OVERLAP // 2) if y1 < H else (y1 - y0)
+                            inner_x1 = (x1 - x0) - (OVERLAP // 2) if x1 < W else (x1 - x0)
+                            for obj_id in np.unique(tile_labels):
+                                if obj_id == 0:
+                                    continue
+                                mask = tile_labels == obj_id
+                                ys_obj, xs_obj = np.where(mask)
+                                cy = int(np.mean(ys_obj))
+                                cx = int(np.mean(xs_obj))
+                                if inner_y0 <= cy < inner_y1 and inner_x0 <= cx < inner_x1:
+                                    cell_mask[y0 + ys_obj, x0 + xs_obj] = next_id
+                                    next_id += 1
+
                 cell_mask = _postprocess_labels(
-                    cell_mask, 
+                    cell_mask,
                     fill_holes=params.get("fill_holes", False),
                     keep_largest=params.get("keep_largest", False)
                 )
-                
+
                 results.append((cell_mask, f"InstanSeg ({model_name})", False))
                 
             else:

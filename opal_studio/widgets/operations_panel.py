@@ -404,6 +404,49 @@ class MergeTab(QWidget):
         super().setEnabled(enabled)
         self._run_btn.setEnabled(enabled)
 
+_BRIGHTFIELD_PRESETS = [
+    "H&E", "IHC", "Aperio CS2", "Hamamatsu XR", "Hamamatsu S360",
+    "Leica GT450", "3DHistech Pannoramic Scan II", "CyteFinder",
+    "Axioscan 7", "Orion", "Masson Trichrome", "PAS",
+    "Jones Silver", "Toluidine Blue",
+]
+
+
+class BrightfieldTab(QWidget):
+    """Generate a virtual brightfield image from the multiplex image."""
+    runRequested = Signal(dict)
+
+    def __init__(self, channel_model, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self._preset_combo = QComboBox()
+        self._preset_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for name in _BRIGHTFIELD_PRESETS:
+            self._preset_combo.addItem(name)
+        form.addRow("Preset:", self._preset_combo)
+        layout.addLayout(form)
+
+        self._run_btn = QPushButton("Generate Brightfield")
+        self._run_btn.clicked.connect(self._on_run)
+        layout.addWidget(self._run_btn)
+        layout.addStretch()
+
+    def _on_run(self):
+        self.runRequested.emit({"preset": self._preset_combo.currentText()})
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._run_btn.setEnabled(enabled)
+
+
 class StarDistTab(QWidget):
     """Sub-widget for StarDist segmentation parameters."""
     runRequested = Signal(dict)
@@ -2112,6 +2155,7 @@ class OperationsPanel(QWidget):
 
     DEFAULT_WIDTH = 300
     runPreprocessingRequested = Signal(dict)
+    runBrightfieldRequested = Signal(dict)
     runSegmentationRequested = Signal(dict)
     runMaskProcessingRequested = Signal(dict)
     runCellPositivityRequested = Signal(dict)
@@ -2180,17 +2224,19 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Pre-processing", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        # Tabs for Filter vs Merge
         self._pre_tabs = OperationsTabWidget()
         self._pre_tabs.setIconSize(QSize(1, 24))
         self._filter_tab = FilterTab(self._channel_model)
         self._merge_tab = MergeTab(self._channel_model)
-        
+        self._brightfield_tab = BrightfieldTab(self._channel_model)
+
         self._filter_tab.runRequested.connect(self._on_run_preprocessing)
         self._merge_tab.runRequested.connect(self._on_run_preprocessing)
-        
+        self._brightfield_tab.runRequested.connect(self._on_run_brightfield)
+
         self._pre_tabs.addTab(self._merge_tab, self._spacer_icon, "Merge")
         self._pre_tabs.addTab(self._filter_tab, self._spacer_icon, "Filter")
+        self._pre_tabs.addTab(self._brightfield_tab, self._spacer_icon, "Brightfield")
         panel.addWidget(self._pre_tabs)
 
     def _setup_segmentation_section(self):
@@ -2372,6 +2418,11 @@ class OperationsPanel(QWidget):
         self._progress.setVisible(True); self._progress.setRange(0, 0)
         self.runPreprocessingRequested.emit(params)
 
+    def _on_run_brightfield(self, params):
+        self._brightfield_tab.setEnabled(False)
+        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self.runBrightfieldRequested.emit(params)
+
     def _on_run_segmentation(self, params):
         target_mode = "new" if self._radio_new_mask.isChecked() else "overwrite"
         if self._radio_full.isChecked():
@@ -2467,6 +2518,7 @@ class OperationsPanel(QWidget):
 
     def stop_loading(self):
         self._filter_tab.setEnabled(True)
+        self._brightfield_tab.setEnabled(True)
         self._stardist_tab.setEnabled(True)
         self._cellpose_tab.setEnabled(True)
         self._omnipose_tab.setEnabled(True)

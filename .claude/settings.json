@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"dir /b C:\\\\Users\\\\Tristan\\\\AppData\\\\Local\\\\miniforge3\\\\envs 2>nul & dir /b C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs 2>nul & dir /b C:\\\\Users\\\\Tristan\\\\anaconda3\\\\envs 2>nul\")",
+      "Bash(cmd /c \"dir /s /b converter.py 2>nul | findstr multiplex\")"
+    ]
+  }
+}

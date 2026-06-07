@@ -34,6 +34,7 @@ from opal_studio.widgets.operations_panel import OperationsPanel
 from opal_studio.widgets.phenotyping_tab import PhenotypingTab
 from opal_studio.widgets.clustering_heatmap_tab import ClusteringHeatmapTab
 from opal_studio.widgets.scatter_plot_tab import ScatterPlotTab
+from opal_studio.widgets.brightfield_view import BrightfieldView
 
 import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt, find_objects
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
     clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
     clusteringDimReductionReady = Signal(object, object, object, object)  # tsne_coords, umap_coords, cluster_labels, cluster_colors
     clusteringMetricsReady = Signal(str)
+    brightfieldResultReady = Signal(object)  # (H, W, 3) uint8 ndarray
 
     def __init__(self):
         super().__init__()
@@ -127,11 +129,14 @@ class MainWindow(QMainWindow):
         self._clustering_heatmap_tab = ClusteringHeatmapTab()
         self._tsne_tab = ScatterPlotTab("t-SNE")
         self._umap_tab = ScatterPlotTab("UMAP")
+        self._brightfield_view = BrightfieldView(self._channel_model)
         self._active_cluster_ids: list[int] = []
 
         # Signals
         self._ops_panel.runSegmentationRequested.connect(self._start_segmentation)
         self._ops_panel.runPreprocessingRequested.connect(self._run_preprocessing)
+        self._ops_panel.runBrightfieldRequested.connect(self._run_brightfield)
+        self.brightfieldResultReady.connect(self._on_brightfield_complete)
         self._ops_panel.runMaskProcessingRequested.connect(self._run_mask_expansion)
         self._ops_panel.runCellPositivityRequested.connect(self._run_cell_positivity)
         self._ops_panel.runCellIdentificationRequested.connect(self._run_cell_identification)
@@ -153,10 +158,18 @@ class MainWindow(QMainWindow):
         self.preprocessingError.connect(self._on_segmentation_error)
         self._canvas.pixelHovered.connect(self._on_pixel_hovered)
 
-        # Connect drawing signals between panel and canvas
+        # Connect drawing signals between panel and canvas / brightfield view
         self._channel_panel._draw_btn.toggled.connect(self._canvas.set_draw_mode)
+        self._channel_panel._draw_btn.toggled.connect(self._brightfield_view.set_draw_mode)
         self._channel_panel._simplification_spin.valueChanged.connect(self._canvas.set_simplification_epsilon)
+        self._channel_panel._simplification_spin.valueChanged.connect(self._brightfield_view.set_simplification_epsilon)
         self._canvas.regionDrawn.connect(self._on_region_drawn)
+        self._brightfield_view.regionDrawn.connect(self._on_region_drawn)
+
+        # Sync viewport between multiplex canvas and brightfield view
+        self._viewport_syncing = False
+        self._canvas.viewportChanged.connect(self._sync_canvas_to_brightfield)
+        self._brightfield_view.viewportChanged.connect(self._sync_brightfield_to_canvas)
 
         # Layout
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -171,6 +184,7 @@ class MainWindow(QMainWindow):
         
         self._center_tabs.setIconSize(QSize(1, 24))
         self._center_tabs.addTab(self._canvas, spacer_icon, "Image")
+        self._center_tabs.addTab(self._brightfield_view, spacer_icon, "Brightfield")
         self._center_tabs.addTab(self._phenotyping_tab, spacer_icon, "Phenotyping")
         self._center_tabs.addTab(self._clustering_heatmap_tab, spacer_icon, "Heatmap")
         self._center_tabs.addTab(self._tsne_tab, spacer_icon, "t-SNE")
@@ -209,16 +223,28 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_sdata_act)
 
         file_menu.addSeparator()
-        
+
         load_masks_act = QAction("&Load Masks…", self)
         load_masks_act.triggered.connect(lambda: self._on_import_masks(target="mask"))
         file_menu.addAction(load_masks_act)
 
-        load_cells_act = QAction("Load &Cells…", self)
-        load_cells_act.triggered.connect(lambda: self._on_import_masks(target="cell"))
-        file_menu.addAction(load_cells_act)
+        load_contours_act = QAction("Load &Contours…", self)
+        load_contours_act.triggered.connect(self._on_import_contours)
+        file_menu.addAction(load_contours_act)
 
-        load_phenos_act = QAction("Load &Phenotyping…", self)
+        load_positivity_act = QAction("Load &Positivity…", self)
+        load_positivity_act.triggered.connect(lambda: self._on_import_masks(target="cell"))
+        file_menu.addAction(load_positivity_act)
+
+        load_types_act = QAction("Load &Types…", self)
+        load_types_act.triggered.connect(self._on_import_types)
+        file_menu.addAction(load_types_act)
+
+        load_regions_act = QAction("Load &Regions…", self)
+        load_regions_act.triggered.connect(self._on_import_regions)
+        file_menu.addAction(load_regions_act)
+
+        load_phenos_act = QAction("Load P&henotyping…", self)
         load_phenos_act.triggered.connect(self._on_import_phenotypes)
         file_menu.addAction(load_phenos_act)
 
@@ -228,15 +254,23 @@ class MainWindow(QMainWindow):
         save_masks_act.triggered.connect(lambda: self._on_export_masks(target="mask"))
         file_menu.addAction(save_masks_act)
 
-        save_cells_act = QAction("Save &Cells…", self)
-        save_cells_act.triggered.connect(lambda: self._on_export_masks(target="cell"))
-        file_menu.addAction(save_cells_act)
-
-        save_contours_act = QAction("Save Con&tours (GeoJSON)…", self)
+        save_contours_act = QAction("Save Con&toursS…", self)
         save_contours_act.triggered.connect(self._on_export_contours)
         file_menu.addAction(save_contours_act)
 
-        save_phenos_act = QAction("Save &Phenotyping…", self)
+        save_positivity_act = QAction("Save &Positivity…", self)
+        save_positivity_act.triggered.connect(lambda: self._on_export_masks(target="cell"))
+        file_menu.addAction(save_positivity_act)
+
+        save_types_act = QAction("Save &Types…", self)
+        save_types_act.triggered.connect(self._on_export_types)
+        file_menu.addAction(save_types_act)
+
+        save_regions_act = QAction("Save &Regions…", self)
+        save_regions_act.triggered.connect(self._on_export_regions)
+        file_menu.addAction(save_regions_act)
+
+        save_phenos_act = QAction("Save P&henotyping…", self)
         save_phenos_act.triggered.connect(self._on_export_phenotypes)
         file_menu.addAction(save_phenos_act)
         
@@ -534,6 +568,307 @@ class MainWindow(QMainWindow):
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Export Error", f"Could not export contours: {e}")
 
+    def _on_import_contours(self):
+        if not self._image: return
+
+        path, _ = QFileDialog.getOpenFileName(self, "Load Contours", "", "GeoJSON (*.geojson);;All files (*)")
+        if not path: return
+
+        try:
+            import json
+            import cv2
+            from PySide6.QtGui import QPolygonF
+            from opal_studio.image_loader import _get_yx
+
+            with open(path, 'r', encoding='utf-8') as f:
+                geojson_data = json.load(f)
+
+            features = geojson_data.get("features", [])
+            if not features:
+                QMessageBox.information(self, "Load Contours", "No features found in GeoJSON file.")
+                return
+
+            h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
+            labels = np.zeros((h, w), dtype=np.int32)
+            contour_data = {}
+
+            label_id = 1
+            for feat in features:
+                geom = feat.get("geometry", {})
+                geom_type = geom.get("type", "")
+                coords = geom.get("coordinates", [])
+
+                if geom_type == "Polygon" and coords:
+                    rings = [coords[0]]
+                elif geom_type == "MultiPolygon" and coords:
+                    rings = [sub[0] for sub in coords if sub]
+                else:
+                    continue
+
+                polygons = []
+                all_xs, all_ys = [], []
+                for ring_coords in rings:
+                    if len(ring_coords) < 3:
+                        continue
+                    # Coordinates are stored at pixel-centres (+0.5 offset from _get_contour_data).
+                    # Subtract 0.5 before rounding so each centre maps back to its origin pixel.
+                    pts_np = np.array([[c[0] - 0.5, c[1] - 0.5] for c in ring_coords], dtype=np.float64)
+                    pts_np = np.round(pts_np).astype(np.int32)
+                    pts_np[:, 0] = np.clip(pts_np[:, 0], 0, w - 1)
+                    pts_np[:, 1] = np.clip(pts_np[:, 1], 0, h - 1)
+                    cv2.fillPoly(labels, [pts_np], label_id)
+
+                    points = [QPointF(c[0], c[1]) for c in ring_coords]
+                    # Ensure closed ring in QPolygonF (consistent with _get_contour_data)
+                    if points[0].x() != points[-1].x() or points[0].y() != points[-1].y():
+                        points.append(points[0])
+                    polygons.append(QPolygonF(points))
+                    all_xs.extend(c[0] for c in ring_coords)
+                    all_ys.extend(c[1] for c in ring_coords)
+
+                if polygons:
+                    contour_data[label_id] = {
+                        "polygons": polygons,
+                        "bbox": [min(all_ys), min(all_xs), max(all_ys), max(all_xs)]
+                    }
+                    label_id += 1
+
+            if label_id == 1:
+                QMessageBox.information(self, "Load Contours", "No valid polygons found in the GeoJSON file.")
+                return
+
+            name = self._channel_model.get_unique_name(Path(path).stem)
+            new_ch = Channel(
+                name=name,
+                color=QColor(255, 255, 255),
+                visible=True,
+                is_mask=True,
+                mask_data=labels,
+                contour_data=contour_data,
+                index=-1
+            )
+            self._channel_model.add_channel(new_ch)
+            self._status.showMessage(f"Loaded {label_id - 1} contours as mask from {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Import Error", f"Could not load contours: {e}")
+
+    def _on_export_regions(self):
+        if not self._image: return
+
+        regions = []
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if getattr(ch, 'is_region', False) and ch.contour_data:
+                regions.append(ch)
+
+        if not regions:
+            QMessageBox.information(self, "Export", "No regions found to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Regions", "regions.geojson", "GeoJSON (*.geojson)")
+        if not path: return
+        if not path.endswith(".geojson"): path += ".geojson"
+
+        try:
+            import json
+            features = []
+
+            for ch in regions:
+                for label_id, data in ch.contour_data.items():
+                    polygons = data.get("polygons", [])
+                    if not polygons: continue
+
+                    coordinates = []
+                    for poly in polygons:
+                        ring = []
+                        for j in range(poly.count()):
+                            pt = poly.at(j)
+                            ring.append([pt.x(), pt.y()])
+                        # GeoJSON rings must be explicitly closed (first coord == last coord).
+                        # Strip any existing closing duplicate first, then re-append, to avoid
+                        # a double-closing point when the stored QPolygonF is already closed.
+                        if len(ring) >= 2 and ring[0][0] == ring[-1][0] and ring[0][1] == ring[-1][1]:
+                            ring = ring[:-1]
+                        if len(ring) < 3:
+                            continue
+                        ring.append(ring[0])  # explicit closure
+                        coordinates.append(ring)
+
+                    if not coordinates: continue
+
+                    feature = {
+                        "type": "Feature",
+                        "geometry": {"type": "Polygon", "coordinates": coordinates},
+                        "properties": {"objectType": "annotation", "name": ch.name}
+                    }
+                    if len(coordinates) > 1:
+                        feature["geometry"]["type"] = "MultiPolygon"
+                        feature["geometry"]["coordinates"] = [[ring] for ring in coordinates]
+                    features.append(feature)
+
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({"type": "FeatureCollection", "features": features}, f)
+
+            self._status.showMessage(f"Saved {len(features)} regions to {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Export Error", f"Could not save regions: {e}")
+
+    def _on_import_regions(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Regions", "", "GeoJSON (*.geojson);;All files (*)")
+        if not path: return
+
+        try:
+            import json
+            from PySide6.QtGui import QPolygonF
+            from opal_studio.channel_model import generate_spaced_colors
+
+            with open(path, 'r', encoding='utf-8') as f:
+                geojson_data = json.load(f)
+
+            features = geojson_data.get("features", [])
+            if not features:
+                QMessageBox.information(self, "Load Regions", "No features found in GeoJSON file.")
+                return
+
+            existing_regions = sum(
+                1 for i in range(self._channel_model.rowCount())
+                if getattr(self._channel_model.channel(i), 'is_region', False)
+            )
+            colors = generate_spaced_colors(len(features) + existing_regions + 1)
+
+            imported_count = 0
+            for feat in features:
+                geom = feat.get("geometry", {})
+                props = feat.get("properties", {})
+                name = props.get("name", f"Region {existing_regions + imported_count + 1}")
+                geom_type = geom.get("type", "")
+                coords = geom.get("coordinates", [])
+
+                if geom_type == "Polygon" and coords:
+                    ring_coords = coords[0]
+                elif geom_type == "MultiPolygon" and coords:
+                    ring_coords = coords[0][0]
+                else:
+                    continue
+
+                points = [QPointF(c[0], c[1]) for c in ring_coords]
+                # Normalise: strip any existing closing duplicate, then always re-append it.
+                # This matches the format that _simplify_contour produces for drawn regions,
+                # so drawPolyline renders a visually closed shape.
+                if len(points) >= 2 and points[0].x() == points[-1].x() and points[0].y() == points[-1].y():
+                    points = points[:-1]
+                if len(points) < 3:
+                    continue
+                points.append(points[0])  # explicit closure — first == last
+
+                qpoly = QPolygonF(points)
+                xs = [pt.x() for pt in points]
+                ys = [pt.y() for pt in points]
+                contour_data = {1: {"polygons": [qpoly], "bbox": [min(ys), min(xs), max(ys), max(xs)]}}
+
+                rgb = colors[(existing_regions + imported_count) % len(colors)]
+                new_ch = Channel(
+                    name=self._channel_model.get_unique_name(name),
+                    color=QColor(*rgb),
+                    visible=True,
+                    is_region=True,
+                    contour_data=contour_data,
+                    index=-1
+                )
+                self._channel_model.add_channel(new_ch)
+                imported_count += 1
+
+            self._status.showMessage(f"Loaded {imported_count} regions from {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Import Error", f"Could not load regions: {e}")
+
+    def _on_export_types(self):
+        if not self._image: return
+
+        masks = []
+        names = []
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_type_mask and ch.mask_data is not None:
+                masks.append(ch.mask_data)
+                names.append("Type: " + ch.name)
+
+        if not masks:
+            QMessageBox.information(self, "Export", "No cell type masks found to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Types", "", "OME-TIFF (*.ome.tif *.ome.tiff)")
+        if not path: return
+        if not path.lower().endswith(".ome.tif") and not path.lower().endswith(".ome.tiff"):
+            path += ".ome.tif"
+
+        try:
+            data = np.stack(masks).astype(np.uint8)
+            tifffile.imwrite(
+                path,
+                data,
+                ome=True,
+                metadata={'axes': 'CYX', 'Channel': {'Name': names}},
+                compression='zlib'
+            )
+            self._status.showMessage(f"Saved {len(masks)} type masks to {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Export Error", f"Could not save types: {e}")
+
+    def _on_import_types(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Types", "", "Images (*.ome.tif *.ome.tiff *.tif *.tiff)")
+        if not path: return
+
+        try:
+            from opal_studio.channel_model import generate_spaced_colors
+
+            with tifffile.TiffFile(path) as tif:
+                data = tif.series[0].asarray()
+                if data.ndim == 2:
+                    data = data[np.newaxis, ...]
+
+                names = []
+                try:
+                    ome_xml = tif.ome_metadata
+                    if ome_xml:
+                        root = ET.fromstring(ome_xml)
+                        channels = root.findall(".//ome:Channel", {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"})
+                        if not channels:
+                            channels = root.findall(".//{*}Channel")
+                        for ch_xml in channels:
+                            names.append(ch_xml.get("Name") or ch_xml.get("ID"))
+                except Exception:
+                    pass
+
+                for i in range(len(names), data.shape[0]):
+                    names.append(f"Type {i}")
+
+            colors = generate_spaced_colors(data.shape[0])
+
+            imported_count = 0
+            for i in range(data.shape[0]):
+                name = names[i]
+                clean_name = name[len("Type: "):] if name.startswith("Type: ") else name
+                new_ch = Channel(
+                    name=clean_name,
+                    color=QColor(*colors[i % len(colors)]),
+                    visible=True,
+                    is_type_mask=True,
+                    mask_data=data[i].astype(np.int32),
+                    index=-1
+                )
+                self._channel_model.add_channel(new_ch)
+                imported_count += 1
+
+            self._status.showMessage(f"Loaded {imported_count} type masks from {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Import Error", f"Could not load types: {e}")
+
     @staticmethod
     def _quick_percentile_range(img: ImageData, channel: int) -> tuple[float, float]:
         if not img.levels: return 0.0, 1.0
@@ -686,6 +1021,68 @@ class MainWindow(QMainWindow):
         )
         self._channel_model.add_channel(new_ch)
         self._status.showMessage(f"Generated: {new_name}", 3000)
+
+    # ------------------------------------------------------------------
+    # Brightfield generation
+    # ------------------------------------------------------------------
+
+    def _run_brightfield(self, params: dict):
+        if not self._image: return
+
+        def _run():
+            try:
+                from multiplex2brightfield import convert
+                from multiplex2brightfield.configuration_presets import GetConfiguration
+
+                preset = params.get("preset", "H&E")
+                config = GetConfiguration(preset)
+
+                channel_names = []
+                channels_data = []
+                for i in range(self._channel_model.rowCount()):
+                    ch = self._channel_model.channel(i)
+                    if ch.is_mask or ch.is_cell_mask or ch.is_type_mask or getattr(ch, 'is_region', False):
+                        continue
+                    if ch.is_processed and ch.processed_data is not None:
+                        data = ch.processed_data.astype(np.float32)
+                    else:
+                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                    channels_data.append(data)
+                    channel_names.append(ch.name)
+
+                if not channels_data:
+                    self.segmentationError.emit("No image channels found for brightfield generation.")
+                    return
+
+                # convert expects (n_slices, n_channels, H, W); single slice = (1, C, H, W)
+                imc_image = np.stack(channels_data, axis=0)[np.newaxis]
+
+                result = convert(
+                    imc_image,
+                    output_filename=None,
+                    channel_names=channel_names,
+                    config=config,
+                    AI_enhancement=False,
+                )
+                # result: (1, 3, H, W) -> (H, W, 3) uint8
+                rgb = np.transpose(result[0], (1, 2, 0)).astype(np.uint8)
+                self.brightfieldResultReady.emit(rgb)
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.segmentationError.emit(str(e))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @Slot(object)
+    def _on_brightfield_complete(self, rgb_array):
+        self._ops_panel.stop_loading()
+        self._brightfield_view.set_image(rgb_array)
+        for i in range(self._center_tabs.count()):
+            if self._center_tabs.tabText(i) == "Brightfield":
+                self._center_tabs.setCurrentIndex(i)
+                break
+        self._status.showMessage("Brightfield image generated", 3000)
 
     # ------------------------------------------------------------------
     # Segmentation
@@ -988,7 +1385,16 @@ class MainWindow(QMainWindow):
 
     def _on_segmentation_complete(self, labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut=None, random_colors=True, aux_labels=None):
         self._ops_panel.stop_loading()
-        
+
+        # For cell masks with no explicit target, overwrite any existing mask
+        # for the same marker rather than accumulating duplicates.
+        if is_cell_mask and target_idx < 0 and source_marker:
+            for i in range(self._channel_model.rowCount()):
+                ch = self._channel_model.channel(i)
+                if ch.is_cell_mask and ch.source_marker == source_marker:
+                    target_idx = i
+                    break
+
         if target_idx >= 0:
             # Update existing
             try:
@@ -1368,12 +1774,21 @@ class MainWindow(QMainWindow):
         if len(cell_ids):
             pos_lut[cell_ids] = np.where(means_lut[cell_ids] >= threshold, 2, 1).astype(np.int16)
 
+        # If no registered target yet, check for an existing cell mask for this marker
+        if target_ch_idx == -1:
+            for i in range(self._channel_model.rowCount()):
+                existing = self._channel_model.channel(i)
+                if existing.is_cell_mask and existing.source_marker == ch_name:
+                    target_ch_idx = i
+                    thresh_tab.register_generated_channel(ch_model_idx, i)
+                    break
+
         if target_ch_idx != -1:
             # Update existing channel in-place
             try:
                 tgt_ch = self._channel_model.channel(target_ch_idx)
-                tgt_ch.mask_data = working_labels   # Use working labels
-                tgt_ch.pos_lut = pos_lut    # Store states separately
+                tgt_ch.mask_data = working_labels
+                tgt_ch.pos_lut = pos_lut
                 idx_qt = self._channel_model.index(target_ch_idx)
                 self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
                 self._channel_model.channels_changed.emit()
@@ -1889,6 +2304,24 @@ class MainWindow(QMainWindow):
                 self._status.showMessage(f"X: {x}, Y: {y}")
         else:
             self._status.clearMessage()
+
+    def _sync_canvas_to_brightfield(self, vp):
+        if self._viewport_syncing:
+            return
+        self._viewport_syncing = True
+        try:
+            self._brightfield_view.set_image_viewport(vp)
+        finally:
+            self._viewport_syncing = False
+
+    def _sync_brightfield_to_canvas(self, vp):
+        if self._viewport_syncing:
+            return
+        self._viewport_syncing = True
+        try:
+            self._canvas.set_image_viewport(vp)
+        finally:
+            self._viewport_syncing = False
 
     @Slot(list)
     def _on_region_drawn(self, points: list[QPointF]):

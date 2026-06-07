@@ -232,7 +232,7 @@ class MainWindow(QMainWindow):
         save_cells_act.triggered.connect(lambda: self._on_export_masks(target="cell"))
         file_menu.addAction(save_cells_act)
 
-        save_contours_act = QAction("Save Con&tours (GeoJSON)…", self)
+        save_contours_act = QAction("Save Con&tours…", self)
         save_contours_act.triggered.connect(self._on_export_contours)
         file_menu.addAction(save_contours_act)
 

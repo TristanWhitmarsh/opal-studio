@@ -176,6 +176,7 @@ class ImageCanvas(QWidget):
     ZOOM_FACTOR = 1.15
     pixelHovered = Signal(int, int)
     regionDrawn = Signal(list)
+    viewportChanged = Signal(QRectF)   # emitted on user zoom/pan
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
@@ -310,6 +311,14 @@ class ImageCanvas(QWidget):
     @Slot(float)
     def set_simplification_epsilon(self, val: float):
         self._simplification_epsilon = val
+
+    def set_image_viewport(self, vp: QRectF):
+        """Set viewport from an external source without emitting viewportChanged (avoids sync loops)."""
+        if not self._img or vp.width() <= 0 or vp.height() <= 0:
+            return
+        self._viewport = vp
+        self._schedule_render(immediate_progressive=True)
+        self.update()
 
     def _simplify_contour(self, points: list[QPointF], epsilon: float) -> list[QPointF]:
         """Apply Ramer-Douglas-Peucker (RDP) algorithm to simplify the contour."""
@@ -658,8 +667,14 @@ class ImageCanvas(QWidget):
 
         new_w = self._viewport.width()  * factor
         new_h = self._viewport.height() * factor
+        # Clamp zoom: don't go below 1 px visible or above 20× the image size
         if new_w < 1 or new_h < 1:
             return
+        if self._img:
+            axes = self._img._tif.series[0].axes.upper() if self._img._tif else ""
+            ih, iw = _get_yx(self._img.base_shape, axes, self._img.is_rgb)
+            if new_w > iw * 20 or new_h > ih * 20:
+                return
 
         frac_x = mx / max(self.width(), 1)
         frac_y = my / max(self.height(), 1)
@@ -670,6 +685,7 @@ class ImageCanvas(QWidget):
         )
         self._schedule_render(immediate_progressive=True)
         self.update()
+        self.viewportChanged.emit(QRectF(self._viewport))
 
     # ── Pan ───────────────────────────────────────────────────────────────────
 
@@ -699,10 +715,10 @@ class ImageCanvas(QWidget):
         spp = self._screen_pixels_per_image_pixel()
         if spp > 0:
             mx, my = event.position().x(), event.position().y()
-            self.pixelHovered.emit(
-                int(self._viewport.left() + mx / spp),
-                int(self._viewport.top()  + my / spp),
-            )
+            _I32 = 2**31 - 1
+            px = max(-_I32, min(_I32, int(self._viewport.left() + mx / spp)))
+            py = max(-_I32, min(_I32, int(self._viewport.top()  + my / spp)))
+            self.pixelHovered.emit(px, py)
             
         if getattr(self, "_draw_mode", False) and getattr(self, "_dragging_point", False):
             mx, my = event.position().x(), event.position().y()
@@ -745,6 +761,7 @@ class ImageCanvas(QWidget):
             )
             self._schedule_render(immediate_progressive=True)
             self.update()
+            self.viewportChanged.emit(QRectF(self._viewport))
         elif getattr(self, "_draw_mode", False):
             if spp > 0:
                 mx, my = event.position().x(), event.position().y()
