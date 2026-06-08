@@ -85,7 +85,7 @@ def parallel_analysis_n_components(
 def run_tsne(
     data: np.ndarray,
     perplexity: float = 30.0,
-    n_iter: int = 1000,
+    max_iter: int = 1000,
     random_state: int = 42,
 ) -> np.ndarray:
     """Run t-SNE on *data* (n_cells × n_features) and return 2-D embedding."""
@@ -97,7 +97,7 @@ def run_tsne(
     tsne = TSNE(
         n_components=2,
         perplexity=actual_perplexity,
-        n_iter=n_iter,
+        max_iter=max_iter,
         random_state=random_state,
         init="pca",
         learning_rate="auto",
@@ -109,7 +109,6 @@ def run_umap(
     data: np.ndarray,
     n_neighbors: int = 15,
     min_dist: float = 0.1,
-    random_state: int = 42,
 ) -> np.ndarray | None:
     """Run UMAP on *data* and return 2-D embedding, or None if umap-learn is absent."""
     try:
@@ -124,6 +123,5 @@ def run_umap(
         n_components=2,
         n_neighbors=actual_neighbors,
         min_dist=min_dist,
-        random_state=random_state,
     )
     return reducer.fit_transform(data)
