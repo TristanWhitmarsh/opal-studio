@@ -105,10 +105,11 @@ class MainWindow(QMainWindow):
     preprocessingError = Signal(str)
     operationProgress = Signal(int, int)
     operationFinished = Signal(int)
-    thresholdMeansReady = Signal(object, object, object, int)  # labels, cell_means dict, otsu dict, mask_model_idx
+    thresholdMeansReady = Signal(object, object, object, int)  # labels, cell_means dict, all_thresholds dict, mask_model_idx
     clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
     clusteringDimReductionReady = Signal(object, object, object, object)  # tsne_coords, umap_coords, cluster_labels, cluster_colors
     clusteringMetricsReady = Signal(str)
+    clusterTypesIdentified = Signal(object)  # dict[int, str]  cluster_id -> type_name
     brightfieldResultReady = Signal(object)  # (H, W, 3) uint8 ndarray
 
     def __init__(self):
@@ -131,6 +132,9 @@ class MainWindow(QMainWindow):
         self._umap_tab = ScatterPlotTab("UMAP")
         self._brightfield_view = BrightfieldView(self._channel_model)
         self._active_cluster_ids: list[int] = []
+        self._cluster_cell_ids: "np.ndarray | None" = None
+        self._cluster_labels_arr: "np.ndarray | None" = None
+        self._cluster_working_labels: "np.ndarray | None" = None
 
         # Signals
         self._ops_panel.runSegmentationRequested.connect(self._start_segmentation)
@@ -141,12 +145,14 @@ class MainWindow(QMainWindow):
         self._ops_panel.runCellPositivityRequested.connect(self._run_cell_positivity)
         self._ops_panel.runCellIdentificationRequested.connect(self._run_cell_identification)
         self._ops_panel.runClusteringRequested.connect(self._run_clustering)
+        self._ops_panel.runClusterCellIdentificationRequested.connect(self._run_cluster_cell_identification)
         self._ops_panel.runThresholdComputeRequested.connect(self._run_threshold_compute)
         self._ops_panel.applyThresholdRequested.connect(self._apply_threshold_positivity)
         self.operationProgress.connect(self._ops_panel.set_progress_info)
         self.operationFinished.connect(self._on_operation_complete)
         self.thresholdMeansReady.connect(self._on_threshold_means_ready)
         self.clusteringHeatmapReady.connect(self._on_clustering_heatmap_ready)
+        self.clusterTypesIdentified.connect(self._on_cluster_types_identified)
         self.clusteringDimReductionReady.connect(self._on_dim_reduction_ready)
         self.clusteringMetricsReady.connect(self._ops_panel.set_clustering_metrics)
         self._clustering_heatmap_tab.clusterRenamed.connect(self._on_cluster_renamed)
@@ -1384,7 +1390,10 @@ class MainWindow(QMainWindow):
         self._segmentation_thread.start()
 
     def _on_segmentation_complete(self, labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut=None, random_colors=True, aux_labels=None):
-        self._ops_panel.stop_loading()
+        # Type masks arrive one-per-cluster/type while the background thread is still running.
+        # operationFinished handles stop_loading() for those batches.
+        if not is_type_mask:
+            self._ops_panel.stop_loading()
 
         # For cell masks with no explicit target, overwrite any existing mask
         # for the same marker rather than accumulating duplicates.
@@ -1640,6 +1649,7 @@ class MainWindow(QMainWindow):
             return
 
         mask_idx = params["mask_index"]
+        method = params.get("method", "otsu")
         mask_ch = self._channel_model.channel(mask_idx)
         labels = mask_ch.mask_data
         if labels is None:
@@ -1649,7 +1659,19 @@ class MainWindow(QMainWindow):
         def _run():
             try:
                 from opal_studio.image_loader import _get_yx
-                from skimage.filters import threshold_otsu
+                from skimage.filters import (
+                    threshold_otsu, threshold_triangle, threshold_li,
+                    threshold_yen, threshold_isodata,
+                )
+
+                THRESH_METHODS = {
+                    "otsu":     threshold_otsu,
+                    "triangle": threshold_triangle,
+                    "li":       threshold_li,
+                    "yen":      threshold_yen,
+                    "isodata":  threshold_isodata,
+                }
+                thresh_fn = THRESH_METHODS.get(method, threshold_otsu)
 
                 # Handle binary masks (e.g. from Expansion) by using aux labels or re-labeling
                 working_labels = labels
@@ -1671,7 +1693,7 @@ class MainWindow(QMainWindow):
                 max_label = int(working_labels.max())
 
                 cell_means: dict[int, np.ndarray] = {}
-                otsu_thresholds: dict[int, float] = {}
+                thresholds: dict[int, float] = {}
 
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
 
@@ -1695,7 +1717,7 @@ class MainWindow(QMainWindow):
                     means_list = ndi.mean(dat_crop, labels=lab_crop, index=cell_ids)
                     if not isinstance(means_list, np.ndarray):
                         means_list = np.array([means_list])
-                    
+
                     # Clean NaNs (labels that weren't found in the crop)
                     means_list = np.nan_to_num(means_list)
 
@@ -1705,19 +1727,19 @@ class MainWindow(QMainWindow):
 
                     cell_means[i] = means_lut
 
-                    # Otsu on the per-cell means (ignore background zeros)
+                    # Compute threshold using the selected method (ignore background zeros)
                     valid_means = means_lut[cell_ids]
                     valid_means = valid_means[valid_means > 0]
                     if valid_means.size > 1:
                         try:
-                            val = threshold_otsu(valid_means)
+                            val = thresh_fn(valid_means)
                             if not np.isnan(val):
-                                otsu_thresholds[i] = float(val)
+                                thresholds[i] = float(val)
                         except Exception:
                             pass
-                
+
                 # Deliver to main thread
-                self.thresholdMeansReady.emit(working_labels, cell_means, otsu_thresholds, mask_idx)
+                self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -1726,10 +1748,10 @@ class MainWindow(QMainWindow):
         threading.Thread(target=_run, daemon=True).start()
 
     @Slot(object, object, object, int)
-    def _on_threshold_means_ready(self, labels, cell_means, otsu_thresholds, mask_model_idx):
+    def _on_threshold_means_ready(self, labels, cell_means, thresholds, mask_model_idx):
         """Deliver computed means to the Thresholds tab (main thread)."""
         self._ops_panel.stop_loading()
-        self._ops_panel._thresh_tab.receive_means(labels, cell_means, otsu_thresholds, mask_model_idx)
+        self._ops_panel._thresh_tab.receive_means(labels, cell_means, thresholds, mask_model_idx)
 
     @Slot(dict)
     def _apply_threshold_positivity(self, params: dict):
@@ -1816,6 +1838,120 @@ class MainWindow(QMainWindow):
         # Register so future slider moves update in-place
         thresh_tab.register_generated_channel(ch_model_idx, new_idx)
         self._status.showMessage(f"Threshold positivity: {new_name}", 3000)
+
+    @Slot(dict)
+    def _run_cluster_cell_identification(self, params: dict):
+        """Rename existing cluster channels to their identified cell types."""
+        if not self._image:
+            self._ops_panel.stop_loading()
+            return
+
+        if self._cluster_cell_ids is None or self._cluster_labels_arr is None:
+            self._ops_panel.stop_loading()
+            self.statusBar().showMessage("Run clustering first.", 5000)
+            return
+
+        definitions = self._phenotyping_tab.get_phenotype_definitions()
+        if not definitions:
+            self._ops_panel.stop_loading()
+            self.statusBar().showMessage("No cell types defined in the Phenotyping tab.", 5000)
+            return
+
+        pos_cutoff = params.get("positive_fraction_cutoff", 0.60)
+        neg_cutoff = params.get("negative_fraction_cutoff", 0.20)
+
+        # Collect per-marker positivity LUTs on main thread (safe Qt model access)
+        marker_luts: dict[str, np.ndarray] = {}
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_cell_mask and ch.pos_lut is not None:
+                key = ch.source_marker if ch.source_marker else ch.name
+                marker_luts[key] = ch.pos_lut
+
+        if not marker_luts:
+            self._ops_panel.stop_loading()
+            self.statusBar().showMessage(
+                "No positivity masks found. Run thresholding first.", 5000
+            )
+            return
+
+        cell_ids       = self._cluster_cell_ids
+        cluster_labels = self._cluster_labels_arr
+
+        def _run():
+            try:
+                real_clusters = np.unique(cluster_labels)
+                real_clusters = real_clusters[real_clusters >= 0]
+
+                # Step 1: per-cluster, per-marker positivity fraction → state
+                # State: 1 = positive, 2 = negative, 0 = neutral/mixed
+                cluster_states: dict[int, dict[str, int]] = {}
+                for cluster_id in real_clusters:
+                    cells = cell_ids[cluster_labels == cluster_id]
+                    states_for_cluster: dict[str, int] = {}
+                    for marker_name, lut in marker_luts.items():
+                        max_cell = int(cells.max()) if len(cells) else 0
+                        if max_cell >= len(lut):
+                            safe_lut = np.zeros(max_cell + 1, dtype=np.int16)
+                            safe_lut[:len(lut)] = lut
+                        else:
+                            safe_lut = lut
+                        cell_states = safe_lut[cells]
+                        valid = cell_states[cell_states > 0]
+                        if len(valid) == 0:
+                            states_for_cluster[marker_name] = 0
+                            continue
+                        pos_fraction = float(np.sum(valid == 2)) / len(valid)
+                        if pos_fraction >= pos_cutoff:
+                            states_for_cluster[marker_name] = 1
+                        elif pos_fraction <= neg_cutoff:
+                            states_for_cluster[marker_name] = 2
+                        else:
+                            states_for_cluster[marker_name] = 0
+                    cluster_states[int(cluster_id)] = states_for_cluster
+
+                # Step 2: match each cluster to the first matching phenotype
+                cluster_to_type: dict[int, str] = {}
+                for cluster_id in real_clusters:
+                    c_states = cluster_states[int(cluster_id)]
+                    assigned = None
+                    for type_name, criteria in definitions.items():
+                        if not criteria:
+                            continue
+                        if all(c_states.get(m, 0) == req for m, req in criteria.items()):
+                            assigned = type_name
+                            break
+                    cluster_to_type[int(cluster_id)] = assigned or "Unknown"
+
+                self.clusterTypesIdentified.emit(cluster_to_type)
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.segmentationError.emit(f"Cluster identification error: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @Slot(object)
+    def _on_cluster_types_identified(self, cluster_to_type: dict):
+        """Rename existing cluster channels and heatmap columns to identified cell types."""
+        # Snapshot current heatmap names before modifying anything
+        current_names = self._clustering_heatmap_tab.get_cluster_names()
+
+        for cluster_id, type_name in cluster_to_type.items():
+            old_name = current_names.get(cluster_id, f"Cluster {cluster_id}")
+            for i in range(self._channel_model.rowCount()):
+                ch = self._channel_model.channel(i)
+                if ch.is_type_mask and ch.name == old_name:
+                    ch.name = type_name
+                    idx_qt = self._channel_model.index(i)
+                    self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+                    break
+
+        self._clustering_heatmap_tab.rename_clusters(cluster_to_type)
+        self._ops_panel.stop_loading()
+        self.statusBar().showMessage(
+            f"Identified {len(cluster_to_type)} clusters.", 5000
+        )
 
     def _run_cell_identification(self):
         """Perform logical gating based on phenotyping definitions in a background thread."""
@@ -1933,6 +2069,7 @@ class MainWindow(QMainWindow):
             ch = self._channel_model.channel(i)
             if ch.is_type_mask:
                 self._channel_model.remove_channel(i)
+        self._clustering_heatmap_tab.clear()
         self._tsne_tab.clear()
         self._umap_tab.clear()
 
@@ -2113,6 +2250,11 @@ class MainWindow(QMainWindow):
                         noise_data, "Noise", False, QColor(128, 128, 128), None, "", True, -1, None, False, None
                     )
 
+                # Store for cluster-based cell identification
+                self._cluster_cell_ids     = cell_ids
+                self._cluster_labels_arr   = cluster_labels
+                self._cluster_working_labels = working_labels
+
                 # ── Emit heatmap data ─────────────────────────────────────
                 # Compute per-cluster mean of the ORIGINAL (pre-norm) data
                 heatmap = np.zeros((len(real_clusters), len(channel_names)), dtype=np.float32)
@@ -2227,12 +2369,30 @@ class MainWindow(QMainWindow):
     @Slot(object, object, object)
     def _on_channel_data_changed(self, top_left, bottom_right, roles):
         from opal_studio.channel_model import ChannelListModel
-        if roles and ChannelListModel.ColorRole not in roles:
-            return
         row = top_left.row()
         ch = self._channel_model.channel(row)
-        if ch and ch.is_type_mask:
+        if not ch or not ch.is_type_mask:
+            return
+        if not roles or ChannelListModel.ColorRole in roles:
             self._sync_scatter_colors()
+        if not roles or ChannelListModel.VisibleRole in roles:
+            self._sync_scatter_visibility()
+
+    def _sync_scatter_visibility(self):
+        """Hide/show clusters in scatter plots to match type mask visibility."""
+        if not self._active_cluster_ids:
+            return
+        hidden: set[int] = set()
+        type_idx = 0
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_type_mask:
+                if type_idx < len(self._active_cluster_ids):
+                    if not ch.visible:
+                        hidden.add(self._active_cluster_ids[type_idx])
+                type_idx += 1
+        self._tsne_tab.set_hidden_clusters(hidden)
+        self._umap_tab.set_hidden_clusters(hidden)
 
     def _sync_scatter_colors(self):
         """Rebuild the cluster→color map from current type mask channels and repaint."""
@@ -2251,10 +2411,9 @@ class MainWindow(QMainWindow):
             self._tsne_tab.update_colors(new_colors)
             self._umap_tab.update_colors(new_colors)
 
-    @Slot(int, str)
-    def _on_cluster_renamed(self, cluster_id: int, new_name: str):
+    @Slot(int, str, str)
+    def _on_cluster_renamed(self, _cluster_id: int, old_name: str, new_name: str):
         """Rename the type mask channel that corresponds to a cluster."""
-        old_name = f"Cluster {cluster_id}"
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
             if ch.is_type_mask and ch.name == old_name:

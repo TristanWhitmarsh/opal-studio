@@ -90,8 +90,8 @@ class ClusteringHeatmapTab(QWidget):
     Columns = clusters (editable via double-clicking the horizontal header)
     """
 
-    # Emitted when the user renames a cluster: (cluster_id, new_name)
-    clusterRenamed = Signal(int, str)
+    # Emitted when the user renames a cluster: (cluster_id, old_name, new_name)
+    clusterRenamed = Signal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -164,10 +164,8 @@ class ClusteringHeatmapTab(QWidget):
         self._channel_names = list(channel_names)
         self._heatmap_data = heatmap_data.copy()
 
-        # Initialise cluster names (preserve any previous user edits)
-        for cid in self._cluster_ids:
-            if cid not in self._cluster_names:
-                self._cluster_names[cid] = f"Cluster {cid}"
+        # Always reset names to defaults on a new clustering run.
+        self._cluster_names = {cid: f"Cluster {cid}" for cid in self._cluster_ids}
 
         self._info_label.setVisible(False)
         self._table.setVisible(True)
@@ -187,6 +185,18 @@ class ClusteringHeatmapTab(QWidget):
     def get_cluster_names(self) -> dict[int, str]:
         """Return a mapping of cluster_id -> user-assigned name."""
         return dict(self._cluster_names)
+
+    def rename_clusters(self, mapping: dict[int, str]) -> None:
+        """Bulk-rename clusters and refresh the table.
+
+        Parameters
+        ----------
+        mapping : {cluster_id: new_name}
+            Only the supplied cluster IDs are renamed; others are untouched.
+        """
+        for cid, name in mapping.items():
+            self._cluster_names[cid] = name
+        self._rebuild_table()
 
     # ------------------------------------------------------------------
     # Internals
@@ -293,7 +303,7 @@ class ClusteringHeatmapTab(QWidget):
             if new_name and new_name != old_name:
                 self._cluster_names[cid] = new_name
                 self._rebuild_table()
-                self.clusterRenamed.emit(cid, new_name)
+                self.clusterRenamed.emit(cid, old_name, new_name)
             edit.deleteLater()
             
         edit.editingFinished.connect(finish_edit)

@@ -1464,7 +1464,7 @@ class ThresholdPositivityTab(QWidget):
         self._cell_means: dict[int, np.ndarray] = {}
         self._labels: np.ndarray | None = None          # the label map used for compute
         self._mask_model_index: int = -1                # which mask channel was used
-        self._otsu_thresholds: dict[int, float] = {}    # ch_model_idx → otsu threshold
+        self._thresholds: dict[int, float] = {}  # ch_model_idx → threshold for the last-run method
         self._generated_ch_indices: dict[int, int] = {} # ch_model_idx → result channel model idx
 
         layout = QVBoxLayout(self)
@@ -1484,6 +1484,19 @@ class ThresholdPositivityTab(QWidget):
         self._mask_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._mask_combo.setMinimumWidth(50)
         form.addRow("Mask:", self._mask_combo)
+
+        # Method picker (always visible — chosen before running)
+        self._method_combo = QComboBox()
+        self._method_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for label, key in [
+            ("Otsu",     "otsu"),
+            ("Triangle", "triangle"),
+            ("Li",       "li"),
+            ("Yen",      "yen"),
+            ("IsoData",  "isodata"),
+        ]:
+            self._method_combo.addItem(label, key)
+        form.addRow("Method:", self._method_combo)
         layout.addLayout(form)
 
         self._get_btn = QPushButton("Get Thresholds")
@@ -1496,23 +1509,9 @@ class ThresholdPositivityTab(QWidget):
         ctrl_lay.setContentsMargins(0, 6, 0, 0)
         ctrl_lay.setSpacing(6)
 
-        ctrl_form = QFormLayout()
-        ctrl_form.setContentsMargins(0, 0, 0, 0)
-        ctrl_form.setSpacing(6)
-        ctrl_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
-        ctrl_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        ctrl_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        ctrl_form.setHorizontalSpacing(4)
-
-        self._channel_combo = QComboBox()
-        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._channel_combo.currentIndexChanged.connect(self._on_channel_changed)
-        ctrl_form.addRow("Channel:", self._channel_combo)
-        ctrl_lay.addLayout(ctrl_form)
-
         # Threshold value input
         thresh_row = QHBoxLayout()
-        thresh_row.addWidget(QLabel("Threshold:"))
+        thresh_row.addWidget(QLabel("Selected marker threshold:"))
         self._thresh_input = QLineEdit()
         self._thresh_input.setFixedWidth(80)
         self._thresh_input.setValidator(QDoubleValidator())
@@ -1540,6 +1539,7 @@ class ThresholdPositivityTab(QWidget):
         self._channel_model.modelReset.connect(self._refresh_masks)
         self._channel_model.rowsInserted.connect(lambda: self._refresh_masks())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_masks())
+        self._channel_model.dataChanged.connect(self._on_model_data_changed)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1562,9 +1562,10 @@ class ThresholdPositivityTab(QWidget):
         self._get_btn.setEnabled(False)
         self._controls.setVisible(False)
         mask_idx = self._mask_combo.currentData()
-        self.runThresholdComputeRequested.emit({"mask_index": mask_idx})
+        method = self._method_combo.currentData()
+        self.runThresholdComputeRequested.emit({"mask_index": mask_idx, "method": method})
 
-    def receive_means(self, labels, cell_means: dict, otsu_thresholds: dict, mask_model_index: int):
+    def receive_means(self, labels, cell_means: dict, thresholds: dict, mask_model_index: int):
         """
         Called from MainWindow (main thread via signal) when per-cell
         means are ready.
@@ -1573,34 +1574,21 @@ class ThresholdPositivityTab(QWidget):
         ----------
         labels            : (H,W) int32 label map
         cell_means        : {ch_model_idx: np.ndarray[max_label+1]}  (index 0 = bg)
-        otsu_thresholds   : {ch_model_idx: float}
+        thresholds        : {ch_model_idx: float}  — one threshold per channel
         mask_model_index  : which mask channel was used
         """
         self._labels = labels
         self._cell_means = cell_means
-        self._otsu_thresholds = otsu_thresholds
+        self._thresholds = thresholds
         self._mask_model_index = mask_model_index
         self._generated_ch_indices = {}
 
-        # Populate channel dropdown with image channels that have means
-        prev = self._channel_combo.currentData()
-        self._channel_combo.blockSignals(True)
-        self._channel_combo.clear()
-        for ch_idx in sorted(cell_means.keys()):
-            ch = self._channel_model.channel(ch_idx)
-            self._channel_combo.addItem(ch.name, ch_idx)
-        self._channel_combo.blockSignals(False)
-
-        # Restore previous selection or default to first
-        restore = self._channel_combo.findData(prev)
-        self._channel_combo.setCurrentIndex(restore if restore >= 0 else 0)
-
-        # Apply Otsu thresholds for ALL channels immediately
-        for ch_idx, otsu in self._otsu_thresholds.items():
+        # Apply computed thresholds for ALL channels immediately
+        for ch_idx, thresh in self._thresholds.items():
             ch = self._channel_model.channel(ch_idx)
             self.applyThresholdRequested.emit({
                 "ch_model_index":   ch_idx,
-                "threshold":        otsu,
+                "threshold":        thresh,
                 "mask_index":       self._mask_model_index,
                 "ch_name":          ch.name,
                 "ch_color":         ch.color,
@@ -1609,16 +1597,32 @@ class ThresholdPositivityTab(QWidget):
 
         self._controls.setVisible(True)
         self._get_btn.setEnabled(True)
-        self._on_channel_changed()  # Sync slider to Otsu threshold
+        self._sync_slider()  # Sync slider to currently selected marker
 
-    def _on_channel_changed(self):
-        """Update slider range and position to the Otsu threshold for the selected channel."""
-        ch_idx = self._channel_combo.currentData()
+    def _get_active_ch_idx(self) -> int | None:
+        """Return the cell_means key for the currently selected positivity mask."""
+        sel = self._channel_model.selected_channel()
+        if sel is None or not sel.is_cell_mask:
+            return None
+        marker = sel.source_marker or sel.name
+        for ch_idx in self._cell_means:
+            if self._channel_model.channel(ch_idx).name == marker:
+                return ch_idx
+        return None
+
+    def _on_model_data_changed(self, top_left, bottom_right, roles):
+        """Sync slider when the selected channel changes in the Positivity tab."""
+        from opal_studio.channel_model import ChannelListModel
+        if ChannelListModel.SelectedRole in roles:
+            self._sync_slider()
+
+    def _sync_slider(self):
+        """Update slider range and position for the currently selected positivity mask."""
+        ch_idx = self._get_active_ch_idx()
         if ch_idx is None or ch_idx not in self._cell_means:
             return
         means = self._cell_means[ch_idx]
-        # means[0] = background; ignore it
-        valid = means[1:]
+        valid = means[1:]  # means[0] = background
         if valid.size == 0:
             return
         self._means_min = float(np.min(valid))
@@ -1626,11 +1630,10 @@ class ThresholdPositivityTab(QWidget):
         if self._means_max <= self._means_min:
             self._means_max = self._means_min + 1.0
 
-        # Set slider position to Otsu threshold (safely)
-        otsu = self._otsu_thresholds.get(ch_idx, (self._means_min + self._means_max) / 2)
+        auto = self._thresholds.get(ch_idx, (self._means_min + self._means_max) / 2)
         rng = self._means_max - self._means_min
-        if rng > 0 and not np.isnan(otsu):
-            slider_val = int((otsu - self._means_min) / rng * 1000)
+        if rng > 0 and not np.isnan(auto):
+            slider_val = int((auto - self._means_min) / rng * 1000)
             self._slider.blockSignals(True)
             self._slider.setValue(max(0, min(1000, slider_val)))
             self._slider.blockSignals(False)
@@ -1638,8 +1641,6 @@ class ThresholdPositivityTab(QWidget):
             self._slider.setValue(0)
 
         self._update_threshold_display()
-        # Apply immediately to show the Otsu result for this channel
-        self._emit_apply()
 
     def _on_slider_changed(self):
         self._update_threshold_display()
@@ -1649,13 +1650,11 @@ class ThresholdPositivityTab(QWidget):
         try:
             val = float(self._thresh_input.text())
             if hasattr(self, '_means_min') and hasattr(self, '_means_max') and self._means_max > self._means_min:
-                # Update slider position
                 frac = (val - self._means_min) / (self._means_max - self._means_min)
                 self._slider.blockSignals(True)
                 self._slider.setValue(max(0, min(1000, int(frac * 1000))))
                 self._slider.blockSignals(False)
-                # Update pos count display
-                ch_idx = self._channel_combo.currentData()
+                ch_idx = self._get_active_ch_idx()
                 means = self._cell_means.get(ch_idx)
                 if means is not None:
                     n_pos = int(np.sum(means[1:] >= val))
@@ -1669,12 +1668,11 @@ class ThresholdPositivityTab(QWidget):
         thresh = self._current_threshold()
         if thresh is None:
             return
-        # Count positive cells
-        ch_idx = self._channel_combo.currentData()
+        ch_idx = self._get_active_ch_idx()
         means = self._cell_means.get(ch_idx)
         if means is not None:
             n_pos = int(np.sum(means[1:] >= thresh))
-            n_total = int(np.sum(means[1:] > 0))  # cells with any signal
+            n_total = int(np.sum(means[1:] > 0))
             self._pos_count_label.setText(f"{n_pos}/{n_total}")
         self._thresh_input.blockSignals(True)
         self._thresh_input.setText(f"{thresh:.4g}")
@@ -1690,7 +1688,7 @@ class ThresholdPositivityTab(QWidget):
         thresh = self._current_threshold()
         if thresh is None or self._labels is None:
             return
-        ch_idx = self._channel_combo.currentData()
+        ch_idx = self._get_active_ch_idx()
         if ch_idx is None:
             return
         ch = self._channel_model.channel(ch_idx)
@@ -1715,7 +1713,8 @@ class ThresholdPositivityTab(QWidget):
 
 class ClusteringTab(QWidget):
     """Sub-widget for cell clustering parameters."""
-    runRequested = Signal(dict)
+    runRequested           = Signal(dict)
+    identifyCellsRequested = Signal(dict)
 
     def __init__(self, channel_model, parent=None):
         super().__init__(parent)
@@ -2023,6 +2022,48 @@ class ClusteringTab(QWidget):
             }
         """)
         layout.addWidget(self._metrics_output)
+
+        # ── Identify Cells from clusters ──────────────────────────────────────
+        id_line = QFrame()
+        id_line.setFrameShape(QFrame.Shape.HLine)
+        id_line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(id_line)
+
+        cutoff_form = QFormLayout()
+        cutoff_form.setContentsMargins(0, 0, 0, 0)
+        cutoff_form.setSpacing(4)
+        cutoff_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        cutoff_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        cutoff_form.setHorizontalSpacing(4)
+
+        from PySide6.QtWidgets import QDoubleSpinBox
+        self._pos_cutoff = QDoubleSpinBox()
+        self._pos_cutoff.setRange(0.0, 1.0)
+        self._pos_cutoff.setSingleStep(0.05)
+        self._pos_cutoff.setValue(0.60)
+        self._pos_cutoff.setDecimals(2)
+        self._pos_cutoff.setFixedWidth(70)
+        self._pos_cutoff.setToolTip(
+            "Clusters where ≥ this fraction of cells are positive are called positive for that marker."
+        )
+        cutoff_form.addRow("Positive cutoff:", self._pos_cutoff)
+
+        self._neg_cutoff = QDoubleSpinBox()
+        self._neg_cutoff.setRange(0.0, 1.0)
+        self._neg_cutoff.setSingleStep(0.05)
+        self._neg_cutoff.setValue(0.20)
+        self._neg_cutoff.setDecimals(2)
+        self._neg_cutoff.setFixedWidth(70)
+        self._neg_cutoff.setToolTip(
+            "Clusters where ≤ this fraction of cells are positive are called negative for that marker."
+        )
+        cutoff_form.addRow("Negative cutoff:", self._neg_cutoff)
+        layout.addLayout(cutoff_form)
+
+        self._identify_btn = QPushButton("Identify Cells")
+        self._identify_btn.clicked.connect(self._on_identify_cells)
+        layout.addWidget(self._identify_btn)
+
         layout.addStretch()
 
         self._refresh_channels()
@@ -2142,12 +2183,19 @@ class ClusteringTab(QWidget):
             params["metric"] = self._hc_metric.currentText()
         self.runRequested.emit(params)
 
+    def _on_identify_cells(self):
+        self.identifyCellsRequested.emit({
+            "positive_fraction_cutoff": self._pos_cutoff.value(),
+            "negative_fraction_cutoff": self._neg_cutoff.value(),
+        })
+
     def set_metrics(self, text: str) -> None:
         self._metrics_output.setPlainText(text)
 
     def setEnabled(self, enabled):
         super().setEnabled(enabled)
         self._run_btn.setEnabled(enabled)
+        self._identify_btn.setEnabled(enabled)
 
 
 class OperationsPanel(QWidget):
@@ -2159,10 +2207,11 @@ class OperationsPanel(QWidget):
     runSegmentationRequested = Signal(dict)
     runMaskProcessingRequested = Signal(dict)
     runCellPositivityRequested = Signal(dict)
-    runCellIdentificationRequested = Signal()
-    runClusteringRequested = Signal(dict)
-    runThresholdComputeRequested = Signal(dict)
-    applyThresholdRequested = Signal(dict)
+    runCellIdentificationRequested        = Signal()
+    runClusteringRequested                = Signal(dict)
+    runClusterCellIdentificationRequested = Signal(dict)
+    runThresholdComputeRequested          = Signal(dict)
+    applyThresholdRequested               = Signal(dict)
     segmentationFinished = Signal(object)
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
@@ -2407,6 +2456,7 @@ class OperationsPanel(QWidget):
         # Clustering Tab
         self._clustering_tab = ClusteringTab(self._channel_model)
         self._clustering_tab.runRequested.connect(self._on_run_clustering)
+        self._clustering_tab.identifyCellsRequested.connect(self._on_run_cluster_identify)
 
         self._ident_tabs.addTab(gating_tab, self._spacer_icon, "Gating")
         self._ident_tabs.addTab(self._clustering_tab, self._spacer_icon, "Clustering")
@@ -2515,6 +2565,11 @@ class OperationsPanel(QWidget):
         self._clustering_tab.setEnabled(False)
         self._progress.setVisible(True); self._progress.setRange(0, 0)
         self.runClusteringRequested.emit(params)
+
+    def _on_run_cluster_identify(self, params):
+        self._clustering_tab.setEnabled(False)
+        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self.runClusterCellIdentificationRequested.emit(params)
 
     def stop_loading(self):
         self._filter_tab.setEnabled(True)

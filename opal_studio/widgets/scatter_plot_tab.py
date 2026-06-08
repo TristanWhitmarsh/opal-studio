@@ -27,6 +27,7 @@ class _ScatterCanvas(QWidget):
         self._coords: np.ndarray | None = None      # (n, 2)
         self._labels: np.ndarray | None = None      # (n,) int
         self._colors: dict[int, tuple] = {}         # cluster_id -> (R, G, B)
+        self._hidden_clusters: set[int] = set()     # cluster_ids to skip in paint
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(200, 200)
 
@@ -40,16 +41,22 @@ class _ScatterCanvas(QWidget):
         self._coords = coords.astype(np.float32)
         self._labels = cluster_labels
         self._colors = dict(cluster_colors)
+        self._hidden_clusters = set()
         self.update()
 
     def update_colors(self, cluster_colors: dict[int, tuple]) -> None:
         self._colors = dict(cluster_colors)
         self.update()
 
+    def set_hidden_clusters(self, hidden_ids: set[int]) -> None:
+        self._hidden_clusters = set(hidden_ids)
+        self.update()
+
     def clear(self) -> None:
         self._coords = None
         self._labels = None
         self._colors = {}
+        self._hidden_clusters = set()
         self.update()
 
     # ------------------------------------------------------------------
@@ -95,6 +102,8 @@ class _ScatterCanvas(QWidget):
 
         r = self._POINT_RADIUS
         for lbl_id in np.unique(self._labels):
+            if int(lbl_id) in self._hidden_clusters:
+                continue
             rgb = self._colors.get(int(lbl_id), (180, 180, 180))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(QColor(*rgb)))
@@ -141,6 +150,9 @@ class ScatterPlotTab(QWidget):
 
     def update_colors(self, cluster_colors: dict[int, tuple]) -> None:
         self._canvas.update_colors(cluster_colors)
+
+    def set_hidden_clusters(self, hidden_ids: set[int]) -> None:
+        self._canvas.set_hidden_clusters(hidden_ids)
 
     def clear(self) -> None:
         self._canvas.clear()
