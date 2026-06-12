@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(cmd /c \"dir /b C:\\\\Users\\\\Tristan\\\\AppData\\\\Local\\\\miniforge3\\\\envs 2>nul & dir /b C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs 2>nul & dir /b C:\\\\Users\\\\Tristan\\\\anaconda3\\\\envs 2>nul\")",
-      "Bash(cmd /c \"dir /s /b converter.py 2>nul | findstr multiplex\")"
+      "Bash(cmd /c \"dir /s /b converter.py 2>nul | findstr multiplex\")",
+      "Bash(xargs grep -l \"save.*brightfield\\\\|export.*brightfield\")",
+      "Bash(python -c \"import multiplex2brightfield; import inspect; print\\(inspect.getfile\\(multiplex2brightfield\\)\\)\")",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import multiplex2brightfield; import inspect; print\\(inspect.getfile\\(multiplex2brightfield\\)\\)\")",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe -c \"import multiplex2brightfield; import inspect; print\\(inspect.getfile\\(multiplex2brightfield\\)\\)\")",
+      "PowerShell(& \"c:\\\\opal-studio\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import multiplex2brightfield; import inspect; print\\(inspect.getfile\\(multiplex2brightfield\\)\\)\")",
+      "Read(//c//**)"
     ]
   }
 }

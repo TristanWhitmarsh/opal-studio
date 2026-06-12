@@ -247,6 +247,7 @@ class ImageCanvas(QWidget):
         self._dragging_point = False
         self._drag_point_info = None
         self._hovered_point_info = None
+        self._hovered_edge_info = None
 
         # Ensure the worker thread is cleanly stopped when the application
         # exits, regardless of whether closeEvent is triggered.
@@ -257,33 +258,31 @@ class ImageCanvas(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_image(self, img: ImageData):
-        """Load a new image, clear all caches, fit to window."""
+    def set_image(self, img: ImageData, load_overview: bool = True):
+        """Load a new image, clear caches, and fit it to the window."""
         self._img = img
         self._tile_cache.clear()
         self._display_image = None
         self._display_viewport = QRectF()
         self._display_level_idx = -1
-        self._display_channel_version = 0
+        self._display_channel_version = -1
         self._progressive_image = None
         self._progressive_viewport = QRectF()
         self._progressive_level_idx = -1
         self._overview = None
-        self._channel_version = 0
-        self._seq = 0
-        self._pending_seq = -1
-
-        # Reset the worker's stale-check counters BEFORE posting any new render
-        # requests. Without this, all seq numbers (starting from 0) for the new
-        # image would be less than the high _latest_seq accumulated from the
-        # previous image and would be silently discarded as "stale".
-        self._worker.reset_sequence.emit()
+        # Keep both counters monotonic across images. A render from the previous
+        # slice can then never be accepted for the newly selected slice.
+        self._channel_version += 1
+        self._pending_seq = self._seq
 
         axes = img._tif.series[0].axes.upper() if img._tif else ""
         h, w = _get_yx(img.base_shape, axes, img.is_rgb)
         self._viewport = QRectF(0, 0, w, h)
         self._fit_viewport()
-        self._load_overview()
+        if load_overview:
+            self._load_overview()
+        else:
+            self.update()
         self._schedule_render()
 
     # ── Channel change ────────────────────────────────────────────────────────
@@ -305,6 +304,7 @@ class ImageCanvas(QWidget):
             self._dragging_point = False
             self._drag_point_info = None
             self._hovered_point_info = None
+            self._hovered_edge_info = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
@@ -366,6 +366,55 @@ class ImageCanvas(QWidget):
 
         simplified_pts = rdp(pts, epsilon)
         return [QPointF(x, y) for (x, y) in simplified_pts]
+
+    def _point_to_segment_screen_dist(self, px, py, ax, ay, bx, by) -> float:
+        """Perpendicular (clamped) distance from screen point (px,py) to segment (ax,ay)-(bx,by)."""
+        dx, dy = bx - ax, by - ay
+        if dx == 0 and dy == 0:
+            return math.hypot(px - ax, py - ay)
+        t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    def _remove_region_point(self, point_info):
+        from PySide6.QtGui import QPolygonF
+        ch, lid, poly_idx, pt_idx = point_info
+        poly = ch.contour_data[lid]["polygons"][poly_idx]
+        pts = [poly[i] for i in range(len(poly))]
+        n_unique = len(pts) - 1  # pts[0] == pts[-1]
+        if n_unique <= 3:
+            return
+        if pt_idx == len(pts) - 1:
+            pt_idx = 0
+        del pts[pt_idx]
+        del pts[-1]
+        pts.append(QPointF(pts[0]))
+        new_poly = QPolygonF(pts)
+        ch.contour_data[lid]["polygons"][poly_idx] = new_poly
+        xs = [pt.x() for pt in pts]
+        ys = [pt.y() for pt in pts]
+        ch.contour_data[lid]["bbox"] = [min(ys), min(xs), max(ys), max(xs)]
+        self._hovered_point_info = None
+        self._hovered_edge_info = None
+        self._model.channels_changed.emit()
+        self.update()
+
+    def _insert_region_point(self, edge_info, img_x, img_y):
+        from PySide6.QtGui import QPolygonF
+        ch, lid, poly_idx, edge_idx = edge_info
+        poly = ch.contour_data[lid]["polygons"][poly_idx]
+        pts = [poly[i] for i in range(len(poly))]
+        new_pt_idx = edge_idx + 1
+        pts.insert(new_pt_idx, QPointF(img_x, img_y))
+        new_poly = QPolygonF(pts)
+        ch.contour_data[lid]["polygons"][poly_idx] = new_poly
+        xs = [pt.x() for pt in pts]
+        ys = [pt.y() for pt in pts]
+        ch.contour_data[lid]["bbox"] = [min(ys), min(xs), max(ys), max(xs)]
+        self._hovered_edge_info = None
+        self._model.channels_changed.emit()
+        self.update()
+        return (ch, lid, poly_idx, new_pt_idx)
 
     # ── Viewport helpers ──────────────────────────────────────────────────────
 
@@ -690,15 +739,28 @@ class ImageCanvas(QWidget):
     # ── Pan ───────────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
+        if getattr(self, "_draw_mode", False) and event.button() == Qt.MouseButton.RightButton:
+            if getattr(self, "_hovered_point_info", None) is not None:
+                self._remove_region_point(self._hovered_point_info)
+            return
         if getattr(self, "_draw_mode", False) and event.button() == Qt.MouseButton.LeftButton:
             if getattr(self, "_hovered_point_info", None) is not None:
                 self._dragging_point = True
                 self._drag_point_info = self._hovered_point_info
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            elif getattr(self, "_hovered_edge_info", None) is not None:
+                spp = self._screen_pixels_per_image_pixel()
+                mx, my = event.position().x(), event.position().y()
+                img_x = self._viewport.left() + mx / spp
+                img_y = self._viewport.top() + my / spp
+                drag_info = self._insert_region_point(self._hovered_edge_info, img_x, img_y)
+                self._dragging_point = True
+                self._drag_point_info = drag_info
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
             else:
                 self._drawing = True
                 self._drawn_points = []
-                
+
                 spp = self._screen_pixels_per_image_pixel()
                 mx, my = event.position().x(), event.position().y()
                 img_x = self._viewport.left() + mx / spp
@@ -765,34 +827,58 @@ class ImageCanvas(QWidget):
         elif getattr(self, "_draw_mode", False):
             if spp > 0:
                 mx, my = event.position().x(), event.position().y()
-                hovered = None
-                best_dist = 8.0
-                
-                for ch in self._model._channels:
-                    if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
-                        for lid, data in ch.contour_data.items():
-                            for poly_idx, poly in enumerate(data["polygons"]):
-                                for pt_idx, pt in enumerate(poly):
-                                    sx = (pt.x() - self._viewport.left()) * spp
-                                    sy = (pt.y() - self._viewport.top()) * spp
-                                    
-                                    dist = math.hypot(mx - sx, my - sy)
-                                    if dist < best_dist:
-                                        best_dist = dist
-                                        hovered = (ch, lid, poly_idx, pt_idx)
-                                        
-                if hovered is not None:
-                    self._hovered_point_info = hovered
-                    self.setCursor(Qt.CursorShape.PointingHandCursor)
-                else:
-                    self._hovered_point_info = None
-                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                self._update_hover(mx, my)
+
+    def _update_hover(self, mx: float, my: float):
+        spp = self._screen_pixels_per_image_pixel()
+        if spp <= 0:
+            return
+        hovered_pt = None
+        best_pt_dist = 8.0
+        hovered_edge = None
+        best_edge_dist = 8.0
+        for ch in self._model._channels:
+            if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
+                for lid, data in ch.contour_data.items():
+                    for poly_idx, poly in enumerate(data["polygons"]):
+                        n = len(poly)
+                        for pt_idx, pt in enumerate(poly):
+                            sx = (pt.x() - self._viewport.left()) * spp
+                            sy = (pt.y() - self._viewport.top()) * spp
+                            dist = math.hypot(mx - sx, my - sy)
+                            if dist < best_pt_dist:
+                                best_pt_dist = dist
+                                hovered_pt = (ch, lid, poly_idx, pt_idx)
+                        for edge_idx in range(n - 1):
+                            a = poly[edge_idx]
+                            b = poly[edge_idx + 1]
+                            ax = (a.x() - self._viewport.left()) * spp
+                            ay = (a.y() - self._viewport.top()) * spp
+                            bx = (b.x() - self._viewport.left()) * spp
+                            by = (b.y() - self._viewport.top()) * spp
+                            dist = self._point_to_segment_screen_dist(mx, my, ax, ay, bx, by)
+                            if dist < best_edge_dist:
+                                best_edge_dist = dist
+                                hovered_edge = (ch, lid, poly_idx, edge_idx)
+        if hovered_pt is not None:
+            self._hovered_point_info = hovered_pt
+            self._hovered_edge_info = None
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        elif hovered_edge is not None:
+            self._hovered_point_info = None
+            self._hovered_edge_info = hovered_edge
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._hovered_point_info = None
+            self._hovered_edge_info = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if getattr(self, "_draw_mode", False) and getattr(self, "_dragging_point", False):
             self._dragging_point = False
             self._drag_point_info = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            mx, my = event.position().x(), event.position().y()
+            self._update_hover(mx, my)
             self.update()
         elif getattr(self, "_draw_mode", False) and getattr(self, "_drawing", False):
             self._drawing = False
@@ -805,6 +891,12 @@ class ImageCanvas(QWidget):
         elif self._panning:
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def contextMenuEvent(self, event):
+        if getattr(self, "_draw_mode", False):
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
     # ── Resize ────────────────────────────────────────────────────────────────
 

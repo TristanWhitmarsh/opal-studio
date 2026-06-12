@@ -21,12 +21,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QSplitter, QWidget,
-    QHBoxLayout, QStatusBar, QMessageBox, QTabWidget, QApplication
+    QHBoxLayout, QVBoxLayout, QStatusBar, QMessageBox, QTabWidget,
+    QApplication, QScrollBar, QLabel
 )
 
 from opal_studio.channel_model import Channel, ChannelListModel
 from opal_studio.image_loader import (
-    ImageData, open_image, open_spatialdata, spatialdata_channel_maxima, get_tile, _get_yx
+    ImageData, open_image, open_spatialdata_collection,
+    spatialdata_channel_maxima, get_tile, _get_yx
 )
 from opal_studio.widgets.channel_panel import ChannelPanel
 from opal_studio.widgets.image_canvas import ImageCanvas
@@ -101,6 +103,7 @@ class MainWindow(QMainWindow):
     # Signals for cross-thread communication
     segmentationResultReady = Signal(object, str, bool, object, object, str, bool, int, object, bool, object) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut, random_colors, aux_labels
     segmentationError = Signal(str)
+    segmentationTileReady = Signal(object)  # dict with tile info from child process
     preprocessingResultReady = Signal(str, str, object, float, float) # original_name, suffix, data, min, max
     preprocessingError = Signal(str)
     operationProgress = Signal(int, int)
@@ -121,6 +124,9 @@ class MainWindow(QMainWindow):
         # Data model
         self._channel_model = ChannelListModel()
         self._image: ImageData | None = None
+        self._spatialdata_collection = None
+        self._spatialdata_slice_index = 0
+        self._pending_spatialdata_slice = 0
 
         # Components
         self._channel_panel = ChannelPanel(self._channel_model)
@@ -160,9 +166,14 @@ class MainWindow(QMainWindow):
         
         self.segmentationResultReady.connect(self._on_segmentation_complete)
         self.segmentationError.connect(self._on_segmentation_error)
+        self.segmentationTileReady.connect(self._on_segmentation_tile_ready)
+        self._ops_panel.cancelSegmentationRequested.connect(self._cancel_segmentation)
         self.preprocessingResultReady.connect(self._on_preprocessing_complete)
         self.preprocessingError.connect(self._on_segmentation_error)
         self._canvas.pixelHovered.connect(self._on_pixel_hovered)
+        self._segmentation_proc = None
+        self._seg_preview_channel_idx = -1
+        self._seg_cancelled = False
 
         # Connect drawing signals between panel and canvas / brightfield view
         self._channel_panel._draw_btn.toggled.connect(self._canvas.set_draw_mode)
@@ -182,6 +193,31 @@ class MainWindow(QMainWindow):
         self._splitter.addWidget(self._channel_panel)
         
         self._center_tabs = QTabWidget()
+
+        self._image_tab = QWidget()
+        image_layout = QVBoxLayout(self._image_tab)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+        image_layout.setSpacing(0)
+        image_layout.addWidget(self._canvas, 1)
+
+        self._slice_controls = QWidget()
+        slice_layout = QHBoxLayout(self._slice_controls)
+        slice_layout.setContentsMargins(8, 4, 8, 4)
+        self._slice_label = QLabel("Slice 1 / 1")
+        self._slice_scrollbar = QScrollBar(Qt.Orientation.Horizontal)
+        self._slice_scrollbar.setRange(1, 1)
+        self._slice_scrollbar.setSingleStep(1)
+        self._slice_scrollbar.setPageStep(1)
+        self._slice_scrollbar.valueChanged.connect(self._on_spatialdata_slice_changed)
+        slice_layout.addWidget(self._slice_label)
+        slice_layout.addWidget(self._slice_scrollbar, 1)
+        self._slice_controls.hide()
+        image_layout.addWidget(self._slice_controls)
+
+        self._slice_load_timer = QTimer(self)
+        self._slice_load_timer.setSingleShot(True)
+        self._slice_load_timer.setInterval(120)
+        self._slice_load_timer.timeout.connect(self._load_pending_spatialdata_slice)
         
         # Inject an invisible native icon to force the tab bar to draw taller, preventing cut-off text
         spacer_pixmap = QPixmap(1, 24)
@@ -189,7 +225,7 @@ class MainWindow(QMainWindow):
         spacer_icon = QIcon(spacer_pixmap)
         
         self._center_tabs.setIconSize(QSize(1, 24))
-        self._center_tabs.addTab(self._canvas, spacer_icon, "Image")
+        self._center_tabs.addTab(self._image_tab, spacer_icon, "Image")
         self._center_tabs.addTab(self._brightfield_view, spacer_icon, "Brightfield")
         self._center_tabs.addTab(self._phenotyping_tab, spacer_icon, "Phenotyping")
         self._center_tabs.addTab(self._clustering_heatmap_tab, spacer_icon, "Heatmap")
@@ -279,6 +315,14 @@ class MainWindow(QMainWindow):
         save_phenos_act = QAction("Save P&henotyping…", self)
         save_phenos_act.triggered.connect(self._on_export_phenotypes)
         file_menu.addAction(save_phenos_act)
+
+        save_brightfield_act = QAction("Save &Brightfield…", self)
+        save_brightfield_act.triggered.connect(self._on_export_brightfield)
+        file_menu.addAction(save_brightfield_act)
+
+        save_cells_act = QAction("Save Cell Data…", self)
+        save_cells_act.triggered.connect(self._on_export_cells)
+        file_menu.addAction(save_cells_act)
         
         file_menu.addSeparator()
         quit_act = QAction("&Quit", self)
@@ -298,8 +342,12 @@ class MainWindow(QMainWindow):
     def _load_spatialdata(self, path: str):
         """Open a SpatialData directory and set it as the active image."""
         try:
-            img = open_spatialdata(path)
+            collection = open_spatialdata_collection(path)
+            img = collection.open_image(0)
             self._image = img
+            self._spatialdata_collection = collection
+            self._spatialdata_slice_index = 0
+            self._pending_spatialdata_slice = 0
 
             from opal_studio.channel_model import generate_spaced_colors
             palette = generate_spaced_colors(len(img.channel_names))
@@ -324,13 +372,116 @@ class MainWindow(QMainWindow):
             self._ops_panel.reset()
             self._phenotyping_tab.clear()
             self._clustering_heatmap_tab.clear()
-            self._status.showMessage(f"Loaded SpatialData: {Path(path).name}", 5000)
+
+            slice_count = len(collection)
+            self._slice_scrollbar.blockSignals(True)
+            self._slice_scrollbar.setRange(1, slice_count)
+            self._slice_scrollbar.setValue(1)
+            self._slice_scrollbar.blockSignals(False)
+            self._slice_label.setText(
+                f"Slice 1 / {slice_count}: {collection.image_names[0]}"
+            )
+            self._slice_controls.setVisible(slice_count > 1)
+            self._status.showMessage(
+                f"Loaded SpatialData: {Path(path).name} (slice 1 of {slice_count})",
+                5000,
+            )
         except Exception as e:
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Could not load SpatialData: {e}")
 
+    @Slot(int)
+    def _on_spatialdata_slice_changed(self, value: int):
+        collection = self._spatialdata_collection
+        if collection is None:
+            return
+        index = value - 1
+        if not 0 <= index < len(collection):
+            return
+
+        self._pending_spatialdata_slice = index
+        self._slice_label.setText(
+            f"Slice {value} / {len(collection)}: {collection.image_names[index]}"
+        )
+        if index == self._spatialdata_slice_index:
+            self._slice_load_timer.stop()
+            return
+
+        # Coalesce rapid scrollbar changes. Opening a slice below only builds
+        # lazy metadata objects; pixel chunks remain on the render thread.
+        self._slice_load_timer.start()
+
+    @Slot()
+    def _load_pending_spatialdata_slice(self):
+        collection = self._spatialdata_collection
+        if collection is None:
+            return
+        index = self._pending_spatialdata_slice
+        if index == self._spatialdata_slice_index:
+            return
+
+        try:
+            img = collection.open_image(index)
+            self._image = img
+            self._spatialdata_slice_index = index
+
+            from opal_studio.channel_model import generate_spaced_colors
+            palette = generate_spaced_colors(len(img.channel_names))
+            previous = [
+                self._channel_model.channel(i)
+                for i in range(min(self._channel_model.rowCount(), len(img.channel_names)))
+            ]
+            channels = []
+            for i, name in enumerate(img.channel_names):
+                old = previous[i] if i < len(previous) else None
+                if old is not None and old.index == i and not (
+                    old.is_mask or old.is_cell_mask or old.is_type_mask
+                    or old.is_processed or old.is_region
+                ):
+                    channels.append(Channel(
+                        name=name,
+                        color=QColor(old.color),
+                        visible=old.visible,
+                        selected=old.selected,
+                        range_min=old.range_min,
+                        range_max=old.range_max,
+                        data_min=old.data_min,
+                        data_max=old.data_max,
+                        index=i,
+                        alpha=old.alpha,
+                    ))
+                else:
+                    channels.append(Channel(
+                        name=name,
+                        color=QColor(*palette[i]),
+                        visible=True,
+                        data_min=0.0,
+                        data_max=1.0,
+                        index=i,
+                    ))
+
+            self._channel_model.set_channels(channels)
+            self._canvas.set_image(img, load_overview=False)
+            self._ops_panel.reset()
+            self._phenotyping_tab.clear()
+            self._clustering_heatmap_tab.clear()
+            self._status.showMessage(
+                f"Loaded slice {index + 1} of {len(collection)}: "
+                f"{collection.image_names[index]}",
+                3000,
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._slice_scrollbar.blockSignals(True)
+            self._slice_scrollbar.setValue(self._spatialdata_slice_index + 1)
+            self._slice_scrollbar.blockSignals(False)
+            QMessageBox.critical(self, "Error", f"Could not load SpatialData slice: {e}")
+
     def _load_image(self, path: str):
         try:
+            self._slice_load_timer.stop()
+            self._spatialdata_collection = None
+            self._slice_controls.hide()
             img = open_image(path)
             self._image = img
             
@@ -1037,11 +1188,20 @@ class MainWindow(QMainWindow):
 
         def _run():
             try:
+                import json
                 from multiplex2brightfield import convert
                 from multiplex2brightfield.configuration_presets import GetConfiguration
 
-                preset = params.get("preset", "H&E")
-                config = GetConfiguration(preset)
+                config_json = params.get("config_json")
+                if config_json:
+                    try:
+                        config = json.loads(config_json)
+                    except json.JSONDecodeError as e:
+                        self.segmentationError.emit(f"Invalid config JSON: {e}")
+                        return
+                else:
+                    preset = params.get("preset", "H&E")
+                    config = GetConfiguration(preset)
 
                 channel_names = []
                 channels_data = []
@@ -1082,6 +1242,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_brightfield_complete(self, rgb_array):
+        self._brightfield_rgb = rgb_array
         self._ops_panel.stop_loading()
         self._brightfield_view.set_image(rgb_array)
         for i in range(self._center_tabs.count()):
@@ -1089,6 +1250,231 @@ class MainWindow(QMainWindow):
                 self._center_tabs.setCurrentIndex(i)
                 break
         self._status.showMessage("Brightfield image generated", 3000)
+
+    def _on_export_brightfield(self):
+        rgb = getattr(self, "_brightfield_rgb", None)
+        if rgb is None:
+            QMessageBox.information(self, "Export", "No brightfield image has been generated yet.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Export Brightfield", "", "OME-TIFF (*.ome.tif *.ome.tiff)")
+        if not path:
+            return
+        if not path.lower().endswith(".ome.tif") and not path.lower().endswith(".ome.tiff"):
+            path += ".ome.tif"
+
+        try:
+            tifffile.imwrite(
+                path,
+                rgb,
+                ome=True,
+                photometric="rgb",
+                metadata={"axes": "YXS"},
+            )
+            self._status.showMessage(f"Brightfield saved to {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Export Error", f"Could not save brightfield: {e}")
+
+    # ------------------------------------------------------------------
+    # Cell data export
+    # ------------------------------------------------------------------
+
+    def _build_cell_export_dataframe(self):
+        """Collect all per-cell data into a pandas DataFrame plus a metadata dict.
+
+        Returns (df, metadata) or (None, {}) if no cell label map is found.
+        """
+        import pandas as pd
+        from skimage.measure import regionprops_table
+
+        # Resolve label map: prefer the one used for clustering, else any cell mask
+        working_labels = self._cluster_working_labels
+        if working_labels is None:
+            for i in range(self._channel_model.rowCount()):
+                ch = self._channel_model.channel(i)
+                if ch.is_cell_mask and ch.mask_data is not None:
+                    lm = ch.mask_data
+                    if lm.max() <= 1:
+                        from skimage.measure import label as _label
+                        lm = _label(lm).astype(np.int32)
+                    working_labels = lm.astype(np.int32)
+                    break
+
+        if working_labels is None or working_labels.max() == 0:
+            return None, {}
+
+        # Cell IDs, centroids, areas
+        props = regionprops_table(
+            working_labels, properties=("label", "centroid", "area")
+        )
+        cell_ids = props["label"]           # actual label values
+        cx = props["centroid-1"]            # column → x
+        cy = props["centroid-0"]            # row    → y
+        areas = props["area"]
+
+        pixel_size = self._ops_panel.get_pixel_size()
+
+        data: dict = {
+            "cell_id": cell_ids.astype(np.int32),
+            "x_px":    cx.astype(np.float32),
+            "y_px":    cy.astype(np.float32),
+            "area_px": areas.astype(np.int32),
+        }
+        if pixel_size > 0:
+            data["x_um"]     = (cx    * pixel_size     ).astype(np.float32)
+            data["y_um"]     = (cy    * pixel_size     ).astype(np.float32)
+            data["area_um2"] = (areas * pixel_size ** 2).astype(np.float32)
+
+        df = pd.DataFrame(data)
+
+        # Cluster assignments
+        if self._cluster_cell_ids is not None and self._cluster_labels_arr is not None:
+            max_label = int(working_labels.max())
+            id_to_cluster = np.full(max_label + 1, -1, dtype=np.int32)
+            for j, cid in enumerate(self._cluster_cell_ids):
+                if cid <= max_label:
+                    id_to_cluster[cid] = self._cluster_labels_arr[j]
+            cluster_ids = id_to_cluster[cell_ids]
+            df["cluster_id"] = cluster_ids
+            names_map = self._clustering_heatmap_tab.get_cluster_names()
+            df["cluster_name"] = pd.Categorical([
+                names_map.get(int(c), f"Cluster {c}") if c >= 0 else "Noise"
+                for c in cluster_ids
+            ])
+
+        # Phenotypes from type-mask channels
+        type_masks: list[tuple[str, np.ndarray]] = []
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_type_mask and ch.mask_data is not None:
+                type_masks.append((ch.name, ch.mask_data))
+        if type_masks:
+            cell_phenotype: dict[int, str] = {}
+            for type_name, type_data in type_masks:
+                region_ids = np.unique(working_labels[type_data > 0])
+                for cid in region_ids[region_ids > 0]:
+                    cell_phenotype[int(cid)] = type_name
+            df["phenotype"] = pd.Categorical([
+                cell_phenotype.get(int(c), "Unknown") for c in cell_ids
+            ])
+
+        # Per-marker means and positivity, interleaved per marker
+        thresh_tab = self._ops_panel._thresh_tab
+        pos_luts: dict[str, np.ndarray] = {}
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_cell_mask and ch.pos_lut is not None:
+                key = ch.source_marker if ch.source_marker else ch.name
+                pos_luts[key] = ch.pos_lut
+
+        marker_names: list[str] = []
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if ch.is_mask or ch.is_cell_mask or ch.is_type_mask or getattr(ch, "is_region", False):
+                continue
+            has_mean = i in thresh_tab._cell_means
+            has_pos  = ch.name in pos_luts
+            if not has_mean and not has_pos:
+                continue
+            marker_names.append(ch.name)
+            if has_mean:
+                lut = thresh_tab._cell_means[i]
+                safe = np.clip(cell_ids, 0, len(lut) - 1)
+                df[f"{ch.name}_mean"] = lut[safe].astype(np.float32)
+            if has_pos:
+                lut = pos_luts[ch.name]
+                safe = np.clip(cell_ids, 0, len(lut) - 1)
+                df[f"{ch.name}_positive"] = (lut[safe] == 2)
+
+        thresholds: dict[str, float] = {}
+        for k, v in thresh_tab._thresholds.items():
+            try:
+                thresholds[self._channel_model.channel(k).name] = float(v)
+            except Exception:
+                pass
+
+        metadata = {
+            "pixel_size_um": float(pixel_size),
+            "n_cells": len(cell_ids),
+            "marker_names": marker_names,
+            "thresholds": thresholds,
+        }
+        return df, metadata
+
+    def _on_export_cells(self):
+        df, metadata = self._build_cell_export_dataframe()
+        if df is None:
+            QMessageBox.information(self, "Export",
+                "No cell data available. Run segmentation and cell identification first.")
+            return
+
+        parquet_filter = "Parquet (*.parquet)"
+        h5ad_filter    = "AnnData (*.h5ad)"
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export Cell Data", "", f"{parquet_filter};;{h5ad_filter}")
+        if not path:
+            return
+
+        try:
+            if selected_filter == h5ad_filter or path.lower().endswith(".h5ad"):
+                self._save_cells_h5ad(path, df, metadata)
+            else:
+                if not path.lower().endswith(".parquet"):
+                    path += ".parquet"
+                df.to_parquet(path, index=False)
+                self._status.showMessage(
+                    f"Exported {len(df)} cells to {Path(path).name}", 5000)
+        except ImportError as e:
+            QMessageBox.critical(self, "Missing Dependency", str(e))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Export Error", f"Could not export cell data: {e}")
+
+    def _save_cells_h5ad(self, path: str, df, metadata: dict):
+        import anndata as ad
+        import pandas as pd
+        import datetime
+
+        if not path.lower().endswith(".h5ad"):
+            path += ".h5ad"
+
+        marker_names = metadata.get("marker_names", [])
+        pixel_size   = metadata.get("pixel_size_um", 1.0)
+
+        mean_cols = [f"{m}_mean" for m in marker_names if f"{m}_mean" in df.columns]
+        var_names = [c[:-5] for c in mean_cols]
+        X = df[mean_cols].values.astype(np.float32) if mean_cols else np.zeros((len(df), 0), dtype=np.float32)
+
+        obs_keys = ["cell_id", "x_px", "y_px", "area_px"]
+        for k in ("x_um", "y_um", "area_um2", "phenotype", "cluster_id", "cluster_name"):
+            if k in df.columns:
+                obs_keys.append(k)
+        obs = df[obs_keys].copy()
+        obs.index = obs["cell_id"].astype(str)
+
+        var = pd.DataFrame(index=pd.Index(var_names, name="marker"))
+
+        adata = ad.AnnData(X=X, obs=obs, var=var)
+
+        if mean_cols:
+            adata.layers["intensity"] = X
+        pos_cols = [f"{m}_positive" for m in var_names if f"{m}_positive" in df.columns]
+        if pos_cols and len(pos_cols) == len(var_names):
+            adata.layers["positive"] = df[pos_cols].values.astype(bool)
+
+        xy_cols = ("x_um", "y_um") if "x_um" in df.columns else ("x_px", "y_px")
+        adata.obsm["spatial"] = df[list(xy_cols)].values.astype(np.float32)
+
+        adata.uns["opal_studio"] = {
+            "pixel_size_um": pixel_size,
+            "thresholds":    metadata.get("thresholds", {}),
+            "export_date":   datetime.datetime.now().isoformat(),
+        }
+
+        adata.write_h5ad(path)
+        self._status.showMessage(
+            f"Exported {len(df)} cells to {Path(path).name}", 5000)
 
     # ------------------------------------------------------------------
     # Segmentation
@@ -1361,39 +1747,145 @@ class MainWindow(QMainWindow):
                     
                     ctx = multiprocessing.get_context("spawn")
                     parent_conn, child_conn = ctx.Pipe()
-                    
+                    stop_event = ctx.Event()
+
                     worker_params = params.copy()
                     worker_params["override_name"] = override_name
-                    
-                    proc = ctx.Process(target=run_segmentation_task_pipe, args=(child_conn, worker_params, input_channels_data))
+                    worker_params["crop_offset_y"] = v_top if region_mode == "visible" else (r_top if region_mode == "selected_region" else 0)
+                    worker_params["crop_offset_x"] = v_left if region_mode == "visible" else (r_left if region_mode == "selected_region" else 0)
+                    worker_params["full_shape"] = list(full_shape) if full_shape is not None else None
+                    worker_params["target_mode"] = target_mode
+                    worker_params["target_mask_index"] = target_mask_index
+
+                    proc = ctx.Process(target=run_segmentation_task_pipe, args=(child_conn, worker_params, input_channels_data, stop_event))
                     proc.start()
-                    
+                    child_conn.close()
+                    self._segmentation_proc = proc
+                    self._seg_cancelled = False
+
                     try:
-                        worker_res = parent_conn.recv()
-                    except EOFError:
-                        raise Exception("Worker process terminated unexpectedly.")
+                        while True:
+                            try:
+                                msg = parent_conn.recv()
+                            except EOFError:
+                                if not self._seg_cancelled:
+                                    raise Exception("Worker process terminated unexpectedly.")
+                                break
+                            msg_type = msg.get("type")
+                            if msg_type == "tile_update":
+                                self.segmentationTileReady.emit(msg)
+                            elif msg_type == "result":
+                                for out_labels, out_name, out_is_cell in msg.get("results", []):
+                                    process_and_emit(out_labels, out_name, out_is_cell)
+                                break
+                            elif msg_type == "cancelled":
+                                break
+                            elif msg_type == "error":
+                                raise Exception(f"Worker Error: {msg.get('error')}\n{msg.get('traceback')}")
                     finally:
-                        proc.join()
+                        proc.join(timeout=5)
                         parent_conn.close()
-                    
-                    if not worker_res.get("success"):
-                        raise Exception(f"Worker Error: {worker_res.get('error')}\n{worker_res.get('traceback')}")
-                    
-                    for out_labels, out_name, out_is_cell in worker_res.get("results", []):
-                        process_and_emit(out_labels, out_name, out_is_cell)
-                print(f"[Segmentation] Result emitted.")
+                        self._segmentation_proc = None
+                if not self._seg_cancelled:
+                    print(f"[Segmentation] Result emitted.")
             except Exception as e:
                 import traceback; traceback.print_exc()
-                self.segmentationError.emit(str(e))
+                if not self._seg_cancelled:
+                    self.segmentationError.emit(str(e))
+                else:
+                    self.segmentationError.emit("")  # triggers stop_loading without dialog
 
         self._segmentation_thread = threading.Thread(target=_run, daemon=True)
         self._segmentation_thread.start()
+
+    @Slot()
+    def _cancel_segmentation(self):
+        self._seg_cancelled = True
+        proc = self._segmentation_proc
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+        self._segmentation_proc = None
+        self._seg_preview_channel_idx = -1
+        self._ops_panel.stop_loading()
+
+    @Slot(object)
+    def _on_segmentation_tile_ready(self, info: dict):
+        y0 = info.get('y0', 0)
+        x0 = info.get('x0', 0)
+        y1 = info.get('y1', 0)
+        x1 = info.get('x1', 0)
+        tile_labels = info.get('tile_labels')
+        full_shape_list = info.get('full_shape')
+        name = info.get('name', 'Preview')
+        is_cell_mask = info.get('is_cell_mask', False)
+        tile_idx = info.get('tile_idx', 0)
+        n_tiles = info.get('n_tiles', 1)
+        target_mode = info.get('target_mode', 'new')
+        target_mask_index = info.get('target_mask_index')
+
+        if tile_labels is None or full_shape_list is None:
+            return
+
+        full_shape = tuple(full_shape_list)
+        self._ops_panel.set_progress_info(tile_idx + 1, n_tiles)
+
+        if target_mode == 'overwrite' and target_mask_index is not None:
+            try:
+                ch = self._channel_model.channel(target_mask_index)
+                if ch.mask_data is not None:
+                    ch.mask_data[y0:y1, x0:x1] = tile_labels
+                    idx_qt = self._channel_model.index(target_mask_index)
+                    self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+                    self._channel_model.channels_changed.emit()
+            except Exception:
+                pass
+            return
+
+        preview_idx = self._seg_preview_channel_idx
+        ch = None
+        if preview_idx >= 0:
+            try:
+                candidate = self._channel_model.channel(preview_idx)
+                if candidate.mask_data is not None and candidate.mask_data.shape == full_shape:
+                    ch = candidate
+            except Exception:
+                preview_idx = -1
+
+        if ch is None:
+            new_ch = Channel(
+                name=self._channel_model.get_unique_name(name),
+                color=QColor(255, 255, 255),
+                visible=True,
+                is_mask=True,
+                is_cell_mask=is_cell_mask,
+                mask_data=np.zeros(full_shape, dtype=np.int32),
+                contour_data={},
+                index=-1,
+            )
+            self._channel_model.add_channel(new_ch)
+            preview_idx = self._channel_model.rowCount() - 1
+            self._seg_preview_channel_idx = preview_idx
+            idx_qt = self._channel_model.index(preview_idx)
+            self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
+            ch = new_ch
+
+        ch.mask_data[y0:y1, x0:x1] = tile_labels
+        idx_qt = self._channel_model.index(preview_idx)
+        self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
+        self._channel_model.channels_changed.emit()
 
     def _on_segmentation_complete(self, labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut=None, random_colors=True, aux_labels=None):
         # Type masks arrive one-per-cluster/type while the background thread is still running.
         # operationFinished handles stop_loading() for those batches.
         if not is_type_mask:
             self._ops_panel.stop_loading()
+
+        # If a tile-progress preview channel was created, use it as the final target
+        # so contour data replaces the raw tile preview in-place.
+        if not is_type_mask and target_idx < 0 and self._seg_preview_channel_idx >= 0:
+            target_idx = self._seg_preview_channel_idx
+        if not is_type_mask:
+            self._seg_preview_channel_idx = -1
 
         # For cell masks with no explicit target, overwrite any existing mask
         # for the same marker rather than accumulating duplicates.
@@ -1451,7 +1943,9 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_segmentation_error(self, message):
         self._ops_panel.stop_loading()
-        QMessageBox.critical(self, "Task Error", message)
+        self._seg_preview_channel_idx = -1
+        if message:
+            QMessageBox.critical(self, "Task Error", message)
 
     @Slot(dict)
     def _run_mask_expansion(self, params):
@@ -1659,6 +2153,7 @@ class MainWindow(QMainWindow):
         def _run():
             try:
                 from opal_studio.image_loader import _get_yx
+                from concurrent.futures import ThreadPoolExecutor
                 from skimage.filters import (
                     threshold_otsu, threshold_triangle, threshold_li,
                     threshold_yen, threshold_isodata,
@@ -1680,65 +2175,72 @@ class MainWindow(QMainWindow):
                 elif labels.max() == 1:
                     from skimage.measure import label
                     working_labels = label(labels).astype(np.int32)
-                
+
                 cell_ids = np.unique(working_labels)
                 cell_ids = cell_ids[cell_ids > 0]
                 if len(cell_ids) == 0:
                     self.segmentationError.emit("No cells found in the selected mask.")
                     return
-                
-                # Update labels sent to UI so _apply knows which one to use
-                labels_for_ui = working_labels
 
                 max_label = int(working_labels.max())
-
-                cell_means: dict[int, np.ndarray] = {}
-                thresholds: dict[int, float] = {}
-
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
 
-                for i in range(self._channel_model.rowCount()):
-                    ch = self._channel_model.channel(i)
-                    if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
-                        continue  # skip mask channels; include raw and processed image channels
+                # Collect image channels to process (skip mask channels)
+                channel_indices = [
+                    i for i in range(self._channel_model.rowCount())
+                    if not (self._channel_model.channel(i).is_mask
+                            or self._channel_model.channel(i).is_cell_mask
+                            or self._channel_model.channel(i).is_type_mask)
+                ]
+                channels_snapshot = {i: self._channel_model.channel(i) for i in channel_indices}
 
+                # Serialise file reads so we don't overwhelm I/O; compute in parallel
+                _read_lock = threading.Lock()
+
+                def _process_one(i):
+                    ch = channels_snapshot[i]
                     if ch.is_processed and ch.processed_data is not None:
                         data = ch.processed_data.astype(np.float32)
                     else:
-                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                        with _read_lock:
+                            data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
 
-                    # Crop/pad to label map size just in case
                     dh, dw = data.shape[:2]
                     crop_h, crop_w = min(h, dh), min(w, dw)
                     lab_crop = working_labels[:crop_h, :crop_w]
                     dat_crop = data[:crop_h, :crop_w]
 
-                    # Vectorised: one scipy call returns mean for every label ID
-                    means_list = ndi.mean(dat_crop, labels=lab_crop, index=cell_ids)
-                    if not isinstance(means_list, np.ndarray):
-                        means_list = np.array([means_list])
+                    # bincount is ~3-5× faster than scipy.ndimage.mean for integer labels
+                    flat_lbl = lab_crop.ravel()
+                    flat_dat = dat_crop.ravel()
+                    sums   = np.bincount(flat_lbl, weights=flat_dat.astype(np.float64), minlength=max_label + 1)
+                    counts = np.bincount(flat_lbl, minlength=max_label + 1)
+                    with np.errstate(invalid="ignore"):
+                        means_lut = np.where(counts > 0, sums / counts, 0.0).astype(np.float32)
 
-                    # Clean NaNs (labels that weren't found in the crop)
-                    means_list = np.nan_to_num(means_list)
-
-                    # Build LUT indexed by label value (index 0 = background = 0)
-                    means_lut = np.zeros(max_label + 1, dtype=np.float32)
-                    means_lut[cell_ids] = means_list
-
-                    cell_means[i] = means_lut
-
-                    # Compute threshold using the selected method (ignore background zeros)
                     valid_means = means_lut[cell_ids]
                     valid_means = valid_means[valid_means > 0]
+                    threshold = None
                     if valid_means.size > 1:
                         try:
                             val = thresh_fn(valid_means)
                             if not np.isnan(val):
-                                thresholds[i] = float(val)
+                                threshold = float(val)
                         except Exception:
                             pass
 
-                # Deliver to main thread
+                    return i, means_lut, threshold
+
+                cell_means: dict[int, np.ndarray] = {}
+                thresholds: dict[int, float] = {}
+
+                n_workers = min(len(channel_indices), max(1, (os.cpu_count() or 4)))
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    for i, means_lut, threshold in pool.map(_process_one, channel_indices):
+                        cell_means[i] = means_lut
+                        if threshold is not None:
+                            thresholds[i] = threshold
+
                 self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx)
 
             except Exception as e:

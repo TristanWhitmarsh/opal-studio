@@ -404,6 +404,36 @@ class MergeTab(QWidget):
         super().setEnabled(enabled)
         self._run_btn.setEnabled(enabled)
 
+class _VResizeHandle(QFrame):
+    """Thin drag strip that vertically resizes a target widget."""
+
+    def __init__(self, target: QWidget, parent=None):
+        super().__init__(parent)
+        self._target = target
+        self._drag_start_y = None
+        self._drag_start_h = None
+        self.setFixedHeight(6)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setStyleSheet(
+            "background: transparent;"
+            "border-top: 2px solid palette(mid);"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_y = event.globalPosition().y()
+            self._drag_start_h = self._target.height()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start_y is not None:
+            delta = event.globalPosition().y() - self._drag_start_y
+            self._target.setFixedHeight(max(60, int(self._drag_start_h + delta)))
+
+    def mouseReleaseEvent(self, _):
+        self._drag_start_y = None
+        self._drag_start_h = None
+
+
 _BRIGHTFIELD_PRESETS = [
     "H&E", "IHC", "Aperio CS2", "Hamamatsu XR", "Hamamatsu S360",
     "Leica GT450", "3DHistech Pannoramic Scan II", "CyteFinder",
@@ -431,16 +461,35 @@ class BrightfieldTab(QWidget):
         self._preset_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for name in _BRIGHTFIELD_PRESETS:
             self._preset_combo.addItem(name)
+        self._preset_combo.currentTextChanged.connect(self._on_preset_changed)
         form.addRow("Preset:", self._preset_combo)
         layout.addLayout(form)
+
+        from PySide6.QtGui import QFont
+        self._config_edit = QPlainTextEdit()
+        self._config_edit.setFixedHeight(240)
+        self._config_edit.setFont(QFont("Courier New", 8))
+        layout.addWidget(self._config_edit)
+        layout.addWidget(_VResizeHandle(self._config_edit))
 
         self._run_btn = QPushButton("Generate Brightfield")
         self._run_btn.clicked.connect(self._on_run)
         layout.addWidget(self._run_btn)
         layout.addStretch()
 
+        self._on_preset_changed(self._preset_combo.currentText())
+
+    def _on_preset_changed(self, name):
+        import json
+        from multiplex2brightfield.configuration_presets import GetConfiguration
+        config = GetConfiguration(name)
+        self._config_edit.setPlainText(json.dumps(config, indent=2))
+
     def _on_run(self):
-        self.runRequested.emit({"preset": self._preset_combo.currentText()})
+        self.runRequested.emit({
+            "preset": self._preset_combo.currentText(),
+            "config_json": self._config_edit.toPlainText(),
+        })
 
     def setEnabled(self, enabled):
         super().setEnabled(enabled)
@@ -2005,23 +2054,14 @@ class ClusteringTab(QWidget):
         layout.addWidget(self._run_btn)
 
         # Metrics output
+        from PySide6.QtGui import QFont
         self._metrics_output = QPlainTextEdit()
         self._metrics_output.setReadOnly(True)
         self._metrics_output.setPlaceholderText("Clustering metrics will appear here after running.")
-        self._metrics_output.setMinimumHeight(120)
-        self._metrics_output.setMaximumHeight(300)
-        self._metrics_output.setStyleSheet("""
-            QPlainTextEdit {
-                font-family: monospace;
-                font-size: 11px;
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                border: 1px solid #3a3a3a;
-                border-radius: 4px;
-                padding: 4px;
-            }
-        """)
+        self._metrics_output.setFixedHeight(240)
+        self._metrics_output.setFont(QFont("Courier New", 8))
         layout.addWidget(self._metrics_output)
+        layout.addWidget(_VResizeHandle(self._metrics_output))
 
         # ── Identify Cells from clusters ──────────────────────────────────────
         id_line = QFrame()
@@ -2213,6 +2253,7 @@ class OperationsPanel(QWidget):
     runThresholdComputeRequested          = Signal(dict)
     applyThresholdRequested               = Signal(dict)
     segmentationFinished = Signal(object)
+    cancelSegmentationRequested           = Signal()
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
@@ -2250,10 +2291,23 @@ class OperationsPanel(QWidget):
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
 
-        # Progress bar at the absolute bottom
+        # Progress bar + cancel button at the absolute bottom
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(4)
         self._progress = QProgressBar()
-        self._progress.setVisible(False); self._progress.setTextVisible(False)
-        main_layout.addWidget(self._progress)
+        self._progress.setTextVisible(False)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setFixedWidth(60)
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.clicked.connect(self.cancelSegmentationRequested)
+        progress_row.addWidget(self._progress)
+        progress_row.addWidget(self._cancel_btn)
+        progress_widget = QWidget()
+        progress_widget.setLayout(progress_row)
+        progress_widget.setVisible(False)
+        self._progress_widget = progress_widget
+        main_layout.addWidget(progress_widget)
 
     def reset(self):
         """Restore all operations panel settings to defaults."""
@@ -2465,12 +2519,12 @@ class OperationsPanel(QWidget):
 
     def _on_run_preprocessing(self, params):
         self._filter_tab.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runPreprocessingRequested.emit(params)
 
     def _on_run_brightfield(self, params):
         self._brightfield_tab.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runBrightfieldRequested.emit(params)
 
     def _on_run_segmentation(self, params):
@@ -2527,28 +2581,29 @@ class OperationsPanel(QWidget):
         self._instanseg_tab.setEnabled(False)
         self._watershed_tab.setEnabled(False)
         self._mesmer_tab.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
+        self._cancel_btn.setVisible(True)
         self.runSegmentationRequested.emit(params)
 
     def _on_run_mask_processing(self, params):
         self._expansion_tab.setEnabled(False)
         self._filter_size_tab.setEnabled(False)
         self._cell_sampler_tab.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runMaskProcessingRequested.emit(params)
 
     def _on_run_cell_positivity(self):
         if self._pos_mask_combo.currentIndex() < 0:
             return
         self._pos_run_btn.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runCellPositivityRequested.emit({
             "mask_index": self._pos_mask_combo.currentData()
         })
 
     def _on_run_threshold_compute(self, params):
         self._thresh_tab.setEnabled(False)
-        self._progress.setVisible(True)
+        self._progress_widget.setVisible(True)
         self._progress.setRange(0, 0)
         self.runThresholdComputeRequested.emit(params)
 
@@ -2558,17 +2613,17 @@ class OperationsPanel(QWidget):
 
     def _on_run_cell_identification(self):
         self._ident_run_btn.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runCellIdentificationRequested.emit()
 
     def _on_run_clustering(self, params):
         self._clustering_tab.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runClusteringRequested.emit(params)
 
     def _on_run_cluster_identify(self, params):
         self._clustering_tab.setEnabled(False)
-        self._progress.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runClusterCellIdentificationRequested.emit(params)
 
     def stop_loading(self):
@@ -2587,7 +2642,8 @@ class OperationsPanel(QWidget):
         self._thresh_tab.setEnabled(True)
         self._ident_run_btn.setEnabled(True)
         self._clustering_tab.setEnabled(True)
-        self._progress.setVisible(False)
+        self._cancel_btn.setVisible(False)
+        self._progress_widget.setVisible(False)
 
     def set_clustering_metrics(self, text: str) -> None:
         self._clustering_tab.set_metrics(text)
@@ -2596,3 +2652,14 @@ class OperationsPanel(QWidget):
     def set_progress_info(self, val, total):
         self._progress.setRange(0, total)
         self._progress.setValue(val)
+
+    def get_pixel_size(self) -> float:
+        """Return pixel size in μm/px from the active segmentation tab, defaulting to 1.0."""
+        current = self._seg_tabs.currentWidget()
+        for tab in (current, self._instanseg_tab, self._mesmer_tab):
+            if hasattr(tab, "_pixel_size"):
+                try:
+                    return float(tab._pixel_size.text() or 1.0)
+                except (ValueError, AttributeError):
+                    pass
+        return 1.0

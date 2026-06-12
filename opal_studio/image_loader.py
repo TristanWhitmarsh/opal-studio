@@ -9,6 +9,7 @@ Zarr V3 chunks (zstd-compressed) via numcodecs.
 Public API (consumed by main_window, image_canvas, image_renderer):
   open_image(path)              -> ImageData   (OME-TIFF)
   open_spatialdata(path)        -> ImageData   (SpatialData / Zarr V3)
+  open_spatialdata_collection(path) -> SpatialDataCollection
   get_tile(img, level, ch, y_slice, x_slice) -> np.ndarray   (unchanged)
   best_level_for_zoom(img, spp) -> int
   get_cached_tile(cache, img, level, ch, tile_row, tile_col, tile_size) -> np.ndarray
@@ -255,18 +256,32 @@ class ZarrV3Array:
         cs = meta['chunk_grid']['configuration']['chunk_shape']
         self._chunk_shape = tuple(cs)              # (c_c, c_y, c_x)
         self._dtype = np.dtype(meta['data_type'])
+        self._fill_value = meta.get('fill_value', 0)
         # Detect codec from codecs list
         codecs = meta.get('codecs', [])
         self._codec = None
         for codec in codecs:
             name = codec.get('name', '')
+            if name == 'bytes':
+                endian = codec.get('configuration', {}).get('endian')
+                if endian == 'little':
+                    self._dtype = self._dtype.newbyteorder('<')
+                elif endian == 'big':
+                    self._dtype = self._dtype.newbyteorder('>')
             if name == 'zstd' and _ZSTD_DECODER is not None:
                 self._codec = _ZSTD_DECODER
-                break
-        # SpatialData stores chunks under a 'c/' subdirectory by convention.
-        # Auto-detect: if 'c/' exists, chunks are at array_path/c/<c>/<y>/<x>;
-        # otherwise standard layout array_path/<c>/<y>/<x> is used.
-        self._chunk_prefix = 'c' if (array_path / 'c').is_dir() else ''
+
+        key_encoding = meta.get('chunk_key_encoding', {})
+        self._chunk_key_name = key_encoding.get('name', 'default')
+        self._chunk_separator = key_encoding.get('configuration', {}).get('separator', '/')
+
+        # All channels in a SpatialData tile are commonly stored in one chunk.
+        # Cache decoded chunks so concurrent per-channel rendering reads and
+        # decompresses each physical chunk only once.
+        self._decoded_chunks: OrderedDict[tuple[int, int, int], np.ndarray] = OrderedDict()
+        self._decoded_chunks_lock = threading.Lock()
+        self._chunk_locks: dict[tuple[int, int, int], threading.Lock] = {}
+        self._max_decoded_chunks = 16
 
     @property
     def shape(self):
@@ -275,6 +290,32 @@ class ZarrV3Array:
     @property
     def dtype(self):
         return self._dtype
+
+    def channel_maxima(self) -> list[float]:
+        """Compute maxima for every channel while decoding each chunk once."""
+        C, H, W = self._shape
+        cc, cy, cx = self._chunk_shape
+        maxima = np.full(C, -np.inf, dtype=np.float64)
+        for c_chunk in range((C + cc - 1) // cc):
+            for y_chunk in range((H + cy - 1) // cy):
+                for x_chunk in range((W + cx - 1) // cx):
+                    chunk = self._read_chunk(c_chunk, y_chunk, x_chunk)
+                    if chunk is None:
+                        continue
+                    actual_c = min(cc, C - c_chunk * cc)
+                    actual_y = min(cy, H - y_chunk * cy)
+                    actual_x = min(cx, W - x_chunk * cx)
+                    valid = chunk[:actual_c, :actual_y, :actual_x]
+                    if np.issubdtype(valid.dtype, np.floating):
+                        chunk_maxima = np.nanmax(valid, axis=(1, 2))
+                    else:
+                        chunk_maxima = np.max(valid, axis=(1, 2))
+                    start = c_chunk * cc
+                    maxima[start:start + actual_c] = np.maximum(
+                        maxima[start:start + actual_c], chunk_maxima
+                    )
+        return [float(value) if np.isfinite(value) and value > 0 else 1.0
+                for value in maxima]
 
     def __getitem__(self, idx):
         """
@@ -296,7 +337,10 @@ class ZarrV3Array:
         x0 = max(0, x_sl.start if x_sl.start is not None else 0)
         x1 = min(W, x_sl.stop  if x_sl.stop  is not None else W)
 
-        out = np.zeros((y1 - y0, x1 - x0), dtype=self._dtype)
+        if not 0 <= c_idx < C:
+            raise IndexError(f"channel index {c_idx} outside array with {C} channels")
+
+        out = np.full((y1 - y0, x1 - x0), self._fill_value, dtype=self._dtype)
 
         # Which chunk tiles overlap with the requested region?
         c_chunk = c_idx // cc   # c tile index (typically == c_idx since cc=1)
@@ -307,21 +351,11 @@ class ZarrV3Array:
 
         for ty in range(ty_start, ty_end + 1):
             for tx in range(tx_start, tx_end + 1):
-                if self._chunk_prefix:
-                    chunk_path = self._path / self._chunk_prefix / str(c_chunk) / str(ty) / str(tx)
-                else:
-                    chunk_path = self._path / str(c_chunk) / str(ty) / str(tx)
-                if not chunk_path.exists():
+                chunk = self._read_chunk(c_chunk, ty, tx)
+                if chunk is None:
                     continue  # fill_value (0) already in out
-
-                with open(chunk_path, 'rb') as fh:
-                    raw = fh.read()
-
-                if self._codec is not None:
-                    raw = self._codec.decode(raw)
-
-                # np.frombuffer returns a read-only view; copy() makes it writable
-                chunk = np.frombuffer(raw, dtype=self._dtype).reshape(cy, cx).copy()
+                channel_in_chunk = c_idx - c_chunk * cc
+                channel_data = chunk[channel_in_chunk]
 
                 # Region of this chunk that overlaps with request
                 t_y0 = ty * cy;  t_y1 = t_y0 + cy
@@ -349,13 +383,73 @@ class ZarrV3Array:
                 dy0 = gy0 - y0;  dy1 = dy0 + (sy1 - sy0)
                 dx0 = gx0 - x0;  dx1 = dx0 + (sx1 - sx0)
 
-                out[dy0:dy1, dx0:dx1] = chunk[sy0:sy1, sx0:sx1]
+                out[dy0:dy1, dx0:dx1] = channel_data[sy0:sy1, sx0:sx1]
 
         # SpatialData stores float32; replace NaN/Inf with 0 for clean rendering
         if np.issubdtype(self._dtype, np.floating):
             np.nan_to_num(out, copy=False)
 
         return out
+
+    def _chunk_path(self, c_chunk: int, y_chunk: int, x_chunk: int) -> Path:
+        indices = [str(c_chunk), str(y_chunk), str(x_chunk)]
+        if self._chunk_key_name == 'default':
+            indices.insert(0, 'c')
+        key = self._chunk_separator.join(indices)
+        return self._path / key
+
+    def _read_chunk(self, c_chunk: int, y_chunk: int, x_chunk: int) -> Optional[np.ndarray]:
+        key = (c_chunk, y_chunk, x_chunk)
+        with self._decoded_chunks_lock:
+            cached = self._decoded_chunks.get(key)
+            if cached is not None:
+                self._decoded_chunks.move_to_end(key)
+                return cached
+            key_lock = self._chunk_locks.setdefault(key, threading.Lock())
+
+        with key_lock:
+            with self._decoded_chunks_lock:
+                cached = self._decoded_chunks.get(key)
+                if cached is not None:
+                    self._decoded_chunks.move_to_end(key)
+                    return cached
+
+            chunk_path = self._chunk_path(c_chunk, y_chunk, x_chunk)
+            if not chunk_path.exists():
+                return None
+
+            with open(chunk_path, 'rb') as fh:
+                raw = fh.read()
+            if self._codec is not None:
+                raw = self._codec.decode(raw)
+
+            cc, cy, cx = self._chunk_shape
+            C, H, W = self._shape
+            actual_shape = (
+                min(cc, C - c_chunk * cc),
+                min(cy, H - y_chunk * cy),
+                min(cx, W - x_chunk * cx),
+            )
+            values = np.frombuffer(raw, dtype=self._dtype)
+            full_size = int(np.prod(self._chunk_shape))
+            actual_size = int(np.prod(actual_shape))
+            if values.size == full_size:
+                chunk = values.reshape(self._chunk_shape).copy()
+            elif values.size == actual_size:
+                chunk = values.reshape(actual_shape).copy()
+            else:
+                raise ValueError(
+                    f"Unexpected decoded chunk size {values.size} at {chunk_path}; "
+                    f"expected {full_size} or {actual_size} values"
+                )
+
+            with self._decoded_chunks_lock:
+                self._decoded_chunks[key] = chunk
+                self._decoded_chunks.move_to_end(key)
+                while len(self._decoded_chunks) > self._max_decoded_chunks:
+                    old_key, _ = self._decoded_chunks.popitem(last=False)
+                    self._chunk_locks.pop(old_key, None)
+            return chunk
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -414,16 +508,88 @@ def spatialdata_channel_maxima(img: 'ImageData') -> list[float]:
     if not isinstance(z_arr, ZarrV3Array):
         return [1.0] * len(img.channel_names)
 
-    C, H, W = z_arr.shape
-    maxima: list[float] = []
-    for c in range(C):
-        tile = z_arr[c, slice(0, H), slice(0, W)]
-        m = float(np.max(tile))
-        maxima.append(m if m > 0.0 else 1.0)
-    return maxima
+    return z_arr.channel_maxima()
 
 
-def open_spatialdata(path: str | Path, image_name: str | None = None) -> ImageData:
+class SpatialDataCollection:
+    """Metadata-only view of the image elements in a SpatialData store."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.images_dir = self.path / 'images'
+        if not self.images_dir.is_dir():
+            raise FileNotFoundError(f"No 'images' directory found in {self.path}")
+
+        self._metadata: dict[str, dict] = {}
+        root_meta_path = self.path / 'zarr.json'
+        if root_meta_path.exists():
+            with open(root_meta_path, 'r') as fh:
+                root_meta = json.load(fh)
+            metadata = root_meta.get('consolidated_metadata', {}).get('metadata', {})
+            if isinstance(metadata, dict):
+                self._metadata = metadata
+
+        image_names = []
+        for key, meta in self._metadata.items():
+            if not key.startswith('images/'):
+                continue
+            relative = key[len('images/'):]
+            if relative and '/' not in relative and meta.get('node_type') == 'group':
+                image_names.append(relative)
+
+        if not image_names:
+            image_names = [
+                item.name for item in self.images_dir.iterdir()
+                if item.is_dir() and (item / 'zarr.json').exists()
+            ]
+
+        def natural_key(value: str):
+            import re
+            return [int(part) if part.isdigit() else part.lower()
+                    for part in re.split(r'(\d+)', value)]
+
+        self.image_names = sorted(set(image_names), key=natural_key)
+        if 'stitched' in self.image_names:
+            self.image_names.remove('stitched')
+            self.image_names.insert(0, 'stitched')
+        if not self.image_names:
+            raise FileNotFoundError(f"No valid image group found inside {self.images_dir}")
+
+        self._panel = _parse_mcd_panel(self.path)
+
+    def __len__(self) -> int:
+        return len(self.image_names)
+
+    def open_image(self, image: int | str = 0) -> ImageData:
+        if isinstance(image, int):
+            try:
+                image_name = self.image_names[image]
+            except IndexError as exc:
+                raise IndexError(f"SpatialData image index {image} is out of range") from exc
+        else:
+            image_name = image
+            if image_name not in self.image_names:
+                raise KeyError(f"SpatialData image '{image_name}' was not found")
+        return open_spatialdata(
+            self.path,
+            image_name,
+            _metadata=self._metadata,
+            _panel=self._panel,
+        )
+
+
+def open_spatialdata_collection(path: str | Path) -> SpatialDataCollection:
+    """Open a SpatialData store without reading any image pixels."""
+    return SpatialDataCollection(path)
+
+
+def open_spatialdata(
+    path: str | Path,
+    image_name: str | None = None,
+    *,
+    _metadata: dict[str, dict] | None = None,
+    _panel: dict | None = None,
+) -> ImageData:
     """
     Open a SpatialData directory and return an *ImageData* compatible with the
     OME-TIFF backend.
@@ -471,21 +637,22 @@ def open_spatialdata(path: str | Path, image_name: str | None = None) -> ImageDa
 
     img_root = images_dir / image_name
     group_meta_path = img_root / 'zarr.json'
-    if not group_meta_path.exists():
-        raise FileNotFoundError(f"zarr.json not found at {group_meta_path}")
-
-    with open(group_meta_path, 'r') as fh:
-        group_meta = json.load(fh)
+    group_meta = (_metadata or {}).get(f'images/{image_name}')
+    if group_meta is None:
+        if not group_meta_path.exists():
+            raise FileNotFoundError(f"zarr.json not found at {group_meta_path}")
+        with open(group_meta_path, 'r') as fh:
+            group_meta = json.load(fh)
 
     # ── Channel names from OME-Zarr metadata ───────────────────────────────
     try:
         ch_defs = group_meta['attributes']['ome']['omero']['channels']
-        metal_names = [c.get('label', f'Channel {i}') for i, c in enumerate(ch_defs)]
+        metal_names = [str(c.get('label', f'Channel {i}')) for i, c in enumerate(ch_defs)]
     except (KeyError, TypeError):
         metal_names = []
 
     # ── Enrich names with protein labels from MCD panel ────────────────────
-    panel = _parse_mcd_panel(sdata_path)
+    panel = _panel if _panel is not None else _parse_mcd_panel(sdata_path)
     if panel:
         channel_names = [
             f"{m} / {panel[m]}" if m in panel else m
@@ -514,11 +681,13 @@ def open_spatialdata(path: str | Path, image_name: str | None = None) -> ImageDa
     for i, ds_entry in enumerate(datasets):
         lvl_path = img_root / ds_entry['path']
         arr_meta_path = lvl_path / 'zarr.json'
-        if not arr_meta_path.exists():
-            continue
-
-        with open(arr_meta_path, 'r') as fh:
-            arr_meta = json.load(fh)
+        level_name = str(ds_entry['path']).strip('/')
+        arr_meta = (_metadata or {}).get(f'images/{image_name}/{level_name}')
+        if arr_meta is None:
+            if not arr_meta_path.exists():
+                continue
+            with open(arr_meta_path, 'r') as fh:
+                arr_meta = json.load(fh)
 
         shape = tuple(arr_meta['shape'])  # (C, Y, X)
         if len(shape) != 3:

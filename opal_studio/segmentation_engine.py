@@ -80,7 +80,7 @@ def _postprocess_labels(labels, fill_holes=False, keep_largest=False):
         new_labels[mask] = idx
     return new_labels
 
-def run_segmentation_task_pipe(conn, params, input_channels_data):
+def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=None):
     """
     Worker function to run segmentation in a separate process.
     This prevents DLL conflicts between TensorFlow and PyTorch.
@@ -229,8 +229,16 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                     stride = TILE_SIZE - OVERLAP
                     ys = list(range(0, H, stride))
                     xs = list(range(0, W, stride))
+                    n_tiles = len(ys) * len(xs)
+                    tile_counter = 0
+                    offset_y = params.get("crop_offset_y", 0)
+                    offset_x = params.get("crop_offset_x", 0)
+                    full_shape = params.get("full_shape") or [H, W]
                     for y0 in ys:
                         for x0 in xs:
+                            if stop_event is not None and stop_event.is_set():
+                                conn.send({"type": "cancelled"})
+                                return
                             y1 = min(y0 + TILE_SIZE, H)
                             x1 = min(x0 + TILE_SIZE, W)
                             patch = raw_input[..., y0:y1, x0:x1]
@@ -251,6 +259,22 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                                 if inner_y0 <= cy < inner_y1 and inner_x0 <= cx < inner_x1:
                                     cell_mask[y0 + ys_obj, x0 + xs_obj] = next_id
                                     next_id += 1
+                            conn.send({
+                                "type": "tile_update",
+                                "tile_idx": tile_counter,
+                                "n_tiles": n_tiles,
+                                "y0": y0 + offset_y,
+                                "x0": x0 + offset_x,
+                                "y1": y1 + offset_y,
+                                "x1": x1 + offset_x,
+                                "tile_labels": cell_mask[y0:y1, x0:x1].copy(),
+                                "full_shape": full_shape,
+                                "name": params.get("override_name", "InstanSeg"),
+                                "is_cell_mask": False,
+                                "target_mode": params.get("target_mode", "new"),
+                                "target_mask_index": params.get("target_mask_index"),
+                            })
+                            tile_counter += 1
 
                 cell_mask = _postprocess_labels(
                     cell_mask,
@@ -426,9 +450,9 @@ def run_segmentation_task_pipe(conn, params, input_channels_data):
                     labels = np.squeeze(labeled_combined[0, ..., 0]).astype(np.int32)
                     results.append((labels, "Mesmer", False))
 
-        conn.send({"success": True, "results": results})
+        conn.send({"type": "result", "results": results})
     except Exception as e:
-        conn.send({"success": False, "error": str(e), "traceback": traceback.format_exc()})
+        conn.send({"type": "error", "error": str(e), "traceback": traceback.format_exc()})
     finally:
         conn.close()
 

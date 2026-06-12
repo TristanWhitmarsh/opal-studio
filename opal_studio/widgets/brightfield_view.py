@@ -43,6 +43,7 @@ class BrightfieldView(QWidget):
         self._dragging_point = False
         self._drag_point_info = None
         self._hovered_point_info = None
+        self._hovered_edge_info = None
 
         # Per-channel overlay cache: row → (fingerprint, QPixmap at full opacity)
         self._overlay_cache: dict[int, tuple[tuple, QPixmap]] = {}
@@ -130,6 +131,7 @@ class BrightfieldView(QWidget):
             self._dragging_point = False
             self._drag_point_info = None
             self._hovered_point_info = None
+            self._hovered_edge_info = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
@@ -204,6 +206,54 @@ class BrightfieldView(QWidget):
                 return [coords[0], coords[end]]
 
         return [QPointF(x, y) for (x, y) in rdp(pts, epsilon)]
+
+    def _point_to_segment_screen_dist(self, px, py, ax, ay, bx, by) -> float:
+        dx, dy = bx - ax, by - ay
+        if dx == 0 and dy == 0:
+            return math.hypot(px - ax, py - ay)
+        t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    def _remove_region_point(self, point_info):
+        from PySide6.QtGui import QPolygonF
+        ch, lid, poly_idx, pt_idx = point_info
+        poly = ch.contour_data[lid]["polygons"][poly_idx]
+        pts = [poly[i] for i in range(len(poly))]
+        n_unique = len(pts) - 1
+        if n_unique <= 3:
+            return
+        if pt_idx == len(pts) - 1:
+            pt_idx = 0
+        del pts[pt_idx]
+        del pts[-1]
+        pts.append(QPointF(pts[0]))
+        new_poly = QPolygonF(pts)
+        ch.contour_data[lid]["polygons"][poly_idx] = new_poly
+        xs = [pt.x() for pt in pts]
+        ys = [pt.y() for pt in pts]
+        ch.contour_data[lid]["bbox"] = [min(ys), min(xs), max(ys), max(xs)]
+        self._hovered_point_info = None
+        self._hovered_edge_info = None
+        self._model.channels_changed.emit()
+        self.update()
+
+    def _insert_region_point(self, edge_info, img_x, img_y):
+        from PySide6.QtGui import QPolygonF
+        ch, lid, poly_idx, edge_idx = edge_info
+        poly = ch.contour_data[lid]["polygons"][poly_idx]
+        pts = [poly[i] for i in range(len(poly))]
+        new_pt_idx = edge_idx + 1
+        pts.insert(new_pt_idx, QPointF(img_x, img_y))
+        new_poly = QPolygonF(pts)
+        ch.contour_data[lid]["polygons"][poly_idx] = new_poly
+        xs = [pt.x() for pt in pts]
+        ys = [pt.y() for pt in pts]
+        ch.contour_data[lid]["bbox"] = [min(ys), min(xs), max(ys), max(xs)]
+        self._hovered_edge_info = None
+        self._model.channels_changed.emit()
+        self.update()
+        return (ch, lid, poly_idx, new_pt_idx)
 
     # ── Per-channel overlay pixmap cache ─────────────────────────────────────
 
@@ -394,10 +444,21 @@ class BrightfieldView(QWidget):
     # ── Mouse events ──────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
+        if self._draw_mode and event.button() == Qt.MouseButton.RightButton:
+            if self._hovered_point_info is not None:
+                self._remove_region_point(self._hovered_point_info)
+            return
         if self._draw_mode and event.button() == Qt.MouseButton.LeftButton:
             if self._hovered_point_info is not None:
                 self._dragging_point = True
                 self._drag_point_info = self._hovered_point_info
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            elif self._hovered_edge_info is not None and self._pixmap is not None:
+                mx, my = event.position().x(), event.position().y()
+                ix, iy = self._screen_to_image(mx, my)
+                drag_info = self._insert_region_point(self._hovered_edge_info, ix, iy)
+                self._dragging_point = True
+                self._drag_point_info = drag_info
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
             else:
                 self._drawing = True
@@ -449,27 +510,52 @@ class BrightfieldView(QWidget):
                 self.viewportChanged.emit(vp)
 
         elif self._draw_mode:
-            # Hover detection for vertex handles
-            hovered = None
-            best_dist = 8.0
-            for ch in self._model._channels:
-                if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
-                    for lid, data in ch.contour_data.items():
-                        for poly_idx, poly in enumerate(data["polygons"]):
-                            for pt_idx, pt in enumerate(poly):
-                                sx, sy = self._image_to_screen(pt.x(), pt.y())
-                                dist = math.hypot(mx - sx, my - sy)
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    hovered = (ch, lid, poly_idx, pt_idx)
-            self._hovered_point_info = hovered
-            self.setCursor(Qt.CursorShape.PointingHandCursor if hovered else Qt.CursorShape.ArrowCursor)
+            self._update_hover(mx, my)
+
+    def _update_hover(self, mx: float, my: float):
+        hovered_pt = None
+        best_pt_dist = 8.0
+        hovered_edge = None
+        best_edge_dist = 8.0
+        for ch in self._model._channels:
+            if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
+                for lid, data in ch.contour_data.items():
+                    for poly_idx, poly in enumerate(data["polygons"]):
+                        n = len(poly)
+                        for pt_idx, pt in enumerate(poly):
+                            sx, sy = self._image_to_screen(pt.x(), pt.y())
+                            dist = math.hypot(mx - sx, my - sy)
+                            if dist < best_pt_dist:
+                                best_pt_dist = dist
+                                hovered_pt = (ch, lid, poly_idx, pt_idx)
+                        for edge_idx in range(n - 1):
+                            a = poly[edge_idx]
+                            b = poly[edge_idx + 1]
+                            ax, ay = self._image_to_screen(a.x(), a.y())
+                            bx, by = self._image_to_screen(b.x(), b.y())
+                            dist = self._point_to_segment_screen_dist(mx, my, ax, ay, bx, by)
+                            if dist < best_edge_dist:
+                                best_edge_dist = dist
+                                hovered_edge = (ch, lid, poly_idx, edge_idx)
+        if hovered_pt is not None:
+            self._hovered_point_info = hovered_pt
+            self._hovered_edge_info = None
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        elif hovered_edge is not None:
+            self._hovered_point_info = None
+            self._hovered_edge_info = hovered_edge
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._hovered_point_info = None
+            self._hovered_edge_info = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self._draw_mode and self._dragging_point:
             self._dragging_point = False
             self._drag_point_info = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            mx, my = event.position().x(), event.position().y()
+            self._update_hover(mx, my)
             self.update()
         elif self._draw_mode and self._drawing:
             self._drawing = False
@@ -522,6 +608,12 @@ class BrightfieldView(QWidget):
         vp = self.get_image_viewport()
         if vp is not None:
             self.viewportChanged.emit(vp)
+
+    def contextMenuEvent(self, event):
+        if self._draw_mode:
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if not self._draw_mode:
