@@ -10,6 +10,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
+from opal_studio.widgets.geometry import clip_polygon_to_rect
+
 
 class BrightfieldView(QWidget):
     """
@@ -563,7 +565,11 @@ class BrightfieldView(QWidget):
                 self._drawn_points.append(self._drawn_points[0])
                 simplified = self._simplify_contour(
                     self._drawn_points, self._simplification_epsilon)
-                self.regionDrawn.emit(simplified)
+                if self._pixmap is not None:
+                    simplified = clip_polygon_to_rect(
+                        simplified, self._pixmap.width(), self._pixmap.height())
+                if len(simplified) >= 4:  # 3 unique vertices + closing point
+                    self.regionDrawn.emit(simplified)
             self._drawn_points = []
             self.update()
         elif event.button() == Qt.MouseButton.LeftButton:

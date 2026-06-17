@@ -61,6 +61,7 @@ from opal_studio.image_loader import (
     ImageData, TileCache, best_level_for_zoom, get_tile, _get_yx,
 )
 from opal_studio.image_renderer import render_viewport_tiled, render_overview
+from opal_studio.widgets.geometry import clip_polygon_to_rect
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 TILE_SIZE       = 512   # tile size passed to the renderer / cache key unit
@@ -366,6 +367,14 @@ class ImageCanvas(QWidget):
 
         simplified_pts = rdp(pts, epsilon)
         return [QPointF(x, y) for (x, y) in simplified_pts]
+
+    def _clip_to_image(self, points: list[QPointF]) -> list[QPointF]:
+        """Crop a drawn contour to the image bounds (parts outside are clipped)."""
+        if not self._img:
+            return points
+        axes = self._img._tif.series[0].axes.upper() if self._img._tif else ""
+        ih, iw = _get_yx(self._img.base_shape, axes, self._img.is_rgb)
+        return clip_polygon_to_rect(points, iw, ih)
 
     def _point_to_segment_screen_dist(self, px, py, ax, ay, bx, by) -> float:
         """Perpendicular (clamped) distance from screen point (px,py) to segment (ax,ay)-(bx,by)."""
@@ -885,7 +894,9 @@ class ImageCanvas(QWidget):
             if len(self._drawn_points) >= 3:
                 self._drawn_points.append(self._drawn_points[0])
                 simplified = self._simplify_contour(self._drawn_points, getattr(self, "_simplification_epsilon", 1.0))
-                self.regionDrawn.emit(simplified)
+                simplified = self._clip_to_image(simplified)
+                if len(simplified) >= 4:  # 3 unique vertices + closing point
+                    self.regionDrawn.emit(simplified)
             self._drawn_points = []
             self.update()
         elif self._panning:
