@@ -264,7 +264,8 @@ class FilterTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -381,7 +382,8 @@ class MergeTab(QWidget):
         self._channel2_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel1_combo.addItem(ch.name, i)
                 self._channel2_combo.addItem(ch.name, i)
         
@@ -560,7 +562,8 @@ class StarDistTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -662,7 +665,8 @@ class CellposeTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -776,7 +780,8 @@ class OmniposeTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -886,7 +891,8 @@ class InstanSegTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
@@ -1093,7 +1099,8 @@ class MesmerTab(QWidget):
         self._membrane_combo.addItem("None", -1)
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._nuclear_combo.addItem(ch.name, i)
                 self._membrane_combo.addItem(ch.name, i)
         
@@ -1221,7 +1228,8 @@ class WatershedTab(QWidget):
         self._channel_combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
-            if not ch.is_mask and not getattr(ch, "is_region", False):
+            if (not ch.is_mask and not ch.is_cell_mask
+                    and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)

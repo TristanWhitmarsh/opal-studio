@@ -75,7 +75,23 @@
       "PowerShell(if \\($?\\) { \"COMPILE OK\" })",
       "PowerShell($h = Get-ChildItem -Path \"$env:USERPROFILE\\\\anaconda3\\\\Scripts\\\\conda.exe\",\"$env:USERPROFILE\\\\miniconda3\\\\Scripts\\\\conda.exe\",\"$env:LOCALAPPDATA\\\\anaconda3\\\\Scripts\\\\conda.exe\",\"C:\\\\ProgramData\\\\anaconda3\\\\Scripts\\\\conda.exe\",\"C:\\\\ProgramData\\\\miniconda3\\\\Scripts\\\\conda.exe\" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName; \"CONDA: $h\")",
       "PowerShell(& \"$env:USERPROFILE\\\\miniconda3\\\\shell\\\\condabin\\\\conda-hook.ps1\"; conda activate opal-all; python -m py_compile opal_studio/widgets/geometry.py opal_studio/widgets/image_canvas.py opal_studio/widgets/brightfield_view.py; if \\($?\\) { \"COMPILE OK\" })",
-      "PowerShell(& \"$env:USERPROFILE\\\\miniconda3\\\\shell\\\\condabin\\\\conda-hook.ps1\"; conda activate opal-all; python _clip_test.py)"
+      "PowerShell(& \"$env:USERPROFILE\\\\miniconda3\\\\shell\\\\condabin\\\\conda-hook.ps1\"; conda activate opal-all; python _clip_test.py)",
+      "PowerShell(conda run -n opal-all python -c \"import importlib, sys; print\\('python', sys.version.split\\(\\)[0]\\); [print\\(f'{m:12s} OK  '+str\\(getattr\\(importlib.import_module\\(m\\),'__version__','?'\\)\\)\\) if _try\\(m\\) else None for m in []]\" 2>$null)",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_probe_env.py\")",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_project_io.py\")",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_reader_compat.py\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_project_integration.py\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_project_integration.py\"; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_pheno.py\"; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_probe_keras.py\")",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" -c \"import tensorflow as tf; print\\(tf.__file__\\)\")",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" -m pip install --force-reinstall --no-deps tensorflow==2.14.1 tensorflow-intel==2.14.1)",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_dup.py\" 2>&1 | Select-String -Pattern \"MODEL|SAVED|AFTER|FRESH|COUNT\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_dup_sdata.py\" 2>&1 | Select-String -Pattern \"backend load|collection|BEFORE|SAVED|source_image|AFTER\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo.py\" 2>&1 | Select-String -Pattern \"AFTER\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo_sdata.py\" 2>&1 | Select-String -Pattern \"AFTER\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo_items.py\" 2>&1 | Select-String -Pattern \"STARDIST\")",
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_saveflow.py\" 2>&1 | Select-String -Pattern \"after|Save Project|SAVE FLOW|Error|assert\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Tristan\\Dropbox\\HologicReader"

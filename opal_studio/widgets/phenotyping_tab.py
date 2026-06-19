@@ -286,6 +286,30 @@ class PhenotypingTab(QWidget):
             definitions[c_type] = criteria
         return definitions
 
+    def export_state(self) -> dict:
+        """Serialise the phenotyping table to a JSON-friendly dict.
+
+        Only non-empty (Pos/Neg) cells are stored; markers are kept by name so
+        the table survives even if the current channel set differs on reload.
+        """
+        return {
+            "cell_types": list(self._cell_types),
+            "states": [[ch, ct, int(st)]
+                       for (ch, ct), st in self._cell_states.items() if st],
+        }
+
+    def import_state(self, state: dict) -> None:
+        """Restore the phenotyping table from :meth:`export_state` output."""
+        self._cell_types = list(state.get("cell_types", []))
+        self._cell_states = {}
+        for entry in state.get("states", []):
+            try:
+                ch, ct, st = entry
+            except (TypeError, ValueError):
+                continue
+            self._cell_states[(ch, ct)] = int(st)
+        self._refresh_rows()
+
     def clear(self):
         """Reset all phenotyping definitions and states."""
         self._cell_states = {}

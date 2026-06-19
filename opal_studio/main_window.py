@@ -44,6 +44,17 @@ from skimage.segmentation import find_boundaries
 from skimage.measure import find_contours
 from skimage.morphology import white_tophat, opening, closing, disk
 
+
+def project_io_unique(existing: dict, name: str) -> str:
+    """Return a key based on *name* that is not already present in *existing*."""
+    if name not in existing:
+        return name
+    i = 1
+    while f"{name}_{i}" in existing:
+        i += 1
+    return f"{name}_{i}"
+
+
 def expand_labels_watershed(labels, expansion_pixels=6):
     """
     Expand labeled regions using watershed, ensuring touching cells are separated.
@@ -124,6 +135,7 @@ class MainWindow(QMainWindow):
         # Data model
         self._channel_model = ChannelListModel()
         self._image: ImageData | None = None
+        self._project_path: str | None = None   # current .zarr project file, if any
         self._spatialdata_collection = None
         self._spatialdata_slice_index = 0
         self._pending_spatialdata_slice = 0
@@ -253,78 +265,101 @@ class MainWindow(QMainWindow):
     def _setup_menus(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
-        
+
+        # ── Open ────────────────────────────────────────────────────────────
         open_act = QAction("&Open Image…", self)
         open_act.setShortcut("Ctrl+O")
         open_act.triggered.connect(self._on_open)
         file_menu.addAction(open_act)
 
-        open_sdata_act = QAction("Open &SpatialData…", self)
+        open_sdata_act = QAction("Open S&patialData…", self)
         open_sdata_act.setShortcut("Ctrl+Shift+O")
         open_sdata_act.triggered.connect(self._on_open_spatialdata)
         file_menu.addAction(open_sdata_act)
 
-        file_menu.addSeparator()
-
-        load_masks_act = QAction("&Load Masks…", self)
-        load_masks_act.triggered.connect(lambda: self._on_import_masks(target="mask"))
-        file_menu.addAction(load_masks_act)
-
-        load_contours_act = QAction("Load &Contours…", self)
-        load_contours_act.triggered.connect(self._on_import_contours)
-        file_menu.addAction(load_contours_act)
-
-        load_positivity_act = QAction("Load &Positivity…", self)
-        load_positivity_act.triggered.connect(lambda: self._on_import_masks(target="cell"))
-        file_menu.addAction(load_positivity_act)
-
-        load_types_act = QAction("Load &Types…", self)
-        load_types_act.triggered.connect(self._on_import_types)
-        file_menu.addAction(load_types_act)
-
-        load_regions_act = QAction("Load &Regions…", self)
-        load_regions_act.triggered.connect(self._on_import_regions)
-        file_menu.addAction(load_regions_act)
-
-        load_phenos_act = QAction("Load P&henotyping…", self)
-        load_phenos_act.triggered.connect(self._on_import_phenotypes)
-        file_menu.addAction(load_phenos_act)
+        open_project_act = QAction("Open Pro&ject…", self)
+        open_project_act.triggered.connect(self._on_open_project)
+        file_menu.addAction(open_project_act)
 
         file_menu.addSeparator()
 
-        save_masks_act = QAction("&Save Masks…", self)
-        save_masks_act.triggered.connect(lambda: self._on_export_masks(target="mask"))
-        file_menu.addAction(save_masks_act)
+        # ── Save project (primary save) ─────────────────────────────────────
+        save_project_act = QAction("&Save Project", self)
+        save_project_act.setShortcut("Ctrl+S")
+        save_project_act.triggered.connect(self._on_save_project)
+        file_menu.addAction(save_project_act)
 
-        save_contours_act = QAction("Save Con&toursS…", self)
-        save_contours_act.triggered.connect(self._on_export_contours)
-        file_menu.addAction(save_contours_act)
+        save_project_as_act = QAction("Save Project &As…", self)
+        save_project_as_act.setShortcut("Ctrl+Shift+S")
+        save_project_as_act.triggered.connect(self._on_save_project_as)
+        file_menu.addAction(save_project_as_act)
 
-        save_positivity_act = QAction("Save &Positivity…", self)
-        save_positivity_act.triggered.connect(lambda: self._on_export_masks(target="cell"))
-        file_menu.addAction(save_positivity_act)
-
-        save_types_act = QAction("Save &Types…", self)
-        save_types_act.triggered.connect(self._on_export_types)
-        file_menu.addAction(save_types_act)
-
-        save_regions_act = QAction("Save &Regions…", self)
-        save_regions_act.triggered.connect(self._on_export_regions)
-        file_menu.addAction(save_regions_act)
-
-        save_phenos_act = QAction("Save P&henotyping…", self)
-        save_phenos_act.triggered.connect(self._on_export_phenotypes)
-        file_menu.addAction(save_phenos_act)
-
-        save_brightfield_act = QAction("Save &Brightfield…", self)
-        save_brightfield_act.triggered.connect(self._on_export_brightfield)
-        file_menu.addAction(save_brightfield_act)
-
-        save_cells_act = QAction("Save Cell Data…", self)
-        save_cells_act.triggered.connect(self._on_export_cells)
-        file_menu.addAction(save_cells_act)
-        
         file_menu.addSeparator()
+
+        # ── Import individual elements ──────────────────────────────────────
+        import_menu = file_menu.addMenu("&Import")
+
+        act = QAction("&Masks…", self)
+        act.triggered.connect(lambda: self._on_import_masks(target="mask"))
+        import_menu.addAction(act)
+
+        act = QAction("&Positivity…", self)
+        act.triggered.connect(lambda: self._on_import_masks(target="cell"))
+        import_menu.addAction(act)
+
+        act = QAction("&Types…", self)
+        act.triggered.connect(self._on_import_types)
+        import_menu.addAction(act)
+
+        act = QAction("&Regions…", self)
+        act.triggered.connect(self._on_import_regions)
+        import_menu.addAction(act)
+
+        act = QAction("&Contours…", self)
+        act.triggered.connect(self._on_import_contours)
+        import_menu.addAction(act)
+
+        act = QAction("P&henotyping…", self)
+        act.triggered.connect(self._on_import_phenotypes)
+        import_menu.addAction(act)
+
+        # ── Export individual elements ──────────────────────────────────────
+        export_menu = file_menu.addMenu("&Export")
+
+        act = QAction("&Masks…", self)
+        act.triggered.connect(lambda: self._on_export_masks(target="mask"))
+        export_menu.addAction(act)
+
+        act = QAction("&Positivity…", self)
+        act.triggered.connect(lambda: self._on_export_masks(target="cell"))
+        export_menu.addAction(act)
+
+        act = QAction("&Types…", self)
+        act.triggered.connect(self._on_export_types)
+        export_menu.addAction(act)
+
+        act = QAction("&Regions…", self)
+        act.triggered.connect(self._on_export_regions)
+        export_menu.addAction(act)
+
+        act = QAction("&Contours…", self)
+        act.triggered.connect(self._on_export_contours)
+        export_menu.addAction(act)
+
+        act = QAction("P&henotyping…", self)
+        act.triggered.connect(self._on_export_phenotypes)
+        export_menu.addAction(act)
+
+        act = QAction("&Brightfield…", self)
+        act.triggered.connect(self._on_export_brightfield)
+        export_menu.addAction(act)
+
+        act = QAction("Cell &Data…", self)
+        act.triggered.connect(self._on_export_cells)
+        export_menu.addAction(act)
+
+        file_menu.addSeparator()
+
         quit_act = QAction("&Quit", self)
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
@@ -342,6 +377,8 @@ class MainWindow(QMainWindow):
     def _load_spatialdata(self, path: str):
         """Open a SpatialData directory and set it as the active image."""
         try:
+            self._project_path = None
+            self.setWindowTitle("Opal Studio")
             collection = open_spatialdata_collection(path)
             img = collection.open_image(0)
             self._image = img
@@ -480,6 +517,8 @@ class MainWindow(QMainWindow):
     def _load_image(self, path: str):
         try:
             self._slice_load_timer.stop()
+            self._project_path = None
+            self.setWindowTitle("Opal Studio")
             self._spatialdata_collection = None
             self._slice_controls.hide()
             img = open_image(path)
@@ -1431,13 +1470,16 @@ class MainWindow(QMainWindow):
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Export Error", f"Could not export cell data: {e}")
 
-    def _save_cells_h5ad(self, path: str, df, metadata: dict):
+    def _build_cells_anndata(self, df, metadata: dict, region_name: str | None = None):
+        """Build a per-cell AnnData from the export DataFrame.
+
+        When *region_name* is given, the table is linked to that labels element
+        via SpatialData's ``uns['spatialdata_attrs']`` so a SpatialData reader
+        can associate each row with its cell in the label map.
+        """
         import anndata as ad
         import pandas as pd
         import datetime
-
-        if not path.lower().endswith(".h5ad"):
-            path += ".h5ad"
 
         marker_names = metadata.get("marker_names", [])
         pixel_size   = metadata.get("pixel_size_um", 1.0)
@@ -1452,6 +1494,9 @@ class MainWindow(QMainWindow):
                 obs_keys.append(k)
         obs = df[obs_keys].copy()
         obs.index = obs["cell_id"].astype(str)
+        # The index must not share a name with a column (the AnnData zarr writer
+        # rejects that), so clear it; the integer cell_id stays as a column.
+        obs.index.name = None
 
         var = pd.DataFrame(index=pd.Index(var_names, name="marker"))
 
@@ -1472,9 +1517,433 @@ class MainWindow(QMainWindow):
             "export_date":   datetime.datetime.now().isoformat(),
         }
 
+        if region_name is not None:
+            adata.obs["region"] = pd.Categorical([region_name] * len(adata))
+            adata.uns["spatialdata_attrs"] = {
+                "region": region_name,
+                "region_key": "region",
+                "instance_key": "cell_id",
+            }
+
+        return adata
+
+    def _save_cells_h5ad(self, path: str, df, metadata: dict):
+        if not path.lower().endswith(".h5ad"):
+            path += ".h5ad"
+
+        adata = self._build_cells_anndata(df, metadata)
         adata.write_h5ad(path)
         self._status.showMessage(
             f"Exported {len(df)} cells to {Path(path).name}", 5000)
+
+    # ------------------------------------------------------------------
+    # Project save / load  (SpatialData-style Zarr store)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _qpoly_to_rings(contour_entry: dict) -> list:
+        """Convert a contour_data entry's QPolygonF list to [[ [x, y], ... ], ...]."""
+        rings = []
+        for poly in contour_entry.get("polygons", []):
+            rings.append([[poly.at(i).x(), poly.at(i).y()]
+                          for i in range(poly.count())])
+        return rings
+
+    @staticmethod
+    def _rings_to_contour_data(shapes_dict: dict) -> dict:
+        """Inverse of _qpoly_to_rings — rebuild a contour_data dict for a region."""
+        from PySide6.QtGui import QPolygonF
+        from PySide6.QtCore import QPointF
+        contour_data = {}
+        for sid, rings in shapes_dict.items():
+            polygons, xs, ys = [], [], []
+            for ring in rings:
+                polygons.append(QPolygonF([QPointF(float(x), float(y)) for x, y in ring]))
+                xs.extend(p[0] for p in ring)
+                ys.extend(p[1] for p in ring)
+            if not polygons:
+                continue
+            try:
+                key = int(sid)
+            except (TypeError, ValueError):
+                key = sid
+            contour_data[key] = {
+                "polygons": polygons,
+                "bbox": [min(ys), min(xs), max(ys), max(xs)] if xs else [0, 0, 0, 0],
+            }
+        return contour_data
+
+    def _channel_display_entry(self, ch) -> dict:
+        """Serialise a channel's display state (no pixel data) to a JSON dict."""
+        c = ch.color
+        return {
+            "name": ch.name,
+            "color": [c.red(), c.green(), c.blue()],
+            "visible": bool(ch.visible),
+            "selected": bool(ch.selected),
+            "range_min": float(ch.range_min),
+            "range_max": float(ch.range_max),
+            "data_min": float(ch.data_min),
+            "data_max": float(ch.data_max),
+            "alpha": float(ch.alpha),
+            "contour_visible": bool(ch.contour_visible),
+            "random_contour_colors": bool(ch.random_contour_colors),
+            "source_marker": ch.source_marker or "",
+            "index": int(ch.index),
+        }
+
+    def _on_save_project(self):
+        """Save to the current project file, prompting only if none is set yet."""
+        if not self._image:
+            QMessageBox.information(self, "Save Project",
+                                   "Open an image before saving a project.")
+            return
+        if not self._project_path:
+            self._on_save_project_as()
+            return
+        self._write_project_to(self._project_path)
+
+    def _on_save_project_as(self):
+        """Always prompt for a new project location."""
+        if not self._image:
+            QMessageBox.information(self, "Save Project",
+                                   "Open an image before saving a project.")
+            return
+        suggested = self._project_path or "project.zarr"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project As", suggested,
+            "Opal Studio Project (*.zarr)")
+        if not path:
+            return
+        if not path.lower().endswith(".zarr"):
+            path += ".zarr"
+        self._write_project_to(path)
+
+    def _write_project_to(self, path: str):
+        try:
+            self._status.showMessage("Saving project…")
+            QApplication.processEvents()
+            n = self._save_project(path)
+            self._project_path = path
+            self.setWindowTitle(f"Opal Studio — {Path(path).name}")
+            self._status.showMessage(
+                f"Saved project ({n} elements) to {Path(path).name}", 5000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Save Error", f"Could not save project: {e}")
+
+    def _save_project(self, path: str) -> int:
+        """Assemble a ProjectDocument from the current session and write it."""
+        from opal_studio import project_io
+
+        store_path = Path(path)
+        doc = project_io.ProjectDocument()
+
+        # ── Source-image reference (never copied, only referenced) ──────────
+        if self._spatialdata_collection is not None:
+            backend = "spatialdata"
+            image_name = self._spatialdata_collection.image_names[
+                self._spatialdata_slice_index]
+            slice_index = self._spatialdata_slice_index
+        else:
+            backend = "ome-tiff"
+            image_name = None
+            slice_index = None
+        doc.source_image = project_io.make_source_reference(
+            self._image.path, store_path,
+            backend=backend, base_shape=self._image.base_shape,
+            axes=self._image.axes, channel_names=self._image.channel_names,
+            image_name=image_name, slice_index=slice_index,
+        )
+
+        # ── Walk channels: build display state + collect element arrays ─────
+        channel_entries: list[dict] = []
+        derived_arrays: list[np.ndarray] = []
+        derived_labels: list[str] = []
+        first_cell_mask_key: str | None = None
+
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            entry = self._channel_display_entry(ch)
+
+            if getattr(ch, "is_region", False):
+                entry["kind"] = "region"
+                if ch.contour_data:
+                    key = project_io_unique(doc.shapes, ch.name)
+                    doc.shapes[key] = {str(sid): self._qpoly_to_rings(data)
+                                       for sid, data in ch.contour_data.items()}
+                    entry["data_ref"] = ["regions", key]
+            elif ch.is_type_mask or ch.is_cell_mask or ch.is_mask:
+                entry["kind"] = ("type_mask" if ch.is_type_mask else
+                                 "cell_mask" if ch.is_cell_mask else "mask")
+                if ch.mask_data is not None:
+                    key = project_io_unique(doc.labels, ch.name)
+                    doc.labels[key] = np.asarray(ch.mask_data)
+                    entry["data_ref"] = ["labels", key]
+                    if ch.is_cell_mask and first_cell_mask_key is None:
+                        first_cell_mask_key = key
+                    if ch.is_cell_mask and ch.pos_lut is not None:
+                        doc.aux[f"pos_lut__{key}"] = np.asarray(ch.pos_lut)
+                        entry["has_pos_lut"] = True
+                    if ch.processed_data is not None:
+                        doc.aux[f"auxlabels__{key}"] = np.asarray(ch.processed_data)
+                        entry["has_aux"] = True
+            elif ch.is_processed and ch.processed_data is not None:
+                entry["kind"] = "derived"
+                entry["data_ref"] = ["derived", len(derived_arrays)]
+                derived_arrays.append(np.asarray(ch.processed_data))
+                derived_labels.append(ch.name)
+            else:
+                entry["kind"] = "original"
+                entry["data_ref"] = None
+
+            channel_entries.append(entry)
+
+        if derived_arrays:
+            doc.images["derived"] = {
+                "data": np.stack(derived_arrays, axis=0),
+                "channel_labels": derived_labels,
+            }
+
+        # ── Brightfield (separate image element, not a marker channel) ──────
+        bf = getattr(self, "_brightfield_rgb", None)
+        if bf is not None:
+            doc.images["brightfield"] = {
+                "data": np.transpose(np.asarray(bf), (2, 0, 1)),  # (H,W,3)->(3,H,W)
+                "channel_labels": ["R", "G", "B"],
+            }
+
+        # ── Per-cell table (linked to the first cell mask) ──────────────────
+        try:
+            df, metadata = self._build_cell_export_dataframe()
+            if df is not None:
+                doc.table = self._build_cells_anndata(
+                    df, metadata,
+                    region_name=first_cell_mask_key or "cell_masks")
+        except Exception:
+            import traceback; traceback.print_exc()
+
+        # ── Clustering / analysis session state ─────────────────────────────
+        clustering: dict = {}
+        if self._cluster_cell_ids is not None and self._cluster_labels_arr is not None:
+            doc.aux["cluster_cell_ids"] = np.asarray(self._cluster_cell_ids)
+            doc.aux["cluster_labels"] = np.asarray(self._cluster_labels_arr)
+            if self._cluster_working_labels is not None:
+                doc.aux["cluster_working_labels"] = np.asarray(self._cluster_working_labels)
+                clustering["working_labels_key"] = "cluster_working_labels"
+            names = self._clustering_heatmap_tab.get_cluster_names()
+            clustering["names"] = {str(k): v for k, v in names.items()}
+
+        heatmap_data = getattr(self._clustering_heatmap_tab, "_heatmap_data", None)
+        if heatmap_data is not None:
+            doc.aux["heatmap_data"] = np.asarray(heatmap_data)
+            clustering["heatmap"] = {
+                "cluster_ids": [int(c) for c in
+                                getattr(self._clustering_heatmap_tab, "_cluster_ids", [])],
+                "channel_names": list(
+                    getattr(self._clustering_heatmap_tab, "_channel_names", [])),
+            }
+
+        # ── Session block ───────────────────────────────────────────────────
+        doc.session = {
+            "pixel_size": float(self._ops_panel.get_pixel_size()),
+            "channels": channel_entries,
+            "clustering": clustering,
+            "phenotyping": self._phenotyping_tab.export_state(),
+        }
+
+        project_io.save_project(store_path, doc)
+        return (len(doc.images) + len(doc.labels) + len(doc.shapes)
+                + (1 if doc.table is not None else 0))
+
+    def _on_open_project(self):
+        path = QFileDialog.getExistingDirectory(self, "Open Project (.zarr)", "")
+        if path:
+            self._load_project(path)
+
+    def _load_project(self, path: str):
+        from opal_studio import project_io
+        from PySide6.QtGui import QColor
+
+        try:
+            doc = project_io.load_project(path)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Open Error", f"Not a valid project: {e}")
+            return
+
+        # ── Resolve and reopen the referenced original image ────────────────
+        ref = doc.source_image or {}
+        backend = ref.get("backend", "ome-tiff")
+        src = project_io.resolve_source_path(ref, Path(path))
+        if src is None:
+            src = self._prompt_for_source(ref, backend)
+            if src is None:
+                self._status.showMessage("Project load cancelled.", 4000)
+                return
+
+        try:
+            self._slice_load_timer.stop()
+            if backend == "spatialdata":
+                collection = open_spatialdata_collection(src)
+                self._spatialdata_collection = collection
+                idx = int(ref.get("slice_index", 0) or 0)
+                idx = max(0, min(idx, len(collection) - 1))
+                img = collection.open_image(idx)
+                self._spatialdata_slice_index = idx
+                self._pending_spatialdata_slice = idx
+            else:
+                collection = None
+                self._spatialdata_collection = None
+                img = open_image(str(src))
+            self._image = img
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Open Error",
+                                 f"Could not open the referenced image: {e}")
+            return
+
+        # ── Rebuild channels from saved display state + element arrays ──────
+        derived = doc.images.get("derived", {}).get("data")
+        channels: list = []
+        for entry in doc.session.get("channels", []):
+            kind = entry.get("kind", "original")
+            ref_ = entry.get("data_ref")
+            common = dict(
+                name=entry.get("name", ""),
+                color=QColor(*entry.get("color", [255, 255, 255])),
+                visible=entry.get("visible", True),
+                selected=entry.get("selected", False),
+                range_min=entry.get("range_min", 0.0),
+                range_max=entry.get("range_max", 1.0),
+                data_min=entry.get("data_min", 0.0),
+                data_max=entry.get("data_max", 1.0),
+                alpha=entry.get("alpha", 1.0),
+                contour_visible=entry.get("contour_visible", False),
+                random_contour_colors=entry.get("random_contour_colors", True),
+                source_marker=entry.get("source_marker", ""),
+                index=int(entry.get("index", -1)),
+            )
+
+            if kind == "derived" and derived is not None and ref_:
+                common["is_processed"] = True
+                common["processed_data"] = derived[int(ref_[1])]
+            elif kind in ("cell_mask", "mask", "type_mask") and ref_:
+                key = ref_[1]
+                mask = doc.labels.get(key)
+                if mask is None:
+                    continue
+                common["mask_data"] = np.asarray(mask)
+                common["contour_data"] = self._get_contour_data(common["mask_data"])
+                common["is_cell_mask"] = (kind == "cell_mask")
+                common["is_type_mask"] = (kind == "type_mask")
+                common["is_mask"] = (kind == "mask")
+                if entry.get("has_pos_lut"):
+                    common["pos_lut"] = doc.aux.get(f"pos_lut__{key}")
+                if entry.get("has_aux"):
+                    common["processed_data"] = doc.aux.get(f"auxlabels__{key}")
+            elif kind == "region" and ref_:
+                common["is_region"] = True
+                common["contour_data"] = self._rings_to_contour_data(
+                    doc.shapes.get(ref_[1], {}))
+            # kind == "original": data comes from the reopened image via index
+
+            channels.append(Channel(**common))
+
+        self._channel_model.set_channels(channels)
+        self._canvas.set_image(img)
+
+        # ── Slice controls (SpatialData multi-slice) ────────────────────────
+        if collection is not None and len(collection) > 1:
+            self._slice_scrollbar.blockSignals(True)
+            self._slice_scrollbar.setRange(1, len(collection))
+            self._slice_scrollbar.setValue(self._spatialdata_slice_index + 1)
+            self._slice_scrollbar.blockSignals(False)
+            self._slice_label.setText(
+                f"Slice {self._spatialdata_slice_index + 1} / {len(collection)}: "
+                f"{collection.image_names[self._spatialdata_slice_index]}")
+            self._slice_controls.show()
+        else:
+            self._slice_controls.hide()
+
+        # ── Brightfield ─────────────────────────────────────────────────────
+        bf = doc.images.get("brightfield", {}).get("data")
+        if bf is not None:
+            rgb = np.ascontiguousarray(np.transpose(np.asarray(bf), (1, 2, 0)))
+            self._brightfield_rgb = rgb.astype(np.uint8, copy=False)
+            self._brightfield_view.set_image(self._brightfield_rgb)
+
+        # ── Restore session: pixel size, clustering, heatmap ────────────────
+        self._restore_session_state(doc)
+
+        self._project_path = path
+        self.setWindowTitle(f"Opal Studio — {Path(path).name}")
+        self._status.showMessage(
+            f"Loaded project {Path(path).name}", 5000)
+
+    def _prompt_for_source(self, ref: dict, backend: str):
+        """Ask the user to locate the original image when the reference is stale."""
+        name = ref.get("channel_names") and ref.get("uri") or ref.get("uri", "the image")
+        QMessageBox.information(
+            self, "Locate Original Image",
+            "The original image referenced by this project could not be found at:\n\n"
+            f"{ref.get('uri', '(unknown)')}\n\n"
+            "Please locate it, or cancel to abort loading.")
+        if backend == "spatialdata":
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Locate Original SpatialData Directory", "")
+            return chosen or None
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Locate Original Image", "",
+            "Images (*.ome.tiff *.tiff *.tif *.png *.jpg);;All files (*)")
+        return chosen or None
+
+    def _restore_session_state(self, doc) -> None:
+        """Restore pixel size, clustering arrays and the heatmap tab."""
+        session = doc.session or {}
+
+        # Pixel size → segmentation tabs that expose a _pixel_size field
+        ps = session.get("pixel_size")
+        if ps:
+            for attr in ("_instanseg_tab", "_mesmer_tab"):
+                tab = getattr(self._ops_panel, attr, None)
+                field = getattr(tab, "_pixel_size", None)
+                if field is not None:
+                    try:
+                        field.setText(str(ps))
+                    except Exception:
+                        pass
+
+        # Phenotyping definitions table
+        phenotyping = session.get("phenotyping")
+        if phenotyping:
+            try:
+                self._phenotyping_tab.import_state(phenotyping)
+            except Exception:
+                import traceback; traceback.print_exc()
+
+        # Clustering assignment arrays (enable cluster→cell identification again)
+        self._cluster_cell_ids = doc.aux.get("cluster_cell_ids")
+        self._cluster_labels_arr = doc.aux.get("cluster_labels")
+        self._cluster_working_labels = doc.aux.get("cluster_working_labels")
+
+        clustering = session.get("clustering", {})
+
+        # Heatmap tab
+        heatmap = clustering.get("heatmap")
+        heatmap_data = doc.aux.get("heatmap_data")
+        if heatmap and heatmap_data is not None:
+            try:
+                self._clustering_heatmap_tab.set_heatmap(
+                    heatmap.get("cluster_ids", []),
+                    heatmap.get("channel_names", []),
+                    np.asarray(heatmap_data))
+                names = clustering.get("names", {})
+                if names:
+                    self._clustering_heatmap_tab.rename_clusters(
+                        {int(k): v for k, v in names.items()})
+            except Exception:
+                import traceback; traceback.print_exc()
 
     # ------------------------------------------------------------------
     # Segmentation
