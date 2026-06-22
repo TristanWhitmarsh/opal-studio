@@ -286,6 +286,23 @@ class ImageCanvas(QWidget):
             self.update()
         self._schedule_render()
 
+    def clear(self):
+        """Unload the current image and return the canvas to a blank state."""
+        self._img = None
+        self._tile_cache.clear()
+        self._display_image = None
+        self._display_viewport = QRectF()
+        self._display_level_idx = -1
+        self._display_channel_version = -1
+        self._progressive_image = None
+        self._progressive_viewport = QRectF()
+        self._progressive_level_idx = -1
+        self._overview = None
+        self._channel_version += 1
+        self._pending_seq = self._seq
+        self._viewport = QRectF(0, 0, 0, 0)
+        self.update()
+
     # ── Channel change ────────────────────────────────────────────────────────
 
     def _on_channels_changed(self):

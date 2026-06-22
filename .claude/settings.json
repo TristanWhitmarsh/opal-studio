@@ -91,7 +91,8 @@
       "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo.py\" 2>&1 | Select-String -Pattern \"AFTER\")",
       "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo_sdata.py\" 2>&1 | Select-String -Pattern \"AFTER\")",
       "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo_items.py\" 2>&1 | Select-String -Pattern \"STARDIST\")",
-      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_saveflow.py\" 2>&1 | Select-String -Pattern \"after|Save Project|SAVE FLOW|Error|assert\")"
+      "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_saveflow.py\" 2>&1 | Select-String -Pattern \"after|Save Project|SAVE FLOW|Error|assert\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\miniconda3\\\\shell\\\\condabin\\\\conda-hook.ps1\"; conda activate opal-all; python -m py_compile opal_studio/main_window.py opal_studio/widgets/image_canvas.py; if \\($?\\) { \"COMPILE OK\" })"
     ],
     "additionalDirectories": [
       "c:\\Users\\Tristan\\Dropbox\\HologicReader"

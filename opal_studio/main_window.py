@@ -266,6 +266,14 @@ class MainWindow(QMainWindow):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
 
+        # ── New (clear everything) ──────────────────────────────────────────
+        new_act = QAction("&New Project", self)
+        new_act.setShortcut("Ctrl+N")
+        new_act.triggered.connect(self._on_new_project)
+        file_menu.addAction(new_act)
+
+        file_menu.addSeparator()
+
         # ── Open ────────────────────────────────────────────────────────────
         open_act = QAction("&Open Image…", self)
         open_act.setShortcut("Ctrl+O")
@@ -513,6 +521,39 @@ class MainWindow(QMainWindow):
             self._slice_scrollbar.setValue(self._spatialdata_slice_index + 1)
             self._slice_scrollbar.blockSignals(False)
             QMessageBox.critical(self, "Error", f"Could not load SpatialData slice: {e}")
+
+    def _on_new_project(self):
+        """Discard all loaded data and return to a blank workspace."""
+        reply = QMessageBox.question(
+            self,
+            "New Project",
+            "This will remove all loaded data (image, channels, masks, regions, "
+            "and analysis results). Any unsaved work will be lost.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._slice_load_timer.stop()
+        self._image = None
+        self._project_path = None
+        self._spatialdata_collection = None
+        self._spatialdata_slice_index = 0
+        self._pending_spatialdata_slice = 0
+        self._brightfield_rgb = None
+        self.setWindowTitle("Opal Studio")
+        self._slice_controls.hide()
+
+        self._channel_model.set_channels([])
+        self._canvas.clear()
+        self._brightfield_view.clear()
+        self._ops_panel.reset()
+        self._phenotyping_tab.clear()
+        self._clustering_heatmap_tab.clear()
+        self._tsne_tab.clear()
+        self._umap_tab.clear()
+        self._status.showMessage("Cleared all data", 3000)
 
     def _load_image(self, path: str):
         try:
