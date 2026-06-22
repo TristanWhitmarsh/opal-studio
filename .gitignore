@@ -66,3 +66,6 @@ opal_studio/models/
 # Project specific
 requirements2.txt
 scratch/
+
+# Extracted sdist / versioned build snapshots (e.g. opal_studio-0.1.3/)
+opal_studio-*/
