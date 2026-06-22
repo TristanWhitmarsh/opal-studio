@@ -1,35 +1,41 @@
-"""
-Opal Studio project I/O — save / load a full session as a SpatialData-style
-Zarr store, *without* depending on the ``spatialdata`` / ``geopandas`` /
-``pyarrow`` libraries (none of which install in the pinned opal-all env).
+"""Opal Studio project I/O — save / load a session as a **spec-compliant
+SpatialData** store (Zarr v3 + OME-NGFF ``0.5-dev-spatialdata``).
 
-The store mirrors the on-disk layout that :class:`opal_studio.image_loader.ZarrV3Array`
-already reads, so generated images and label maps are written as genuine
-Zarr V3 arrays (zstd-compressed, ``c/<c>/<y>/<x>`` chunk keys).  Tables are
-written as AnnData-in-Zarr (the same encoding SpatialData uses).  Shapes
-(vector regions) are written as a small JSON document, because real
-``shapes`` elements need geopandas/geoparquet which is unavailable here.
-
-The **original image is never copied** — only referenced.  ``attrs.source_image``
-records both an absolute and a workspace-relative path plus enough metadata
-to validate the reference on reload.
+The on-disk layout matches what the ``spatialdata`` library (v0.7.x, store
+format ``0.2``) produces, so the stores Opal writes can be opened by
+``spatialdata`` / ``squidpy`` and friends — *without* Opal depending on the
+``spatialdata`` package itself (it conflicts with the pinned ML env).  We drive
+the underlying standards directly: Zarr v3 metadata is hand-written, shapes use
+``geopandas`` GeoParquet, and the cell table uses ``anndata``.
 
 Layout
 ------
     <store>.zarr/
-        zarr.json                     # root group: attrs = {source_image, opal_studio}
-        images/
-            derived/                  # generated channels (filter / average / …)
-                zarr.json  +  0/      # OME multiscales group + level-0 V3 array
-            brightfield/              # generated brightfield, c=3 (R,G,B)
-        labels/
-            <mask name>/              # one V3 array per cell / region / type mask
-        shapes/
-            regions/shapes.json       # vector regions (drawn / imported)
-        tables/
-            cells/                    # AnnData-in-Zarr  (per-cell table)
-        opal_aux/
-            <key>/                    # auxiliary arrays (clustering state, LUTs)
+        zarr.json                     # root group
+                                      #   attrs.spatialdata_attrs {version 0.2, software}
+                                      #   attrs.opal_studio       {source_image, session, ...}
+                                      #   consolidated_metadata   (all v3 descendants, inlined)
+        images/<name>/                # OME-NGFF multiscale image (c,y,x) + omero channels
+            zarr.json  +  0/          #   spatialdata_attrs.version 0.3
+        labels/<name>/                # OME-NGFF label raster (y,x), no channel axis
+            zarr.json  +  0/
+        shapes/<name>/                # ngff:shapes group + shapes.parquet (GeoParquet)
+            zarr.json  +  shapes.parquet
+        tables/cells/                 # anndata-in-zarr regions table (ngff:regions_table)
+        opal_aux/<key>/               # Opal-private arrays (clustering state, LUTs) — custom
+
+Versions
+--------
+    spatialdata container = 0.2     raster (images/labels) = 0.3
+    shapes                = 0.3     tables                 = 0.2
+    OME-NGFF              = 0.5-dev-spatialdata
+
+Compliance note (table)
+-----------------------
+The cell table is written with ``anndata``; with the pinned ``anndata``/``zarr``
+it serialises in anndata's own (Zarr v2) on-disk encoding nested inside the v3
+store.  Opal reads it back directly; full Zarr-v3 consolidation of the table is
+deferred until the env can ship a v3-capable ``anndata``/``zarr``.
 
 Public API
 ----------
@@ -40,6 +46,7 @@ Public API
 
 from __future__ import annotations
 
+import itertools
 import json
 import shutil
 from dataclasses import dataclass, field
@@ -55,21 +62,36 @@ except ImportError:  # pragma: no cover - numcodecs ships with the env
     _numcodecs = None
     _ZSTD = None
 
-from opal_studio.image_loader import ZarrV3Array
+PROJECT_SCHEMA_VERSION = 2
 
-PROJECT_SCHEMA_VERSION = 1
+# ── SpatialData / NGFF format version strings (match spatialdata v0.7.x) ───────
+SPATIALDATA_CONTAINER_VERSION = "0.2"
+RASTER_VERSION = "0.3"
+SHAPES_VERSION = "0.3"
+TABLES_VERSION = "0.2"
+NGFF_VERSION = "0.5-dev-spatialdata"
 
-# Default chunk size (Y, X) for written arrays. One channel per c-chunk.
-_DEFAULT_CHUNK_YX = (1024, 1024)
-
+# Default spatial chunk edge (Y/X). One channel per c-chunk for images.
+_CHUNK_EDGE = 1024
 _ILLEGAL_DIR_CHARS = '<>:"/\\|?*'
+
+# zstd codec block used by the hand-written anndata-v3 encoder.
+_ANNDATA_ZSTD = {"name": "zstd", "configuration": {"level": 5, "checksum": False}}
+
+
+def _software_version() -> str:
+    try:
+        import importlib.metadata as _md
+        return f"opal-studio {_md.version('opal-studio')}"
+    except Exception:
+        return "opal-studio"
 
 
 def _safe_dirname(key: str, used: set[str]) -> str:
-    """Map an arbitrary logical key to a unique, filesystem-safe directory name.
+    """Map a logical key to a unique, filesystem-safe directory name.
 
-    The true key is preserved separately in element metadata, so this is only
-    cosmetic / collision-avoidance for the on-disk name.
+    The true key is preserved in element metadata, so this is only cosmetic /
+    collision-avoidance for the on-disk name.
     """
     base = "".join("_" if (c in _ILLEGAL_DIR_CHARS or ord(c) < 32) else c
                    for c in str(key)).strip().rstrip(".") or "element"
@@ -109,33 +131,25 @@ class ProjectDocument:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-level Zarr V3 array writer (symmetric with image_loader.ZarrV3Array)
+# Low-level Zarr V3 array I/O (default chunk-key encoding, bytes+zstd codecs)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _write_v3_array(array_dir: Path, data: np.ndarray,
-                    chunk_yx: tuple[int, int] = _DEFAULT_CHUNK_YX) -> dict:
-    """Write *data* (C, Y, X) as a Zarr V3 array and return its metadata dict."""
-    if _ZSTD is None:
-        raise RuntimeError("numcodecs is required to write Opal Studio projects")
-    if data.ndim != 3:
-        raise ValueError(f"_write_v3_array expects (C, Y, X), got shape {data.shape}")
+def _pick_chunks(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Choose a chunk shape: 1 channel per c-chunk, spatial dims capped."""
+    if len(shape) == 3:  # (C, Y, X)
+        return (1, min(shape[1], _CHUNK_EDGE) or 1, min(shape[2], _CHUNK_EDGE) or 1)
+    if len(shape) == 2:  # (Y, X)
+        return (min(shape[0], _CHUNK_EDGE) or 1, min(shape[1], _CHUNK_EDGE) or 1)
+    return tuple(max(s, 1) for s in shape)  # single chunk for 0/1-D and odd ranks
 
-    # Force little-endian, C-contiguous so raw chunk bytes match the reader.
-    dt = data.dtype.newbyteorder("<")
-    data = np.ascontiguousarray(data, dtype=dt)
-    C, H, W = data.shape
 
-    cy = min(int(chunk_yx[0]), H) or 1
-    cx = min(int(chunk_yx[1]), W) or 1
-    chunk_shape = (1, cy, cx)
-
-    meta = {
-        "zarr_format": 3,
-        "node_type": "array",
-        "shape": [int(C), int(H), int(W)],
-        "data_type": np.dtype(data.dtype).name,
+def _array_meta(shape: tuple[int, ...], dtype: np.dtype,
+                chunk_shape: tuple[int, ...]) -> dict:
+    return {
+        "shape": [int(s) for s in shape],
+        "data_type": np.dtype(dtype).name,
         "chunk_grid": {"name": "regular",
-                       "configuration": {"chunk_shape": [1, cy, cx]}},
+                       "configuration": {"chunk_shape": [int(c) for c in chunk_shape]}},
         "chunk_key_encoding": {"name": "default",
                                "configuration": {"separator": "/"}},
         "fill_value": 0,
@@ -144,74 +158,359 @@ def _write_v3_array(array_dir: Path, data: np.ndarray,
             {"name": "zstd", "configuration": {"level": 5, "checksum": False}},
         ],
         "attributes": {},
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": [],
     }
+
+
+def _write_v3_array(array_dir: Path, data: np.ndarray) -> dict:
+    """Write *data* (any rank) as a Zarr V3 array; return its metadata dict."""
+    if _ZSTD is None:
+        raise RuntimeError("numcodecs is required to write Opal Studio projects")
+
+    dt = data.dtype.newbyteorder("<")            # force little-endian on disk
+    data = np.ascontiguousarray(data, dtype=dt)
+    shape = data.shape
+    chunk = _pick_chunks(shape)
+    meta = _array_meta(shape, data.dtype, chunk)
 
     array_dir.mkdir(parents=True, exist_ok=True)
     (array_dir / "zarr.json").write_text(json.dumps(meta, indent=2))
 
-    n_ty = (H + cy - 1) // cy
-    n_tx = (W + cx - 1) // cx
-    for c in range(C):
-        for ty in range(n_ty):
-            y0, y1 = ty * cy, min((ty + 1) * cy, H)
-            for tx in range(n_tx):
-                x0, x1 = tx * cx, min((tx + 1) * cx, W)
-                block = np.ascontiguousarray(data[c, y0:y1, x0:x1])
-                raw = _ZSTD.encode(block.tobytes())
-                chunk_path = array_dir / "c" / str(c) / str(ty) / str(tx)
-                chunk_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(chunk_path, "wb") as fh:
-                    fh.write(raw)
+    n_chunks = [(shape[d] + chunk[d] - 1) // chunk[d] for d in range(len(shape))]
+    for idx in itertools.product(*[range(n) for n in n_chunks]):
+        slices = tuple(slice(idx[d] * chunk[d], min((idx[d] + 1) * chunk[d], shape[d]))
+                       for d in range(len(shape)))
+        block = np.ascontiguousarray(data[slices])
+        raw = _ZSTD.encode(block.tobytes())
+        chunk_path = array_dir.joinpath("c", *map(str, idx))
+        chunk_path.parent.mkdir(parents=True, exist_ok=True)
+        chunk_path.write_bytes(raw)
     return meta
 
 
-def _read_v3_array_full(array_dir: Path) -> np.ndarray:
+def _read_v3_array(array_dir: Path) -> np.ndarray:
     """Read a Zarr V3 array written by :func:`_write_v3_array` into memory."""
-    meta_path = array_dir / "zarr.json"
-    with open(meta_path) as fh:
-        meta = json.load(fh)
-    arr = ZarrV3Array(array_dir, meta)
-    C, H, W = arr.shape
-    out = np.empty((C, H, W), dtype=arr.dtype)
-    for c in range(C):
-        out[c] = arr[c, 0:H, 0:W]
-    return out
+    meta = json.loads((array_dir / "zarr.json").read_text())
+    shape = tuple(meta["shape"])
+    dtype = np.dtype(meta["data_type"]).newbyteorder("<")
+    chunk = tuple(meta["chunk_grid"]["configuration"]["chunk_shape"])
 
+    out = np.zeros(shape, dtype=dtype)
+    n_chunks = [(shape[d] + chunk[d] - 1) // chunk[d] for d in range(len(shape))]
+    for idx in itertools.product(*[range(n) for n in n_chunks]):
+        chunk_path = array_dir.joinpath("c", *map(str, idx))
+        if not chunk_path.exists():
+            continue                              # implicit fill_value (0)
+        raw = _ZSTD.decode(chunk_path.read_bytes())
+        slices = tuple(slice(idx[d] * chunk[d], min((idx[d] + 1) * chunk[d], shape[d]))
+                       for d in range(len(shape)))
+        block_shape = tuple(s.stop - s.start for s in slices)
+        out[slices] = np.frombuffer(raw, dtype=dtype).reshape(block_shape)
+    return out.astype(out.dtype.newbyteorder("="), copy=False)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Zarr V3 group + NGFF metadata helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _write_group(group_dir: Path, attributes: Optional[dict] = None) -> None:
+    """Write a plain Zarr-v3 group.
+
+    Sub-groups carry *no* ``consolidated_metadata`` key — only the store root
+    does (a flat listing of every descendant).  This matches what SpatialData
+    writes and lets readers that open a sub-group directly (e.g. anndata opening
+    the ``tables/cells`` group) fall back to a normal on-disk hierarchy scan.
+    """
     group_dir.mkdir(parents=True, exist_ok=True)
-    meta = {"zarr_format": 3, "node_type": "group",
-            "attributes": attributes or {}}
+    meta = {
+        "attributes": attributes or {},
+        "zarr_format": 3,
+        "node_type": "group",
+    }
     (group_dir / "zarr.json").write_text(json.dumps(meta, indent=2))
 
 
-def _write_image_element(images_dir: Path, dirname: str, key: str,
-                         data: np.ndarray, channel_labels: list[str]) -> None:
-    """Write an OME-Zarr-style multiscale image group with a single level."""
-    elem_dir = images_dir / dirname
-    omero_channels = [{"label": str(lbl)} for lbl in channel_labels]
-    group_attrs = {
-        "opal_studio": {"key": key},
-        "ome": {
-            "version": "0.4",
-            "multiscales": [{
-                "name": dirname,
-                "axes": [
-                    {"name": "c", "type": "channel"},
-                    {"name": "y", "type": "space"},
-                    {"name": "x", "type": "space"},
-                ],
-                "datasets": [{
-                    "path": "0",
-                    "coordinateTransformations": [
-                        {"type": "scale", "scale": [1.0, 1.0, 1.0]}],
-                }],
-            }],
-            "omero": {"channels": omero_channels},
-        }
+def _ngff_axis(name: str, *, unit: bool) -> dict:
+    ax = {"name": name, "type": "channel" if name == "c" else "space"}
+    if unit and name != "c":
+        ax["unit"] = "unit"
+    return ax
+
+
+def _coordinate_systems_axes(names: tuple[str, ...]) -> list[dict]:
+    return [_ngff_axis(n, unit=True) for n in names]
+
+
+def _identity_transform(names: tuple[str, ...]) -> dict:
+    """NGFF identity transform between the element's CS and the 'global' CS."""
+    return {
+        "type": "identity",
+        "input": {"name": "".join(names), "axes": _coordinate_systems_axes(names)},
+        "output": {"name": "global", "axes": _coordinate_systems_axes(names)},
     }
-    _write_group(elem_dir, group_attrs)
+
+
+def _raster_attrs(element_path: str, names: tuple[str, ...],
+                  channel_labels: Optional[list[str]]) -> dict:
+    """Element-group attributes for an image (c,y,x) or label (y,x) raster."""
+    ome: dict = {}
+    if channel_labels is not None:                # images carry omero channels
+        ome["omero"] = {"channels": [{"label": str(lbl)} for lbl in channel_labels]}
+    ome["version"] = NGFF_VERSION
+    ome["multiscales"] = [{
+        "datasets": [{
+            "path": "0",
+            "coordinateTransformations": [{"type": "scale",
+                                           "scale": [1.0] * len(names)}],
+        }],
+        "name": element_path,
+        "axes": [_ngff_axis(n, unit=False) for n in names],
+        "coordinateTransformations": [_identity_transform(names)],
+    }]
+    return {"ome": ome, "spatialdata_attrs": {"version": RASTER_VERSION}}
+
+
+def _write_raster_element(parent_dir: Path, dirname: str, key: str,
+                          data: np.ndarray, names: tuple[str, ...],
+                          channel_labels: Optional[list[str]]) -> None:
+    elem_dir = parent_dir / dirname
+    attrs = _raster_attrs(f"/{parent_dir.name}/{dirname}", names, channel_labels)
+    attrs["opal_studio"] = {"key": key}           # custom: preserve true key
+    _write_group(elem_dir, attrs)
     _write_v3_array(elem_dir / "0", data)
+
+
+def _write_shapes_element(parent_dir: Path, dirname: str, key: str,
+                          polygons: dict) -> None:
+    """Write a regions element: ngff:shapes group + GeoParquet of polygons."""
+    import geopandas as gpd
+    from shapely.geometry import MultiPolygon, Polygon
+
+    geoms: list = []
+    index: list = []
+    for sid, rings in polygons.items():
+        polys = [Polygon([(float(x), float(y)) for x, y in ring])
+                 for ring in rings if len(ring) >= 3]
+        if not polys:
+            continue
+        geoms.append(polys[0] if len(polys) == 1 else MultiPolygon(polys))
+        s = str(sid)
+        index.append(int(s) if s.lstrip("-").isdigit() else s)
+
+    elem_dir = parent_dir / dirname
+    attrs = {
+        "encoding-type": "ngff:shapes",
+        "axes": ["x", "y"],
+        "coordinateTransformations": [_identity_transform(("x", "y"))],
+        "spatialdata_attrs": {"version": SHAPES_VERSION},
+        "opal_studio": {"key": key},              # custom: preserve true key
+    }
+    _write_group(elem_dir, attrs)
+
+    gdf = gpd.GeoDataFrame({"geometry": geoms}, index=index)
+    gdf.to_parquet(elem_dir / "shapes.parquet")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AnnData → Zarr V3 (anndata's on-disk "encoding-type" format, hand-written)
+#
+# Mirrors what anndata writes into a Zarr-v3 group so that SpatialData / squidpy
+# recognise the cell table.  Covered encodings: anndata, dict, dataframe,
+# categorical, array, string-array, string, numeric-scalar, null.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _aw_chunk(node_dir: Path, raw: bytes, ndim: int) -> None:
+    if ndim == 0:                                 # scalar → single file "c"
+        (node_dir / "c").write_bytes(raw)
+    else:                                         # single chunk "c/0[/0...]"
+        cp = node_dir.joinpath("c", *(["0"] * ndim))
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_bytes(raw)
+
+
+def _aw_array_meta(shape, data_type, fill_value, codecs, attrs) -> dict:
+    return {
+        "shape": list(shape),
+        "data_type": data_type,
+        "chunk_grid": {"name": "regular",
+                       "configuration": {"chunk_shape": list(shape)}},
+        "chunk_key_encoding": {"name": "default",
+                               "configuration": {"separator": "/"}},
+        "fill_value": fill_value,
+        "codecs": codecs,
+        "attributes": attrs,
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": [],
+    }
+
+
+def _aw_enc(et: str, ev: str) -> dict:
+    return {"encoding-type": et, "encoding-version": ev}
+
+
+def _aw_write_array(node_dir: Path, arr: np.ndarray, et: str = "array",
+                    ev: str = "0.2.0") -> None:
+    arr = np.ascontiguousarray(arr)
+    if arr.dtype.itemsize == 1:                   # int8 / bool: no endian
+        bytes_codec = {"name": "bytes"}
+    else:
+        arr = np.ascontiguousarray(arr, dtype=arr.dtype.newbyteorder("<"))
+        bytes_codec = {"name": "bytes", "configuration": {"endian": "little"}}
+    if arr.dtype.kind == "b":
+        fill: Any = False
+    elif arr.dtype.kind == "f":
+        fill = 0.0
+    else:
+        fill = 0
+    meta = _aw_array_meta(arr.shape, np.dtype(arr.dtype).name, fill,
+                          [bytes_codec, dict(_ANNDATA_ZSTD)], _aw_enc(et, ev))
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "zarr.json").write_text(json.dumps(meta, indent=2))
+    _aw_chunk(node_dir, _ZSTD.encode(arr.tobytes()), arr.ndim)
+
+
+def _aw_write_string_array(node_dir: Path, values, *, scalar: bool = False,
+                           et: str = "string-array", ev: str = "0.2.0") -> None:
+    if scalar:
+        encode_arr = np.array(["" if values is None else str(values)], dtype=object)
+        shape: tuple = ()
+        ndim = 0
+    else:
+        encode_arr = np.array(["" if v is None else str(v) for v in values],
+                              dtype=object)
+        shape = encode_arr.shape
+        ndim = 1
+    meta = _aw_array_meta(shape, "string", "",
+                          [{"name": "vlen-utf8", "configuration": {}},
+                           dict(_ANNDATA_ZSTD)], _aw_enc(et, ev))
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "zarr.json").write_text(json.dumps(meta, indent=2))
+    raw = _ZSTD.encode(bytes(_numcodecs.VLenUTF8().encode(encode_arr)))
+    _aw_chunk(node_dir, raw, ndim)
+
+
+def _aw_write_group(node_dir: Path, et: str, ev: str, extra: Optional[dict] = None) -> None:
+    attrs = _aw_enc(et, ev)
+    if extra:
+        attrs.update(extra)
+    _write_group(node_dir, attrs)
+
+
+def _aw_write_scalar(node_dir: Path, value: Any) -> None:
+    if isinstance(value, str):
+        _aw_write_string_array(node_dir, value, scalar=True, et="string", ev="0.2.0")
+        return
+    arr = np.asarray(value)                        # 0-d numeric / bool
+    meta_arr = arr.reshape(())
+    if meta_arr.dtype.itemsize == 1:
+        bytes_codec = {"name": "bytes"}
+    else:
+        meta_arr = np.ascontiguousarray(meta_arr, dtype=meta_arr.dtype.newbyteorder("<"))
+        bytes_codec = {"name": "bytes", "configuration": {"endian": "little"}}
+    fill = False if meta_arr.dtype.kind == "b" else (0.0 if meta_arr.dtype.kind == "f" else 0)
+    meta = _aw_array_meta((), np.dtype(meta_arr.dtype).name, fill,
+                          [bytes_codec, dict(_ANNDATA_ZSTD)],
+                          _aw_enc("numeric-scalar", "0.2.0"))
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "zarr.json").write_text(json.dumps(meta, indent=2))
+    _aw_chunk(node_dir, _ZSTD.encode(meta_arr.tobytes()), 0)
+
+
+def _aw_write_column(node_dir: Path, series) -> None:
+    import pandas as pd
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        _aw_write_group(node_dir, "categorical", "0.2.0",
+                        {"ordered": bool(series.cat.ordered)})
+        _aw_write_string_array(node_dir / "categories",
+                               list(series.cat.categories))
+        _aw_write_array(node_dir / "codes",
+                        np.asarray(series.cat.codes.values))
+    elif series.dtype == object or series.dtype.kind in ("U", "S"):
+        _aw_write_string_array(node_dir, list(series.values))
+    else:
+        _aw_write_array(node_dir, np.asarray(series.values))
+
+
+def _aw_write_dataframe(node_dir: Path, df) -> None:
+    index_name = df.index.name or "_index"
+    _aw_write_group(node_dir, "dataframe", "0.2.0",
+                    {"column-order": [str(c) for c in df.columns],
+                     "_index": str(index_name)})
+    _aw_write_string_array(node_dir / str(index_name),
+                           [str(v) for v in df.index])
+    for col in df.columns:
+        _aw_write_column(node_dir / str(col), df[col])
+
+
+def _aw_write_mapping(node_dir: Path, mapping) -> None:
+    _aw_write_group(node_dir, "dict", "0.1.0")
+    for key, value in mapping.items():
+        _aw_write_uns_value(node_dir / str(key), value)
+
+
+def _aw_write_uns_value(node_dir: Path, value: Any) -> None:
+    import pandas as pd
+    if isinstance(value, dict):
+        _aw_write_mapping(node_dir, value)
+    elif isinstance(value, str):
+        _aw_write_scalar(node_dir, value)
+    elif isinstance(value, (list, tuple, np.ndarray)):
+        arr = np.asarray(value)
+        if arr.dtype.kind in ("U", "S", "O"):
+            _aw_write_string_array(node_dir, [str(v) for v in arr.ravel()])
+        else:
+            _aw_write_array(node_dir, arr)
+    elif isinstance(value, (bool, int, float, np.integer, np.floating, np.bool_)):
+        _aw_write_scalar(node_dir, value)
+    elif isinstance(value, pd.DataFrame):
+        _aw_write_dataframe(node_dir, value)
+    else:
+        _aw_write_scalar(node_dir, str(value))
+
+
+def _write_null(node_dir: Path) -> None:
+    """Encode an absent element (e.g. raw=None) as anndata does: a null array."""
+    meta = _aw_array_meta((), "bool", False,
+                          [{"name": "bytes"}, dict(_ANNDATA_ZSTD)],
+                          _aw_enc("null", "0.1.0"))
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "zarr.json").write_text(json.dumps(meta, indent=2))
+
+
+def _write_anndata_v3(cells_dir: Path, adata: Any, table_attrs: dict) -> None:
+    """Write *adata* as an anndata-encoded Zarr-v3 group (ngff:regions_table)."""
+    root_attrs = _aw_enc("anndata", "0.1.0")
+    root_attrs.update(table_attrs)                # SpatialData table-link attrs
+    _write_group(cells_dir, root_attrs)
+
+    _aw_write_array(cells_dir / "X", np.asarray(adata.X))
+    _aw_write_dataframe(cells_dir / "obs", adata.obs)
+    _aw_write_dataframe(cells_dir / "var", adata.var)
+
+    for mname in ("obsm", "obsp", "varm", "varp", "layers"):
+        m = getattr(adata, mname, None)
+        node = cells_dir / mname
+        _aw_write_group(node, "dict", "0.1.0")
+        if m:
+            for key, value in dict(m).items():
+                _aw_write_array(node / str(key), np.asarray(value))
+
+    _aw_write_mapping(cells_dir / "uns", dict(adata.uns))
+    _write_null(cells_dir / "raw")
+
+
+def _build_consolidated(store_path: Path) -> dict:
+    """Inline every v3 descendant's metadata into the root consolidated block."""
+    metadata: dict = {}
+    for zj in sorted(store_path.rglob("zarr.json")):
+        if zj.parent == store_path:
+            continue                              # skip the root itself
+        rel = zj.parent.relative_to(store_path).as_posix()
+        metadata[rel] = json.loads(zj.read_text())
+    return {"kind": "inline", "must_understand": False, "metadata": metadata}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -219,7 +518,7 @@ def _write_image_element(images_dir: Path, dirname: str, key: str,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
-    """Write *doc* to a SpatialData-style Zarr store at *store_path*.
+    """Write *doc* to a SpatialData (Zarr v3) store at *store_path*.
 
     An existing store at the path is replaced.
     """
@@ -227,15 +526,19 @@ def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
     if store_path.exists():
         if not (store_path / "zarr.json").exists() and any(store_path.iterdir()):
             raise FileExistsError(
-                f"{store_path} exists and is not an Opal Studio project store")
+                f"{store_path} exists and is not an Opal Studio / SpatialData store")
         shutil.rmtree(store_path)
 
-    # ── Root group with attrs (source_image + opal_studio session) ──────────
+    # ── Root group (spatialdata_attrs + Opal-private attrs) ──────────────────
     root_attrs = {
-        "source_image": doc.source_image,
+        "spatialdata_attrs": {
+            "version": SPATIALDATA_CONTAINER_VERSION,
+            "spatialdata_software_version": _software_version(),
+        },
         "opal_studio": {
             "schema_version": PROJECT_SCHEMA_VERSION,
-            **doc.session,
+            "source_image": doc.source_image,
+            "session": doc.session,
         },
     }
     _write_group(store_path, root_attrs)
@@ -246,12 +549,12 @@ def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
         _write_group(images_dir)
         used: set[str] = set()
         for name, payload in doc.images.items():
-            dirname = _safe_dirname(name, used)
-            _write_image_element(
-                images_dir, dirname, name,
-                np.asarray(payload["data"]),
-                payload.get("channel_labels", []),
-            )
+            data = np.asarray(payload["data"])
+            if data.ndim == 2:
+                data = data[np.newaxis, ...]
+            _write_raster_element(images_dir, _safe_dirname(name, used), name,
+                                  data, ("c", "y", "x"),
+                                  list(payload.get("channel_labels", [])))
 
     # ── Labels (cell / region / type masks) ─────────────────────────────────
     if doc.labels:
@@ -260,9 +563,8 @@ def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
         used = set()
         for name, arr in doc.labels.items():
             arr = np.asarray(arr)
-            dirname = _safe_dirname(name, used)
-            _write_image_element(labels_dir, dirname, name,
-                                 arr[np.newaxis, ...], [name])
+            _write_raster_element(labels_dir, _safe_dirname(name, used), name,
+                                  arr, ("y", "x"), None)
 
     # ── Shapes (vector regions) ─────────────────────────────────────────────
     if doc.shapes:
@@ -270,14 +572,28 @@ def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
         _write_group(shapes_dir)
         used = set()
         for name, polygons in doc.shapes.items():
-            dirname = _safe_dirname(name, used)
-            elem = shapes_dir / dirname
-            elem.mkdir(parents=True, exist_ok=True)
-            (elem / "shapes.json").write_text(json.dumps(
-                {"format": "opal_polygons_v1", "key": name,
-                 "polygons": polygons}))
+            _write_shapes_element(shapes_dir, _safe_dirname(name, used), name,
+                                  polygons)
 
-    # ── Auxiliary arrays (clustering state, LUTs) ───────────────────────────
+    # ── Table (per-cell AnnData, ngff:regions_table) ────────────────────────
+    if doc.table is not None:
+        tables_dir = store_path / "tables"
+        _write_group(tables_dir)
+        sd = {}
+        try:
+            sd = dict(doc.table.uns.get("spatialdata_attrs", {}))
+        except Exception:
+            pass
+        table_attrs = {
+            "spatialdata-encoding-type": "ngff:regions_table",
+            "region": sd.get("region"),
+            "region_key": sd.get("region_key"),
+            "instance_key": sd.get("instance_key"),
+            "version": TABLES_VERSION,
+        }
+        _write_anndata_v3(tables_dir / "cells", doc.table, table_attrs)
+
+    # ── Auxiliary arrays (clustering state, LUTs) — Opal-private group ───────
     if doc.aux:
         aux_dir = store_path / "opal_aux"
         _write_group(aux_dir)
@@ -285,26 +601,22 @@ def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
         for key, arr in doc.aux.items():
             arr = np.asarray(arr)
             orig_shape = list(arr.shape)
-            arr3d = _to_3d(arr)
-            dirname = _safe_dirname(key, used)
-            elem = aux_dir / dirname
-            _write_v3_array(elem, arr3d)
-            # remember original shape + logical key so we can restore on load
+            elem = aux_dir / _safe_dirname(key, used)
+            _write_v3_array(elem, _to_3d(arr))
             meta_path = elem / "zarr.json"
             meta = json.loads(meta_path.read_text())
             meta["attributes"]["opal_orig_shape"] = orig_shape
             meta["attributes"]["opal_key"] = key
             meta_path.write_text(json.dumps(meta, indent=2))
 
-    # ── Table (per-cell AnnData) ────────────────────────────────────────────
-    if doc.table is not None:
-        tables_dir = store_path / "tables"
-        _write_group(tables_dir)
-        doc.table.write_zarr(tables_dir / "cells")
+    # ── Consolidated metadata (root inlines all v3 descendants) ─────────────
+    root_meta = json.loads((store_path / "zarr.json").read_text())
+    root_meta["consolidated_metadata"] = _build_consolidated(store_path)
+    (store_path / "zarr.json").write_text(json.dumps(root_meta, indent=2))
 
 
 def _to_3d(arr: np.ndarray) -> np.ndarray:
-    """Promote a 1-D / 2-D array to (C, Y, X) for the V3 writer."""
+    """Promote a 1-D / 2-D array to (C, Y, X) for the array writer."""
     if arr.ndim == 1:
         return arr[np.newaxis, np.newaxis, :]
     if arr.ndim == 2:
@@ -325,15 +637,9 @@ def load_project(store_path: str | Path) -> ProjectDocument:
     if not root_meta_path.exists():
         raise FileNotFoundError(f"No zarr.json at {store_path} — not a project store")
 
-    with open(root_meta_path) as fh:
-        root_meta = json.load(fh)
+    root_meta = json.loads(root_meta_path.read_text())
     attrs = root_meta.get("attributes", {})
     opal = attrs.get("opal_studio", {})
-
-    doc = ProjectDocument(
-        source_image=attrs.get("source_image", {}),
-        session=opal,
-    )
 
     schema = opal.get("schema_version")
     if schema is not None and schema > PROJECT_SCHEMA_VERSION:
@@ -341,15 +647,20 @@ def load_project(store_path: str | Path) -> ProjectDocument:
             f"Project schema v{schema} is newer than supported "
             f"v{PROJECT_SCHEMA_VERSION}; please update Opal Studio")
 
+    doc = ProjectDocument(
+        source_image=opal.get("source_image", {}),
+        session=opal.get("session", {}),
+    )
+
     # ── Images ──────────────────────────────────────────────────────────────
     images_dir = store_path / "images"
     if images_dir.is_dir():
         for elem in sorted(images_dir.iterdir()):
             if not (elem / "0" / "zarr.json").exists():
                 continue
-            key = _read_group_key(elem / "zarr.json", elem.name)
+            key = _read_element_key(elem / "zarr.json", elem.name)
             doc.images[key] = {
-                "data": _read_v3_array_full(elem / "0"),
+                "data": _read_v3_array(elem / "0"),
                 "channel_labels": _read_omero_labels(elem / "zarr.json"),
             }
 
@@ -359,18 +670,18 @@ def load_project(store_path: str | Path) -> ProjectDocument:
         for elem in sorted(labels_dir.iterdir()):
             if not (elem / "0" / "zarr.json").exists():
                 continue
-            key = _read_group_key(elem / "zarr.json", elem.name)
-            doc.labels[key] = _read_v3_array_full(elem / "0")[0]
+            key = _read_element_key(elem / "zarr.json", elem.name)
+            arr = _read_v3_array(elem / "0")
+            doc.labels[key] = arr[0] if arr.ndim == 3 else arr
 
     # ── Shapes ──────────────────────────────────────────────────────────────
     shapes_dir = store_path / "shapes"
     if shapes_dir.is_dir():
         for elem in sorted(shapes_dir.iterdir()):
-            sj = elem / "shapes.json"
-            if not sj.exists():
+            if not (elem / "shapes.parquet").exists():
                 continue
-            payload = json.loads(sj.read_text())
-            doc.shapes[payload.get("key", elem.name)] = payload.get("polygons", {})
+            key = _read_element_key(elem / "zarr.json", elem.name)
+            doc.shapes[key] = _read_shapes_parquet(elem / "shapes.parquet")
 
     # ── Auxiliary arrays ────────────────────────────────────────────────────
     aux_dir = store_path / "opal_aux"
@@ -379,7 +690,7 @@ def load_project(store_path: str | Path) -> ProjectDocument:
             meta_path = elem / "zarr.json"
             if not meta_path.exists():
                 continue
-            arr = _read_v3_array_full(elem)
+            arr = _read_v3_array(elem)
             elem_attrs = json.loads(meta_path.read_text()).get("attributes", {})
             orig = elem_attrs.get("opal_orig_shape")
             if orig is not None:
@@ -398,7 +709,26 @@ def load_project(store_path: str | Path) -> ProjectDocument:
     return doc
 
 
-def _read_group_key(group_meta_path: Path, fallback: str) -> str:
+def _read_shapes_parquet(path: Path) -> dict:
+    """Read a GeoParquet shapes file back into {sid: [ring, ...]}."""
+    import geopandas as gpd
+
+    gdf = gpd.read_parquet(path)
+    out: dict = {}
+    for sid, geom in zip(gdf.index, gdf.geometry):
+        if geom is None:
+            continue
+        if geom.geom_type == "Polygon":
+            rings = [[[x, y] for x, y in geom.exterior.coords]]
+        elif geom.geom_type == "MultiPolygon":
+            rings = [[[x, y] for x, y in g.exterior.coords] for g in geom.geoms]
+        else:
+            continue
+        out[str(sid)] = rings
+    return out
+
+
+def _read_element_key(group_meta_path: Path, fallback: str) -> str:
     try:
         meta = json.loads(group_meta_path.read_text())
         return meta["attributes"]["opal_studio"]["key"]
@@ -424,7 +754,7 @@ def make_source_reference(image_path: Path, store_path: Path, *,
                           channel_names: list[str],
                           image_name: Optional[str] = None,
                           slice_index: Optional[int] = None) -> dict:
-    """Build the ``source_image`` attrs block (absolute + relative paths)."""
+    """Build the ``source_image`` block (absolute + relative paths)."""
     image_path = Path(image_path).resolve()
     store_parent = Path(store_path).resolve().parent
     try:

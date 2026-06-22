@@ -92,10 +92,21 @@
       "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo_sdata.py\" 2>&1 | Select-String -Pattern \"AFTER\")",
       "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_combo_items.py\" 2>&1 | Select-String -Pattern \"STARDIST\")",
       "PowerShell($env:QT_QPA_PLATFORM = \"offscreen\"; & \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_saveflow.py\" 2>&1 | Select-String -Pattern \"after|Save Project|SAVE FLOW|Error|assert\")",
-      "PowerShell(& \"$env:USERPROFILE\\\\miniconda3\\\\shell\\\\condabin\\\\conda-hook.ps1\"; conda activate opal-all; python -m py_compile opal_studio/main_window.py opal_studio/widgets/image_canvas.py; if \\($?\\) { \"COMPILE OK\" })"
+      "PowerShell(& \"$env:USERPROFILE\\\\miniconda3\\\\shell\\\\condabin\\\\conda-hook.ps1\"; conda activate opal-all; python -m py_compile opal_studio/main_window.py opal_studio/widgets/image_canvas.py; if \\($?\\) { \"COMPILE OK\" })",
+      "Bash(git add *)",
+      "Bash(git commit -q -m ' *)",
+      "Bash(git check-ignore *)",
+      "WebFetch(domain:spatialdata.scverse.org)",
+      "Bash(python -)",
+      "Read(//tmp/tmp.VJeGJpau1O/spatialdata/src/spatialdata/_io/**)",
+      "Read(//c/tmp/tmp.VJeGJpau1O/spatialdata/src/spatialdata/_io/**)",
+      "Read(//tmp/**)",
+      "Bash(cygpath -w __CMDSUB_OUTPUT__/src/spatialdata/_io)",
+      "Bash(rm -f _io_roundtrip_test.py && rm -rf \"C:/Users/Tristan/AppData/Local/Temp/opal_sd_validate.zarr\" && echo \"cleaned test artifacts\" && git status --short)"
     ],
     "additionalDirectories": [
-      "c:\\Users\\Tristan\\Dropbox\\HologicReader"
+      "c:\\Users\\Tristan\\Dropbox\\HologicReader",
+      "C:\\Users\\Tristan\\AppData\\Local\\Temp\\opal_sd_validate.zarr"
     ]
   }
 }

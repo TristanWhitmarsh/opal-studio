@@ -67,6 +67,92 @@ Opal Studio can open:
 
 For OME-TIFF, channel names are read from OME metadata when available. For SpatialData, channel names are read from OME-Zarr metadata and can be enriched from `extras/mcd_schema.xml` when present.
 
+## Project Format (SpatialData)
+
+`File > Save Project` writes the whole session as a spec-compliant **SpatialData**
+store (Zarr v3, OME-NGFF `0.5-dev-spatialdata`, store format `0.2`). The stores
+Opal writes can be opened directly by the `spatialdata` / `squidpy` ecosystem —
+Opal does not depend on the `spatialdata` package, it drives the underlying
+standards (Zarr v3, GeoParquet, AnnData) directly.
+
+Segmentation masks become `labels`, hand-drawn regions become `shapes`, processed
+channels and the generated brightfield become `images`, and the per-cell table
+becomes `tables` (linked to the cell mask via `region` / `region_key` /
+`instance_key`, so e.g. `obs['region'].value_counts()` gives cells-per-region).
+
+```
+project.zarr/
+├── zarr.json                      # root group: spatialdata_attrs (v0.2) +
+│                                  #   opal_studio {source_image, session} +
+│                                  #   consolidated_metadata (flat list of all nodes)
+│
+├── images/
+│   ├── zarr.json                  # group
+│   ├── derived/                   # one OME-NGFF image element per key
+│   │   ├── zarr.json              #   ome (multiscales; axes c,y,x; omero channels;
+│   │   │                          #        coordinateTransformations) + spatialdata_attrs v0.3
+│   │   └── 0/                     # scale-0 array (C,Y,X)
+│   │       ├── zarr.json
+│   │       └── c/ …               # chunk files  (c/<c>/<y>/<x>)
+│   └── brightfield/
+│       ├── zarr.json
+│       └── 0/ { zarr.json, c/… }
+│
+├── labels/
+│   ├── zarr.json                  # group
+│   └── Cell Mask/                 # OME-NGFF label element (axes y,x, no channel)
+│       ├── zarr.json              #   ome + spatialdata_attrs v0.3
+│       └── 0/ { zarr.json, c/… }  # scale-0 array (Y,X)
+│
+├── shapes/
+│   ├── zarr.json                  # group
+│   └── Region 1/                  # ngff:shapes element
+│       ├── zarr.json              #   encoding-type ngff:shapes, axes, transforms, v0.3
+│       └── shapes.parquet         # GeoParquet (WKB polygons) — NOT a zarr node
+│
+├── tables/
+│   ├── zarr.json                  # group
+│   └── cells/                     # anndata-encoded Zarr-v3 group (ngff:regions_table v0.2)
+│       ├── zarr.json              #   encoding-type anndata + region/region_key/instance_key
+│       ├── X/            { zarr.json, c/… }        # array
+│       ├── obs/                                    # dataframe
+│       │   ├── zarr.json          #   column-order, _index
+│       │   ├── _index/ { zarr.json, c/… }          # string-array
+│       │   ├── cell_id/ { zarr.json, c/… }         # array
+│       │   ├── area_px/ { zarr.json, c/… }         # array
+│       │   └── region/                             # categorical
+│       │       ├── zarr.json
+│       │       ├── categories/ { zarr.json, c/… }  # string-array
+│       │       └── codes/      { zarr.json, c/… }  # array
+│       ├── var/         { zarr.json, marker/ }     # dataframe
+│       ├── obsm/        { zarr.json, spatial/ }    # dict → arrays
+│       ├── layers/      { zarr.json, positive/ }   # dict → arrays
+│       ├── uns/                                    # dict
+│       │   ├── zarr.json
+│       │   └── spatialdata_attrs/ { region, region_key, instance_key }  # string scalars
+│       ├── obsp/ varm/ varp/  { zarr.json }        # empty dict groups
+│       └── raw/         { zarr.json }              # null
+│
+└── opal_aux/                      # Opal-private (ignored by SpatialData readers)
+    ├── zarr.json                  # group
+    └── cluster_labels/            # plain Zarr-v3 array (+ opal_key, opal_orig_shape attrs)
+        ├── zarr.json
+        └── c/ …
+```
+
+Notes:
+
+- `images`, `labels`, `shapes`, and `tables` are standard SpatialData elements.
+  `opal_aux` and the `opal_studio` root attributes are Opal-private extras that
+  SpatialData readers ignore.
+- Element directory names are filesystem-sanitized; the true layer name is
+  preserved in each element's attributes.
+- Only the **root** `zarr.json` carries `consolidated_metadata`; every other group
+  omits it (so readers that open a sub-group directly fall back to a disk scan).
+- `shapes.parquet` is a regular GeoParquet file, deliberately not part of the zarr
+  hierarchy.
+- Element names must be unique across element types (a SpatialData requirement).
+
 ## Application Layout
 
 The main window has three working areas:
