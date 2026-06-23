@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSizePolicy, QColorDialog, QFrame, QSlider,
-    QTabWidget
+    QTabWidget, QLineEdit
 )
 
 
@@ -23,7 +23,16 @@ class ElidedLabel(QLabel):
     return width=0.  Without this Qt's layout will allocate the full text
     width to the label and clip all widgets to the right of it (eye button,
     delete button, etc.) instead of shrinking the label itself.
+
+    Double-clicking emits ``doubleClicked`` so the row can offer inline rename.
     """
+
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
     def sizeHint(self):
         sh = super().sizeHint()
@@ -532,7 +541,8 @@ class ChannelPanel(QWidget):
         name = ElidedLabel(ch.name)
         name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         name.setMinimumWidth(0)  # allow shrinking below the text's natural width
-        name.setToolTip(ch.name)  # full name on hover
+        name.setToolTip(f"{ch.name}\n(double-click to rename)")  # full name on hover
+        name.doubleClicked.connect(lambda r=row, lbl=name: self._begin_rename(r, lbl))
         top.addWidget(name)
 
         # Delete button for mask, processed channel, or region
@@ -559,6 +569,41 @@ class ChannelPanel(QWidget):
             pass
 
         return frame
+
+    def _begin_rename(self, row: int, label: ElidedLabel):
+        """Replace the name label with an inline editor to rename the channel."""
+        if not (0 <= row < len(self._row_widgets)):
+            return
+        frame = self._row_widgets[row]
+        top_layout = frame.layout().itemAt(0).layout()
+        idx = next((i for i in range(top_layout.count())
+                    if top_layout.itemAt(i).widget() is label), None)
+        if idx is None:
+            return
+
+        editor = QLineEdit(self._model.channel(row).name)
+        editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        editor.setMinimumWidth(0)
+        label.hide()
+        top_layout.insertWidget(idx, editor)
+        editor.setFocus()
+        editor.selectAll()
+
+        state = {"done": False}
+
+        def finish(commit: bool):
+            if state["done"]:
+                return
+            state["done"] = True
+            new_name = editor.text().strip()
+            top_layout.removeWidget(editor)
+            editor.deleteLater()
+            label.show()
+            if commit and new_name:
+                self._model.setData(self._model.index(row), new_name,
+                                    ChannelListModel.NameRole)
+
+        editor.editingFinished.connect(lambda: finish(True))
 
     # ---- callbacks ----------------------------------------------------
 

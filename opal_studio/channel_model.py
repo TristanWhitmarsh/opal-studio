@@ -324,6 +324,17 @@ class ChannelListModel(QAbstractListModel):
             ch.alpha = float(value)
         elif role == self.ContourVisibleRole:
             ch.contour_visible = bool(value)
+        elif role == self.NameRole:
+            new_name = str(value).strip()
+            if not new_name or new_name == ch.name:
+                return False
+            existing = {c.name for i, c in enumerate(self._channels) if i != index.row()}
+            if new_name in existing:
+                k = 1
+                while f"{new_name}{k}" in existing:
+                    k += 1
+                new_name = f"{new_name}{k}"
+            ch.name = new_name
         else:
             return False
         self.dataChanged.emit(index, index, [role])

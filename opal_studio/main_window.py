@@ -3521,7 +3521,7 @@ class MainWindow(QMainWindow):
         rgb = colors[regions_count % len(colors)]
         row_color = QColor(*rgb)
         
-        region_name = self._channel_model.get_unique_name("Region ")
+        region_name = self._channel_model.get_unique_name("Region", always_suffix=True)
         
         new_ch = Channel(
             name=region_name,

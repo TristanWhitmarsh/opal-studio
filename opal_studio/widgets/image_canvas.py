@@ -751,11 +751,15 @@ class ImageCanvas(QWidget):
             if new_w > iw * 20 or new_h > ih * 20:
                 return
 
-        frac_x = mx / max(self.width(), 1)
-        frac_y = my / max(self.height(), 1)
+        # Anchor the image point under the cursor in BOTH axes using the new
+        # screen-pixels-per-image-pixel. paintEvent maps x and y with this same
+        # single (width-based) spp, so the y anchor must use it too — otherwise
+        # zoom drifts vertically whenever the viewport aspect differs from the
+        # widget aspect (e.g. right after switching images).
+        spp_new = self.width() / new_w
         self._viewport = QRectF(
-            img_x - frac_x * new_w,
-            img_y - frac_y * new_h,
+            img_x - mx / spp_new,
+            img_y - my / spp_new,
             new_w, new_h,
         )
         self._schedule_render(immediate_progressive=True)

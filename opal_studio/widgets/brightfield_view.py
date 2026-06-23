@@ -310,16 +310,20 @@ class BrightfieldView(QWidget):
             unique_ids = unique_ids[unique_ids > 0]
             if len(unique_ids) == 0:
                 return None
-            for lid in unique_ids:
-                if ch.random_contour_colors:
+            # Build a per-label colour LUT and apply it in one vectorised pass.
+            # (Looping `labels == lid` per label is O(n_labels * pixels) and
+            # freezes the UI for masks with many cells.)
+            max_id = int(unique_ids[-1])
+            lut = np.zeros((max_id + 1, 4), dtype=np.uint8)
+            if ch.random_contour_colors:
+                for lid in unique_ids:
                     rng.seed(int(lid))
-                    r = int(rng.random() * 255)
-                    g = int(rng.random() * 255)
-                    b = int(rng.random() * 255)
-                else:
-                    r, g, b = ch.color.red(), ch.color.green(), ch.color.blue()
-                m = labels == lid
-                rgba[m, 0] = r; rgba[m, 1] = g; rgba[m, 2] = b; rgba[m, 3] = 255
+                    lut[lid] = (int(rng.random() * 255), int(rng.random() * 255),
+                                int(rng.random() * 255), 255)
+            else:
+                lut[unique_ids] = (ch.color.red(), ch.color.green(),
+                                   ch.color.blue(), 255)
+            rgba = lut[labels]
 
         elif ch.is_cell_mask:
             if ch.pos_lut is None:
