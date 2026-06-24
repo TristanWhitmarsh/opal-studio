@@ -276,11 +276,16 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                             })
                             tile_counter += 1
 
+                    print(f"[InstanSeg] All {n_tiles} tiles processed. "
+                          f"Stitching & post-processing…", flush=True)
+
                 cell_mask = _postprocess_labels(
                     cell_mask,
                     fill_holes=params.get("fill_holes", False),
                     keep_largest=params.get("keep_largest", False)
                 )
+                print(f"[InstanSeg] Post-processing complete "
+                      f"({int(cell_mask.max())} objects). Sending result…", flush=True)
 
                 results.append((cell_mask, f"InstanSeg ({model_name})", False))
                 
@@ -297,9 +302,15 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                     x_input = np.stack([x]*3, axis=-1)
                 
                 if max(x.shape[0], x.shape[1]) > 512:
+                    print(f"[InstanSeg] Running '{model_name}' on a "
+                          f"{x.shape[0]}×{x.shape[1]} image (tiled, no per-tile "
+                          f"progress)… this may take a while.", flush=True)
                     out, _ = model.eval_medium_image(x_input, params.get("pixel_size", 1.0), tile_size=512, batch_size=16)
                 else:
+                    print(f"[InstanSeg] Running '{model_name}' on a "
+                          f"{x.shape[0]}×{x.shape[1]} image…", flush=True)
                     out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
+                print("[InstanSeg] Inference complete. Building result…", flush=True)
                 
                 labels_tensor = out[0]
                 if hasattr(labels_tensor, 'cpu'):

@@ -102,11 +102,18 @@
       "Read(//c/tmp/tmp.VJeGJpau1O/spatialdata/src/spatialdata/_io/**)",
       "Read(//tmp/**)",
       "Bash(cygpath -w __CMDSUB_OUTPUT__/src/spatialdata/_io)",
-      "Bash(rm -f _io_roundtrip_test.py && rm -rf \"C:/Users/Tristan/AppData/Local/Temp/opal_sd_validate.zarr\" && echo \"cleaned test artifacts\" && git status --short)"
+      "Bash(rm -f _io_roundtrip_test.py && rm -rf \"C:/Users/Tristan/AppData/Local/Temp/opal_sd_validate.zarr\" && echo \"cleaned test artifacts\" && git status --short)",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-spatial\\\\python.exe\" -c \"import spatialdata, geopandas, scipy; print\\('spatialdata', spatialdata.__version__\\); print\\('geopandas', geopandas.__version__\\)\")",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-spatial\\\\python.exe\" \"c:\\\\opal-studio\\\\tests\\\\test_count_cells_in_regions.py\" 2>$null)",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-spatial\\\\python.exe\" \"c:\\\\opal-studio\\\\tests\\\\test_count_cells_in_regions.py\" 2>&1)",
+      "Bash(\"/c/Users/Tristan/miniconda3/envs/sd_validate/python.exe\" -)",
+      "PowerShell(& \"C:\\\\Users\\\\Tristan\\\\miniconda3\\\\envs\\\\opal-all\\\\python.exe\" \"c:\\\\opal-studio\\\\_test_chunk_pad.py\")",
+      "Bash(SCRATCH=\"/c/Users/Tristan/AppData/Local/Temp/claude/c--opal-studio/b4f800df-cba3-472c-8cba-f1ee4516c9dc/scratchpad\" *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Tristan\\Dropbox\\HologicReader",
-      "C:\\Users\\Tristan\\AppData\\Local\\Temp\\opal_sd_validate.zarr"
+      "C:\\Users\\Tristan\\AppData\\Local\\Temp\\opal_sd_validate.zarr",
+      "C:\\Users\\Tristan\\AppData\\Local\\Temp\\claude\\c--opal-studio\\b4f800df-cba3-472c-8cba-f1ee4516c9dc\\scratchpad"
     ]
   }
 }

@@ -182,8 +182,17 @@ def _write_v3_array(array_dir: Path, data: np.ndarray) -> dict:
     for idx in itertools.product(*[range(n) for n in n_chunks]):
         slices = tuple(slice(idx[d] * chunk[d], min((idx[d] + 1) * chunk[d], shape[d]))
                        for d in range(len(shape)))
-        block = np.ascontiguousarray(data[slices])
-        raw = _ZSTD.encode(block.tobytes())
+        block_shape = tuple(s.stop - s.start for s in slices)
+        if block_shape == tuple(chunk):
+            block = np.ascontiguousarray(data[slices])
+        else:
+            # Boundary chunk: the Zarr spec requires every stored chunk to be the
+            # full chunk_shape, with out-of-bounds elements set to fill_value (0).
+            # Padding (vs. clipping) is what makes the store readable by standard
+            # zarr-python / spatialdata. Compression keeps the padding ~free.
+            block = np.zeros(chunk, dtype=dt)
+            block[tuple(slice(0, b) for b in block_shape)] = data[slices]
+        raw = _ZSTD.encode(np.ascontiguousarray(block).tobytes())
         chunk_path = array_dir.joinpath("c", *map(str, idx))
         chunk_path.parent.mkdir(parents=True, exist_ok=True)
         chunk_path.write_bytes(raw)
@@ -199,6 +208,7 @@ def _read_v3_array(array_dir: Path) -> np.ndarray:
 
     out = np.zeros(shape, dtype=dtype)
     n_chunks = [(shape[d] + chunk[d] - 1) // chunk[d] for d in range(len(shape))]
+    full_size = int(np.prod(chunk))
     for idx in itertools.product(*[range(n) for n in n_chunks]):
         chunk_path = array_dir.joinpath("c", *map(str, idx))
         if not chunk_path.exists():
@@ -207,7 +217,14 @@ def _read_v3_array(array_dir: Path) -> np.ndarray:
         slices = tuple(slice(idx[d] * chunk[d], min((idx[d] + 1) * chunk[d], shape[d]))
                        for d in range(len(shape)))
         block_shape = tuple(s.stop - s.start for s in slices)
-        out[slices] = np.frombuffer(raw, dtype=dtype).reshape(block_shape)
+        vals = np.frombuffer(raw, dtype=dtype)
+        if vals.size == full_size:
+            # Spec-compliant full chunk: reshape then trim to the valid region.
+            block = vals.reshape(chunk)[tuple(slice(0, b) for b in block_shape)]
+        else:
+            # Legacy clipped edge chunk (older opal-studio stores).
+            block = vals.reshape(block_shape)
+        out[slices] = block
     return out.astype(out.dtype.newbyteorder("="), copy=False)
 
 

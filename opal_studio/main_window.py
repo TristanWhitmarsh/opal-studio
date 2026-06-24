@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
     # Signals for cross-thread communication
     segmentationResultReady = Signal(object, str, bool, object, object, str, bool, int, object, bool, object) # labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut, random_colors, aux_labels
     segmentationError = Signal(str)
+    segmentationStatus = Signal(str)  # thread-safe status-bar text from worker reader
     segmentationTileReady = Signal(object)  # dict with tile info from child process
     preprocessingResultReady = Signal(str, str, object, float, float) # original_name, suffix, data, min, max
     preprocessingError = Signal(str)
@@ -167,6 +168,7 @@ class MainWindow(QMainWindow):
         self._ops_panel.runThresholdComputeRequested.connect(self._run_threshold_compute)
         self._ops_panel.applyThresholdRequested.connect(self._apply_threshold_positivity)
         self.operationProgress.connect(self._ops_panel.set_progress_info)
+        self.segmentationStatus.connect(lambda m: self._status.showMessage(m))
         self.operationFinished.connect(self._on_operation_complete)
         self.thresholdMeansReady.connect(self._on_threshold_means_ready)
         self.clusteringHeatmapReady.connect(self._on_clustering_heatmap_ready)
@@ -2205,7 +2207,20 @@ class MainWindow(QMainWindow):
                     else:
                         final_labels = out_labels
 
+                    # Tile-based methods (e.g. custom InstanSeg) drive the bar to
+                    # 100% on the last tile, but building one contour per cell can
+                    # take a while for dense masks. Flip the bar to an indeterminate
+                    # "busy" state and report progress so it doesn't look finished.
+                    n_cells = int(final_labels.max())
+                    print(f"[Segmentation] {out_name}: {n_cells} objects detected. "
+                          f"Generating contours…")
+                    self.operationProgress.emit(0, 0)
+                    self.segmentationStatus.emit(
+                        f"Finalizing {out_name}: generating contours for {n_cells} objects…")
                     contour_data = self._get_contour_data(final_labels.astype(np.int32))
+                    print(f"[Segmentation] {out_name}: contours generated "
+                          f"({len(contour_data)} objects). Adding to view…")
+                    self.segmentationStatus.emit(f"Adding {out_name} to view…")
                     self.segmentationResultReady.emit(final_labels, out_name, out_is_cell, None, contour_data, "", False, target_idx, None, True, None)
 
                 if method == "watershed":
@@ -2704,29 +2719,61 @@ class MainWindow(QMainWindow):
                 ]
                 channels_snapshot = {i: self._channel_model.channel(i) for i in channel_indices}
 
-                # Serialise file reads so we don't overwhelm I/O; compute in parallel
+                # ── Precompute label geometry ONCE, shared by every channel ──────
+                # Per-cell pixel counts and the set of foreground (cell) pixels
+                # depend only on the label map, not on the channel data. Computing
+                # them once — instead of once per (often 40+) channel — and then
+                # reducing only over foreground pixels is the bulk of the speedup
+                # on large datasets (e.g. a whole mouse embryo): it removes one
+                # full-image bincount per channel and skips the large background.
+                lh, lw = working_labels.shape[:2]
+                crop_h, crop_w = min(h, lh), min(w, lw)
+                flat_lbl = np.ascontiguousarray(working_labels[:crop_h, :crop_w]).ravel()
+                fg = flat_lbl > 0                              # foreground (cell) pixels
+                lbl_fg = flat_lbl[fg]                          # their label ids
+                counts = np.bincount(lbl_fg, minlength=max_label + 1)
+                safe_counts = np.where(counts > 0, counts, 1).astype(np.float64)
+                zero_count = counts == 0
+
+                # Read channels in parallel. The SpatialData/Zarr backend is
+                # thread-safe for concurrent reads (each chunk read opens its files
+                # independently), so multiple channels decompress at once across
+                # cores. tifffile shares a file handle and is NOT thread-safe, so
+                # those reads are serialised behind a lock.
+                tiff_backed = getattr(self._image, "_tif", None) is not None
                 _read_lock = threading.Lock()
+
+                def _read_channel(ch):
+                    if ch.is_processed and ch.processed_data is not None:
+                        return ch.processed_data
+                    if tiff_backed:
+                        with _read_lock:
+                            return self._image.get_full_channel_data(ch.index, level=0)
+                    return self._image.get_full_channel_data(ch.index, level=0)
 
                 def _process_one(i):
                     ch = channels_snapshot[i]
-                    if ch.is_processed and ch.processed_data is not None:
-                        data = ch.processed_data.astype(np.float32)
-                    else:
-                        with _read_lock:
-                            data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+                    data = _read_channel(ch)
 
                     dh, dw = data.shape[:2]
-                    crop_h, crop_w = min(h, dh), min(w, dw)
-                    lab_crop = working_labels[:crop_h, :crop_w]
-                    dat_crop = data[:crop_h, :crop_w]
-
-                    # bincount is ~3-5× faster than scipy.ndimage.mean for integer labels
-                    flat_lbl = lab_crop.ravel()
-                    flat_dat = dat_crop.ravel()
-                    sums   = np.bincount(flat_lbl, weights=flat_dat.astype(np.float64), minlength=max_label + 1)
-                    counts = np.bincount(flat_lbl, minlength=max_label + 1)
-                    with np.errstate(invalid="ignore"):
-                        means_lut = np.where(counts > 0, sums / counts, 0.0).astype(np.float32)
+                    if dh >= crop_h and dw >= crop_w:
+                        flat_dat = np.ascontiguousarray(data[:crop_h, :crop_w]).ravel()
+                        # Gather only the foreground pixels and sum per label. This
+                        # skips the background and avoids casting the whole image to
+                        # float64 just to satisfy bincount's weight dtype.
+                        vals_fg = flat_dat[fg].astype(np.float64, copy=False)
+                        sums = np.bincount(lbl_fg, weights=vals_fg, minlength=max_label + 1)
+                        means_lut = (sums / safe_counts).astype(np.float32)
+                        means_lut[zero_count] = 0.0
+                    else:
+                        # Rare: channel smaller than the shared crop — self-contained.
+                        ch_h, ch_w = min(crop_h, dh), min(crop_w, dw)
+                        fl = np.ascontiguousarray(working_labels[:ch_h, :ch_w]).ravel()
+                        fd = np.ascontiguousarray(data[:ch_h, :ch_w]).ravel().astype(np.float64)
+                        s = np.bincount(fl, weights=fd, minlength=max_label + 1)
+                        c = np.bincount(fl, minlength=max_label + 1)
+                        with np.errstate(invalid="ignore"):
+                            means_lut = np.where(c > 0, s / np.where(c > 0, c, 1), 0.0).astype(np.float32)
 
                     valid_means = means_lut[cell_ids]
                     valid_means = valid_means[valid_means > 0]
@@ -2744,12 +2791,23 @@ class MainWindow(QMainWindow):
                 cell_means: dict[int, np.ndarray] = {}
                 thresholds: dict[int, float] = {}
 
+                # Drive a determinate progress bar: one step per channel as it
+                # finishes (order-independent via as_completed).
+                from concurrent.futures import as_completed
+                total = len(channel_indices)
+                done = 0
+                self.operationProgress.emit(0, total)
+
                 n_workers = min(len(channel_indices), max(1, (os.cpu_count() or 4)))
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    for i, means_lut, threshold in pool.map(_process_one, channel_indices):
+                    futures = [pool.submit(_process_one, i) for i in channel_indices]
+                    for fut in as_completed(futures):
+                        i, means_lut, threshold = fut.result()
                         cell_means[i] = means_lut
                         if threshold is not None:
                             thresholds[i] = threshold
+                        done += 1
+                        self.operationProgress.emit(done, total)
 
                 self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx)
 
