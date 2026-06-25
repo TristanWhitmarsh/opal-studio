@@ -2719,94 +2719,94 @@ class MainWindow(QMainWindow):
                 ]
                 channels_snapshot = {i: self._channel_model.channel(i) for i in channel_indices}
 
-                # ── Precompute label geometry ONCE, shared by every channel ──────
-                # Per-cell pixel counts and the set of foreground (cell) pixels
-                # depend only on the label map, not on the channel data. Computing
-                # them once — instead of once per (often 40+) channel — and then
-                # reducing only over foreground pixels is the bulk of the speedup
-                # on large datasets (e.g. a whole mouse embryo): it removes one
-                # full-image bincount per channel and skips the large background.
+                # ── Precompute label geometry ONCE. The foreground (cell) pixels
+                #    and per-cell pixel counts depend only on the label map, so they
+                #    are computed a single time and reused for every channel. The
+                #    image is split into contiguous strips; for each strip we keep
+                #    the foreground mask and the matching label ids, so the per-cell
+                #    sum reduction for every channel runs fully in parallel across
+                #    cores (np.bincount releases the GIL and each strip writes its
+                #    own partial histogram — no contention, no single-threaded gather,
+                #    and the foreground mask is never recomputed per channel). ───────
                 lh, lw = working_labels.shape[:2]
                 crop_h, crop_w = min(h, lh), min(w, lw)
                 flat_lbl = np.ascontiguousarray(working_labels[:crop_h, :crop_w]).ravel()
-                fg = flat_lbl > 0                              # foreground (cell) pixels
-                lbl_fg = flat_lbl[fg]                          # their label ids
-                counts = np.bincount(lbl_fg, minlength=max_label + 1)
+                N = flat_lbl.size
+
+                n_threads = max(1, (os.cpu_count() or 4))
+                edges = np.linspace(0, N, n_threads + 1).astype(np.int64)
+                seg_bounds = [(int(edges[k]), int(edges[k + 1]))
+                              for k in range(n_threads) if edges[k + 1] > edges[k]]
+                seg_mask = [flat_lbl[a:b] > 0 for (a, b) in seg_bounds]          # cell pixels
+                seg_lbl = [flat_lbl[a:b][m] for (a, b), m in zip(seg_bounds, seg_mask)]
+
+                counts = np.zeros(max_label + 1, dtype=np.int64)
+                for sl in seg_lbl:
+                    counts += np.bincount(sl, minlength=max_label + 1)
                 safe_counts = np.where(counts > 0, counts, 1).astype(np.float64)
                 zero_count = counts == 0
 
-                # Read channels in parallel. The SpatialData/Zarr backend is
-                # thread-safe for concurrent reads (each chunk read opens its files
-                # independently), so multiple channels decompress at once across
-                # cores. tifffile shares a file handle and is NOT thread-safe, so
-                # those reads are serialised behind a lock.
-                tiff_backed = getattr(self._image, "_tif", None) is not None
-                _read_lock = threading.Lock()
+                def _cell_means(flat_dat, pool):
+                    """Per-cell mean LUT for one channel, reduced in parallel by strip."""
+                    def _sum_strip(k):
+                        a, b = seg_bounds[k]
+                        vals = flat_dat[a:b][seg_mask[k]].astype(np.float64)
+                        return np.bincount(seg_lbl[k], weights=vals, minlength=max_label + 1)
+                    if len(seg_bounds) <= 1:
+                        sums = _sum_strip(0)
+                    else:
+                        sums = np.sum(list(pool.map(_sum_strip, range(len(seg_bounds)))), axis=0)
+                    means_lut = (sums / safe_counts).astype(np.float32)
+                    means_lut[zero_count] = 0.0
+                    return means_lut
 
                 def _read_channel(ch):
                     if ch.is_processed and ch.processed_data is not None:
                         return ch.processed_data
-                    if tiff_backed:
-                        with _read_lock:
-                            return self._image.get_full_channel_data(ch.index, level=0)
                     return self._image.get_full_channel_data(ch.index, level=0)
-
-                def _process_one(i):
-                    ch = channels_snapshot[i]
-                    data = _read_channel(ch)
-
-                    dh, dw = data.shape[:2]
-                    if dh >= crop_h and dw >= crop_w:
-                        flat_dat = np.ascontiguousarray(data[:crop_h, :crop_w]).ravel()
-                        # Gather only the foreground pixels and sum per label. This
-                        # skips the background and avoids casting the whole image to
-                        # float64 just to satisfy bincount's weight dtype.
-                        vals_fg = flat_dat[fg].astype(np.float64, copy=False)
-                        sums = np.bincount(lbl_fg, weights=vals_fg, minlength=max_label + 1)
-                        means_lut = (sums / safe_counts).astype(np.float32)
-                        means_lut[zero_count] = 0.0
-                    else:
-                        # Rare: channel smaller than the shared crop — self-contained.
-                        ch_h, ch_w = min(crop_h, dh), min(crop_w, dw)
-                        fl = np.ascontiguousarray(working_labels[:ch_h, :ch_w]).ravel()
-                        fd = np.ascontiguousarray(data[:ch_h, :ch_w]).ravel().astype(np.float64)
-                        s = np.bincount(fl, weights=fd, minlength=max_label + 1)
-                        c = np.bincount(fl, minlength=max_label + 1)
-                        with np.errstate(invalid="ignore"):
-                            means_lut = np.where(c > 0, s / np.where(c > 0, c, 1), 0.0).astype(np.float32)
-
-                    valid_means = means_lut[cell_ids]
-                    valid_means = valid_means[valid_means > 0]
-                    threshold = None
-                    if valid_means.size > 1:
-                        try:
-                            val = thresh_fn(valid_means)
-                            if not np.isnan(val):
-                                threshold = float(val)
-                        except Exception:
-                            pass
-
-                    return i, means_lut, threshold
 
                 cell_means: dict[int, np.ndarray] = {}
                 thresholds: dict[int, float] = {}
 
-                # Drive a determinate progress bar: one step per channel as it
-                # finishes (order-independent via as_completed).
-                from concurrent.futures import as_completed
+                # One progress step per channel; advances as each threshold is found.
                 total = len(channel_indices)
-                done = 0
                 self.operationProgress.emit(0, total)
 
-                n_workers = min(len(channel_indices), max(1, (os.cpu_count() or 4)))
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = [pool.submit(_process_one, i) for i in channel_indices]
-                    for fut in as_completed(futures):
-                        i, means_lut, threshold = fut.result()
-                        cell_means[i] = means_lut
-                        if threshold is not None:
-                            thresholds[i] = threshold
-                        done += 1
+                # Process channels sequentially — only one full-resolution image is
+                # held in memory at a time, so peak RAM stays bounded for very large
+                # datasets (e.g. a whole mouse embryo). The per-cell reduction inside
+                # each channel is what uses all the cores.
+                with ThreadPoolExecutor(max_workers=n_threads) as pool:
+                    for done, ci in enumerate(channel_indices, start=1):
+                        ch = channels_snapshot[ci]
+                        data = _read_channel(ch)               # load whole channel
+                        dh, dw = data.shape[:2]
+                        ch_h, ch_w = min(crop_h, dh), min(crop_w, dw)
+
+                        if (ch_h, ch_w) == (crop_h, crop_w):
+                            flat_dat = np.ascontiguousarray(data[:crop_h, :crop_w]).ravel()
+                            means_lut = _cell_means(flat_dat, pool)
+                        else:
+                            # Rare: channel smaller than the shared crop — self-contained.
+                            fl = np.ascontiguousarray(working_labels[:ch_h, :ch_w]).ravel()
+                            fd = np.ascontiguousarray(data[:ch_h, :ch_w]).ravel().astype(np.float64)
+                            s = np.bincount(fl, weights=fd, minlength=max_label + 1)
+                            c = np.bincount(fl, minlength=max_label + 1)
+                            with np.errstate(invalid="ignore"):
+                                means_lut = np.where(c > 0, s / np.where(c > 0, c, 1), 0.0).astype(np.float32)
+
+                        valid_means = means_lut[cell_ids]
+                        valid_means = valid_means[valid_means > 0]
+                        if valid_means.size > 1:
+                            try:
+                                val = thresh_fn(valid_means)
+                                if not np.isnan(val):
+                                    thresholds[ci] = float(val)
+                            except Exception:
+                                pass
+
+                        cell_means[ci] = means_lut
+                        data = None                            # free before next read
                         self.operationProgress.emit(done, total)
 
                 self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx)
