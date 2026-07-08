@@ -10,12 +10,21 @@ render_viewport_tiled()  <- primary entry point for the canvas
   |- Per disk channel: get_tile(img, level, ch, y_slice, x_slice)
   |     One page read per channel.  Submitted in parallel to _READ_POOL so
   |     all 40 channels of an IMC image are read concurrently.
-  |     The TileCache is NOT used in the hot path because page.asarray()
-  |     already slices to the viewport region -- there is no benefit to
-  |     sub-tiling when we read the viewport in one shot.
   |
-  +- Composite all fetched arrays into one float32 canvas -> single QImage.
+  +- Composite all channels into one float32 canvas -> single QImage.
        Returned as one atomic image (no visible tile seams ever).
+
+Layer caching (LayerCache)
+--------------------------
+Compositing — not disk I/O — dominates once tiles are warm, so a per-viewport
+LayerCache lets display-only changes skip the expensive work, treating channels
+as reusable layers:
+  * each channel's normalised alpha coverage is cached, so changing colour /
+    opacity / visibility (or adding one channel) reuses the others' alpha;
+  * the summed, pre-brightness intensity image is cached, so a brightness change
+    is a single multiply.
+The cache is scoped to one (level, viewport-rect); pan/zoom resets it because the
+pixels differ.  Passing layer_cache=None disables it (identical output, no reuse).
 
 render_overview()  <- coarsest pyramid level, rendered once per image/channel
                      change.  Used as the always-available background layer.
@@ -97,6 +106,102 @@ def _get_thread_zarr(img: "ImageData", level_idx: int):
 # Compositing layer order
 # ─────────────────────────────────────────────────────────────────────────────
 
+class LayerCache:
+    """
+    Per-viewport cache of composited layers, enabling QuPath-style "render as
+    layers" so display-only changes don't recompute the whole image.
+
+    Two levels of caching, both scoped to a single (level, viewport-rect):
+
+      * ``alpha``  — each intensity channel's normalised 0-1 coverage array.
+                     Reused when only colour / opacity / brightness / channel
+                     visibility change (alpha depends solely on the pixels and
+                     the channel's data-range + display-range).
+      * ``intensity_sum`` — the additive sum of every visible intensity
+                     channel's *coloured* contribution, **before** the global
+                     brightness scale.  Reused across brightness changes, making
+                     a brightness drag a single multiply.
+
+    Any change of viewport or pyramid level resets the cache (the pixels are
+    different).  Only the render worker thread touches an instance; the canvas
+    swaps in a fresh LayerCache when a new image loads, so there is never
+    cross-thread mutation of a live cache.
+    """
+
+    __slots__ = ("_key", "_alpha", "intensity_sum", "intensity_sig")
+
+    def __init__(self):
+        self._key = None
+        self._alpha: Dict[int, tuple] = {}   # id(ch) -> (params, ndarray)
+        self.intensity_sum: Optional[np.ndarray] = None
+        self.intensity_sig = None
+
+    def ensure(self, key: tuple) -> None:
+        """Reset all cached data if the viewport / level changed."""
+        if key != self._key:
+            self._key = key
+            self._alpha.clear()
+            self.intensity_sum = None
+            self.intensity_sig = None
+
+    @staticmethod
+    def channel_params(ch: "Channel") -> tuple:
+        """Everything that affects a channel's alpha coverage array."""
+        proc = bool(ch.is_processed and ch.processed_data is not None)
+        return (
+            round(float(ch.data_min), 6), round(float(ch.data_max), 6),
+            round(float(ch.range_min), 6), round(float(ch.range_max), 6),
+            proc, id(ch.processed_data) if proc else 0,
+        )
+
+    def get_alpha(self, ch: "Channel") -> Optional[np.ndarray]:
+        entry = self._alpha.get(id(ch))
+        if entry is not None and entry[0] == self.channel_params(ch):
+            return entry[1]
+        return None
+
+    def put_alpha(self, ch: "Channel", alpha: np.ndarray) -> None:
+        self._alpha[id(ch)] = (self.channel_params(ch), alpha)
+
+    def prune(self, keep_ids: set) -> None:
+        for cid in [c for c in self._alpha if c not in keep_ids]:
+            del self._alpha[cid]
+
+
+def _channel_alpha(raw: np.ndarray, ch: "Channel") -> np.ndarray:
+    """Normalise a raw channel slice to a 0-1 float32 coverage (alpha) array.
+
+    Mirrors the intensity branch of :func:`_composite_channel` exactly so cached
+    and freshly-composited frames are pixel-identical.
+    """
+    dmin, dmax = ch.data_min, ch.data_max
+    if dmax > dmin:
+        alpha = np.clip((raw - dmin) / (dmax - dmin), 0.0, 1.0)
+    else:
+        alpha = np.zeros_like(raw, dtype=np.float32)
+
+    rng_w = ch.range_max - ch.range_min
+    if rng_w > 0:
+        alpha = np.clip((alpha - ch.range_min) / rng_w, 0.0, 1.0)
+    else:
+        alpha = (alpha >= ch.range_max).astype(np.float32)
+    return np.ascontiguousarray(alpha, dtype=np.float32)
+
+
+def _accumulate_colored(dst: np.ndarray, alpha: np.ndarray, col: np.ndarray) -> None:
+    """dst += alpha[...,None] * col, done per-plane to avoid a HxWx3 temporary.
+
+    The broadcast form allocates a full HxWx3 float array per channel; summing
+    into each colour plane separately is ~3x faster on typical viewports.
+    """
+    if col[0]:
+        dst[..., 0] += alpha * col[0]
+    if col[1]:
+        dst[..., 1] += alpha * col[1]
+    if col[2]:
+        dst[..., 2] += alpha * col[2]
+
+
 def _composite_order(ch: "Channel") -> int:
     """
     Return a priority integer used to sort channels before compositing.
@@ -131,6 +236,7 @@ def render_viewport_tiled(
     viewport: QRectF,       # in base-resolution image space
     brightness: float = 1.0,
     tile_size: int = 512,   # reserved for future use
+    layer_cache: Optional["LayerCache"] = None,
 ) -> tuple:
     """
     Composite the visible viewport into one QImage.
@@ -148,7 +254,8 @@ def render_viewport_tiled(
     if img.is_rgb:
         return _render_viewport_rgb(cache, img, level_idx, viewport, tile_size)
     return _render_viewport_multichannel(
-        cache, img, channels, level_idx, viewport, brightness, tile_size
+        cache, img, channels, level_idx, viewport, brightness, tile_size,
+        layer_cache,
     )
 
 
@@ -253,6 +360,7 @@ def _render_viewport_multichannel(
     viewport: QRectF,
     brightness: float,
     tile_size: int,
+    layer_cache: Optional["LayerCache"] = None,
 ) -> tuple:
     lvl = img.levels[level_idx]
     ds = lvl.downsample
@@ -274,37 +382,97 @@ def _render_viewport_multichannel(
     if not channels or height <= 0 or width <= 0:
         return _blank_qimage(1, 1), actual_rect
 
-    # Scale factor for additive blending
+    # Intensity (additive) channels vs. mask overlays (alpha-blended on top).
     intensity_channels = [c for c in channels if not c.is_mask
                           and not c.is_cell_mask and not c.is_type_mask
                           and not getattr(c, 'is_region', False)]
     scale = brightness / len(intensity_channels) if intensity_channels else brightness
 
-    # Channels that need a disk page read: everything that doesn't have
-    # ready-to-use in-memory data.  A channel with is_processed=True but
-    # processed_data=None (still being computed) must fall back to a disk
-    # read of the original data rather than being silently dropped.
-    disk_channels = [c for c in channels
-                     if not c.is_mask and not c.is_cell_mask
-                     and not c.is_type_mask
-                     and not getattr(c, 'is_region', False)
-                     and not (c.is_processed and c.processed_data is not None)]
+    # Scope the layer cache to this exact viewport / level.  A mismatch resets it.
+    if layer_cache is not None:
+        layer_cache.ensure((level_idx, lv_y0, lv_y1, lv_x0, lv_x1))
 
-    # ── Parallel fetch: one page.asarray()[slice] per channel ────────────
-    # Submitting all reads at once is the key performance win: I/O releases
-    # the GIL so 40 channel reads happen in parallel on 6 threads.
-    channel_arrays: Dict[int, np.ndarray] = {}   # id(ch) -> float32 array
+    # ── Intensity layer sum (brightness-independent, cached) ─────────────────
+    # Signature captures everything that changes the summed intensity image
+    # *except* the global brightness scale, so a brightness drag reuses the sum.
+    sig = tuple(
+        (id(c), c.color.rgb(), round(float(c.alpha), 4)) + LayerCache.channel_params(c)
+        for c in intensity_channels
+    )
 
-    y_sl = slice(lv_y0, lv_y1)
-    x_sl = slice(lv_x0, lv_x1)
+    if (layer_cache is not None and layer_cache.intensity_sum is not None
+            and layer_cache.intensity_sig == sig):
+        intensity_sum = layer_cache.intensity_sum
+    else:
+        intensity_sum = _build_intensity_sum(
+            cache, img, level_idx, intensity_channels, layer_cache,
+            slice(lv_y0, lv_y1), slice(lv_x0, lv_x1), ds, height, width, tile_size,
+        )
+        if layer_cache is not None:
+            layer_cache.intensity_sum = intensity_sum
+            layer_cache.intensity_sig = sig
+            layer_cache.prune({id(c) for c in intensity_channels})
 
-    if disk_channels:
+    # Apply the global brightness scale onto a private copy (cache stays clean).
+    canvas = intensity_sum * scale
+
+    # ── Mask / cell / type overlays (alpha-blended, painted on top) ──────────
+    mask_channels = [c for c in channels
+                     if (c.is_mask or c.is_cell_mask or c.is_type_mask)
+                     and c.visible and c.mask_data is not None]
+    if mask_channels:
+        by0 = int(lv_y0 * ds);  by1 = int(lv_y1 * ds)
+        bx0 = int(lv_x0 * ds);  bx1 = int(lv_x1 * ds)
+        for ch in sorted(mask_channels, key=_composite_order):
+            raw = ch.mask_data[by0:by1, bx0:bx1].astype(np.float32)
+            if raw.shape[:2] != (height, width):
+                raw = _fast_resize(raw, height, width)
+            _composite_channel(canvas, raw, ch, scale)
+
+    np.clip(canvas, 0.0, 1.0, out=canvas)
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba[..., :3] = (canvas * 255).astype(np.uint8)
+    rgba[..., 3] = 255
+    return _ndarray_to_qimage(rgba), actual_rect
+
+
+def _build_intensity_sum(
+    cache: TileCache,
+    img: ImageData,
+    level_idx: int,
+    intensity_channels: List[Channel],
+    layer_cache: Optional["LayerCache"],
+    y_sl: slice,
+    x_sl: slice,
+    ds: float,
+    height: int,
+    width: int,
+    tile_size: int,
+) -> np.ndarray:
+    """Sum every intensity channel's coloured (pre-brightness) contribution.
+
+    Each channel's normalised alpha is pulled from the layer cache when its
+    display range is unchanged; only channels whose alpha is missing get a disk
+    read.  So adding one channel reads one channel, not all of them.
+    """
+    # Which channels still need a raw disk read (no cached alpha, on-disk source)?
+    need_read: List[Channel] = []
+    for ch in intensity_channels:
+        cached_alpha = layer_cache.get_alpha(ch) if layer_cache is not None else None
+        is_processed = ch.is_processed and ch.processed_data is not None
+        if cached_alpha is None and not is_processed:
+            need_read.append(ch)
+
+    # ── Parallel fetch: one read per channel that needs it.  I/O releases the
+    #    GIL so many-channel reads overlap on the worker pool. ────────────────
+    channel_arrays: Dict[int, np.ndarray] = {}
+    if need_read:
         future_to_ch = {
             _READ_POOL.submit(
                 _read_channel_slice,
                 cache, img, level_idx, ch.index, y_sl, x_sl, tile_size,
             ): ch
-            for ch in disk_channels
+            for ch in need_read
         }
         for fut in as_completed(future_to_ch):
             ch = future_to_ch[fut]
@@ -314,43 +482,29 @@ def _render_viewport_multichannel(
                 print(f"[Opal] channel read error ({ch.name}): {exc}")
                 channel_arrays[id(ch)] = np.zeros((height, width), dtype=np.float32)
 
-    # ── Composite (serial, in layer order) ───────────────────────────────────
-    canvas = np.zeros((height, width, 3), dtype=np.float32)
-
-    for ch in sorted(channels, key=_composite_order):
-        if getattr(ch, 'is_region', False):
-            continue
-        if ch.is_mask or ch.is_cell_mask or ch.is_type_mask:
-            if not ch.visible or ch.mask_data is None:
-                continue
-            # Mask data is always at base resolution -- slice using base coords
-            by0 = int(lv_y0 * ds);  by1 = int(lv_y1 * ds)
-            bx0 = int(lv_x0 * ds);  bx1 = int(lv_x1 * ds)
-            raw = ch.mask_data[by0:by1, bx0:bx1].astype(np.float32)
+    intensity_sum = np.zeros((height, width, 3), dtype=np.float32)
+    for ch in intensity_channels:
+        alpha = layer_cache.get_alpha(ch) if layer_cache is not None else None
+        if alpha is None:
+            if ch.is_processed and ch.processed_data is not None:
+                by0 = int(y_sl.start * ds);  by1 = int(y_sl.stop * ds)
+                bx0 = int(x_sl.start * ds);  bx1 = int(x_sl.stop * ds)
+                raw = ch.processed_data[by0:by1, bx0:bx1].astype(np.float32)
+            else:
+                raw = channel_arrays.get(id(ch))
+                if raw is None:
+                    continue
             if raw.shape[:2] != (height, width):
                 raw = _fast_resize(raw, height, width)
+            alpha = _channel_alpha(raw, ch)
+            if layer_cache is not None:
+                layer_cache.put_alpha(ch, alpha)
 
-        elif ch.is_processed and ch.processed_data is not None:
-            by0 = int(lv_y0 * ds);  by1 = int(lv_y1 * ds)
-            bx0 = int(lv_x0 * ds);  bx1 = int(lv_x1 * ds)
-            raw = ch.processed_data[by0:by1, bx0:bx1].astype(np.float32)
-            if raw.shape[:2] != (height, width):
-                raw = _fast_resize(raw, height, width)
+        col = np.array([ch.color.redF(), ch.color.greenF(), ch.color.blueF()],
+                       dtype=np.float32) * ch.alpha
+        _accumulate_colored(intensity_sum, alpha, col)
 
-        else:
-            raw = channel_arrays.get(id(ch))
-            if raw is None:
-                continue
-            if raw.shape[:2] != (height, width):
-                raw = _fast_resize(raw, height, width)
-
-        _composite_channel(canvas, raw, ch, scale)
-
-    np.clip(canvas, 0.0, 1.0, out=canvas)
-    rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    rgba[..., :3] = (canvas * 255).astype(np.uint8)
-    rgba[..., 3] = 255
-    return _ndarray_to_qimage(rgba), actual_rect
+    return intensity_sum
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -615,8 +769,7 @@ def _composite_channel(
         col = np.array([ch.color.redF(), ch.color.greenF(), ch.color.blueF()],
                        dtype=np.float32)
         col *= scale * ch.alpha
-        if np.any(col > 0):
-            canvas += alpha[..., None] * col
+        _accumulate_colored(canvas, alpha, col)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

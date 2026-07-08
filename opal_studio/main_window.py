@@ -262,7 +262,20 @@ class MainWindow(QMainWindow):
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
+
+        # Permanent loading indicator pinned to the right of the status bar so
+        # the user always knows the canvas is rendering (vs. frozen).
+        self._loading_label = QLabel("")
+        self._loading_label.setStyleSheet("color: #f0c000; padding-right: 8px;")
+        self._status.addPermanentWidget(self._loading_label)
+        self._canvas.loadingChanged.connect(self._on_canvas_loading)
+
         self._setup_menus()
+
+    @Slot(bool)
+    def _on_canvas_loading(self, loading: bool):
+        """Reflect the canvas render state in the bottom-right status bar."""
+        self._loading_label.setText("● Loading…" if loading else "")
 
     def _setup_menus(self):
         menu_bar = self.menuBar()

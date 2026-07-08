@@ -60,7 +60,7 @@ from opal_studio.channel_model import ChannelListModel
 from opal_studio.image_loader import (
     ImageData, TileCache, best_level_for_zoom, get_tile, _get_yx,
 )
-from opal_studio.image_renderer import render_viewport_tiled, render_overview
+from opal_studio.image_renderer import render_viewport_tiled, render_overview, LayerCache
 from opal_studio.widgets.geometry import clip_polygon_to_rect
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
@@ -78,10 +78,12 @@ class _ViewportRequest:
     __slots__ = (
         "img", "channels", "cache", "level_idx",
         "viewport", "brightness", "seq", "channel_version", "is_progressive",
+        "layer_cache",
     )
 
     def __init__(self, img, channels, cache, level_idx,
-                 viewport: QRectF, brightness, seq, channel_version, is_progressive=False):
+                 viewport: QRectF, brightness, seq, channel_version, is_progressive=False,
+                 layer_cache=None):
         self.img = img
         self.channels = channels
         self.cache = cache
@@ -91,6 +93,7 @@ class _ViewportRequest:
         self.seq = seq
         self.channel_version = channel_version
         self.is_progressive = is_progressive
+        self.layer_cache = layer_cache
 
 
 class _RenderWorker(QObject):
@@ -137,6 +140,7 @@ class _RenderWorker(QObject):
                 req.viewport,
                 req.brightness,
                 TILE_SIZE,
+                req.layer_cache,
             )
             # Emit actual_rect (integer-snapped level coords back-projected to
             # base-image space), NOT req.viewport which is floating-point and
@@ -178,6 +182,7 @@ class ImageCanvas(QWidget):
     pixelHovered = Signal(int, int)
     regionDrawn = Signal(list)
     viewportChanged = Signal(QRectF)   # emitted on user zoom/pan
+    loadingChanged = Signal(bool)      # True while a hi-res frame is being rendered
 
     def __init__(self, channel_model: ChannelListModel, parent=None):
         super().__init__(parent)
@@ -189,6 +194,18 @@ class ImageCanvas(QWidget):
 
         # Decoded channel data (shared with renderer, thread-safe LRU)
         self._tile_cache = TileCache(max_bytes=DECODE_CACHE_MB * 1024 * 1024)
+
+        # Per-viewport composited-layer cache so display-only changes (brightness,
+        # colour, channel show/hide) recomposite from cached layers instead of
+        # re-reading and re-blending every channel.  Replaced (never mutated from
+        # the main thread) on image load so an in-flight worker render is never
+        # racing against a reset.
+        self._layer_cache = LayerCache()
+
+        # Loading-indicator bookkeeping: seq of the most recent hi-res (non-
+        # progressive) render request, and whether we've told the UI we're busy.
+        self._loading_seq = -1
+        self._loading_active = False
 
         # Low-res overview — entire image at coarsest level
         self._overview: Optional[QImage] = None
@@ -259,10 +276,19 @@ class ImageCanvas(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def _set_loading(self, active: bool):
+        """Emit loadingChanged only on a real state transition."""
+        if active != self._loading_active:
+            self._loading_active = active
+            self.loadingChanged.emit(active)
+
     def set_image(self, img: ImageData, load_overview: bool = True):
         """Load a new image, clear caches, and fit it to the window."""
         self._img = img
         self._tile_cache.clear()
+        # Fresh layer cache — the old one may still be read by an in-flight
+        # render on the worker thread; that result is discarded by version check.
+        self._layer_cache = LayerCache()
         self._display_image = None
         self._display_viewport = QRectF()
         self._display_level_idx = -1
@@ -290,6 +316,8 @@ class ImageCanvas(QWidget):
         """Unload the current image and return the canvas to a blank state."""
         self._img = None
         self._tile_cache.clear()
+        self._layer_cache = LayerCache()
+        self._set_loading(False)
         self._display_image = None
         self._display_viewport = QRectF()
         self._display_level_idx = -1
@@ -537,6 +565,7 @@ class ImageCanvas(QWidget):
         if not channels and not self._img.is_rgb:
             self._display_image = None
             self._overview = None
+            self._set_loading(False)
             self.update()
             return
 
@@ -560,12 +589,15 @@ class ImageCanvas(QWidget):
             seq=self._seq,
             channel_version=self._channel_version,
             is_progressive=progressive,
+            layer_cache=self._layer_cache,
         )
         self._worker.request.emit(req, self._seq)
-        
+
         # Only request an overview update on the final debounced high-res render
         # to prevent queue clogging when dragging sliders.
         if not progressive:
+            self._loading_seq = self._seq
+            self._set_loading(True)
             self._request_overview_update()
             
         # Draw immediately with whatever we have (overview + scaled old frame)
@@ -595,6 +627,11 @@ class ImageCanvas(QWidget):
             self._display_channel_version = ch_ver
             self._display_level_idx = level_idx
             self._progressive_image = None
+            # The hi-res frame the user was waiting for has landed (seq is
+            # monotonic and stale requests are dropped before rendering, so any
+            # arriving non-progressive frame is the latest one).
+            if seq >= self._loading_seq:
+                self._set_loading(False)
 
         self.update()
 
