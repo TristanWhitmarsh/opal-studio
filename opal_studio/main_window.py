@@ -822,7 +822,16 @@ class MainWindow(QMainWindow):
             with open(path, 'r', encoding='utf-8') as f:
                 geojson_data = json.load(f)
 
-            features = geojson_data.get("features", [])
+            # Accept the several shapes QuPath emits as well as our own export:
+            #   - a FeatureCollection: {"type": "FeatureCollection", "features": [...]}
+            #   - a bare list of features: [{...}, {...}]   (QuPath multi-object export)
+            #   - a single bare Feature: {"type": "Feature", ...}  (QuPath single-object export)
+            if isinstance(geojson_data, list):
+                features = geojson_data
+            elif isinstance(geojson_data, dict) and geojson_data.get("type") == "Feature":
+                features = [geojson_data]
+            else:
+                features = geojson_data.get("features", [])
             if not features:
                 QMessageBox.information(self, "Load Contours", "No features found in GeoJSON file.")
                 return
@@ -966,7 +975,16 @@ class MainWindow(QMainWindow):
             with open(path, 'r', encoding='utf-8') as f:
                 geojson_data = json.load(f)
 
-            features = geojson_data.get("features", [])
+            # Accept the several shapes QuPath emits as well as our own export:
+            #   - a FeatureCollection: {"type": "FeatureCollection", "features": [...]}
+            #   - a bare list of features: [{...}, {...}]   (QuPath multi-object export)
+            #   - a single bare Feature: {"type": "Feature", ...}  (QuPath single-object export)
+            if isinstance(geojson_data, list):
+                features = geojson_data
+            elif isinstance(geojson_data, dict) and geojson_data.get("type") == "Feature":
+                features = [geojson_data]
+            else:
+                features = geojson_data.get("features", [])
             if not features:
                 QMessageBox.information(self, "Load Regions", "No features found in GeoJSON file.")
                 return
@@ -1889,6 +1907,9 @@ class MainWindow(QMainWindow):
                 common["is_region"] = True
                 common["contour_data"] = self._rings_to_contour_data(
                     doc.shapes.get(ref_[1], {}))
+                # Regions are lightweight vector overlays — always show them on
+                # load regardless of the saved visibility state.
+                common["visible"] = True
             # kind == "original": data comes from the reopened image via index
 
             channels.append(Channel(**common))
@@ -2584,21 +2605,28 @@ class MainWindow(QMainWindow):
                 
                 print(f"[AI] Starting cell positivity detection for mask: {original_mask_ch.name}")
                 
+                # The model was trained on RAW marker intensities (no
+                # normalisation). Only include genuine raw image channels, in
+                # channel order, and feed their raw pixel values. Processed /
+                # derived channels (CLAHE, background-subtracted, merges) have a
+                # different intensity distribution and no raw backing (index<0),
+                # so including them would corrupt the prev/curr/next neighbour
+                # context and shift predictions.
                 target_channels = []
                 for i in range(self._channel_model.rowCount()):
                     ch = self._channel_model.channel(i)
-                    if not ch.is_mask and not ch.is_cell_mask:
-                        target_channels.append(ch)
-                
+                    if ch.is_mask or ch.is_cell_mask:
+                        continue
+                    if ch.is_processed or ch.index is None or ch.index < 0:
+                        continue
+                    target_channels.append(ch)
+
                 S = len(target_channels)
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
                 markers = np.zeros((h, w, S), dtype=np.float32)
                 for z, ch in enumerate(target_channels):
-                    if ch.is_processed and ch.processed_data is not None:
-                        data = ch.processed_data.astype(np.float32)
-                    else:
-                        data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
-                        
+                    data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
+
                     dh, dw = data.shape[:2]
                     copy_h = min(h, dh)
                     copy_w = min(w, dw)
@@ -2710,12 +2738,17 @@ class MainWindow(QMainWindow):
                 max_label = int(working_labels.max())
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
 
-                # Collect image channels to process (skip mask channels)
+                # Collect the ORIGINAL image channels to process. Skip masks,
+                # regions, and derived/filtered channels (e.g. CLAHE output or a
+                # merge of two channels — these carry is_processed/index == -1).
+                # Positivity should only be computed for the raw markers.
+                def _is_original_marker(ch):
+                    return not (ch.is_mask or ch.is_cell_mask or ch.is_type_mask
+                                or getattr(ch, "is_region", False)
+                                or ch.is_processed or ch.index < 0)
                 channel_indices = [
                     i for i in range(self._channel_model.rowCount())
-                    if not (self._channel_model.channel(i).is_mask
-                            or self._channel_model.channel(i).is_cell_mask
-                            or self._channel_model.channel(i).is_type_mask)
+                    if _is_original_marker(self._channel_model.channel(i))
                 ]
                 channels_snapshot = {i: self._channel_model.channel(i) for i in channel_indices}
 
@@ -2888,9 +2921,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # Channel may have been removed — fall through to create new
 
-        # First time: create a new cell-mask channel
+        # First time: create a new cell-mask channel. Name it exactly after the
+        # marker — the positivity map is keyed by source_marker everywhere (lookup,
+        # export, project save), and cell masks live in their own panel, so there
+        # is no need to append a uniquifying "1" that collides with the marker name.
         contour_data = self._get_contour_data(labels)   # One contour per cell ID
-        new_name = self._channel_model.get_unique_name(ch_name)
+        new_name = ch_name
         new_ch = Channel(
             name=new_name,
             color=ch_color,

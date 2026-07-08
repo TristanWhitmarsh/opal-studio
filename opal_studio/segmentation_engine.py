@@ -487,20 +487,22 @@ def run_positivity_task(queue, params, data):
         
         S = markers.shape[2]
         results = []
-        
+
+        # Cells are defined by the mask, which does not change across marker
+        # channels, so label connected components once up front.
+        labeled_slice, num_components = cc_label(labels > 0)
+
         for z in range(S):
             img_curr = markers[:, :, z]
-            # Simplified neighbor logic for worker
+            # Neighbour logic matches the reference get_neighbor_slices():
+            # edges repeat, interior uses z-1 / z+1.
             img_prev = markers[:, :, max(0, z-1)]
             img_next = markers[:, :, min(S-1, z+1)]
-            
-            cell_region = labels > 0
-            labeled_slice, num_components = cc_label(cell_region)
-            
+
             if num_components == 0:
                 results.append((np.zeros_like(labels, dtype=np.int16), z))
                 continue
-                
+
             slice_out = np.zeros_like(labels, dtype=np.int16)
             patches = []
             cell_ids = []

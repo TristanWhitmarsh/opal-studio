@@ -186,25 +186,34 @@ class ChannelListModel(QAbstractListModel):
             self.channels_changed.emit()
 
     def set_all_visible(self, visible: bool, include_masks: bool = True):
-        self.beginResetModel()
-        for ch in self._channels:
+        # Use per-row dataChanged (not beginResetModel) so the canvas refreshes
+        # exactly like a single eye-toggle does. A full model reset updates the
+        # panel's icons but does not reliably re-render the image for every
+        # affected layer, so bulk-toggled masks/types could stay drawn.
+        for i, ch in enumerate(self._channels):
             if not include_masks and (ch.is_mask or ch.is_cell_mask or ch.is_type_mask or ch.is_region):
                 continue
-            ch.visible = visible
-        self.endResetModel()
+            if ch.visible != visible:
+                ch.visible = visible
+                idx = self.index(i)
+                self.dataChanged.emit(idx, idx, [self.VisibleRole])
         self.channels_changed.emit()
 
     def set_category_visible(self, category: str, visible: bool):
         """category can be 'mask', 'cell', or 'type'."""
-        self.beginResetModel()
-        for ch in self._channels:
+        for i, ch in enumerate(self._channels):
             if category == "mask" and ch.is_mask and not ch.is_cell_mask and not ch.is_type_mask:
-                ch.visible = visible
+                match = True
             elif category == "cell" and ch.is_cell_mask:
-                ch.visible = visible
+                match = True
             elif category == "type" and ch.is_type_mask:
+                match = True
+            else:
+                match = False
+            if match and ch.visible != visible:
                 ch.visible = visible
-        self.endResetModel()
+                idx = self.index(i)
+                self.dataChanged.emit(idx, idx, [self.VisibleRole])
         self.channels_changed.emit()
 
     def channel(self, row: int) -> Channel:

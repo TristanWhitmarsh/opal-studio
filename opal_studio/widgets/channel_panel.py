@@ -6,13 +6,13 @@ colour swatch, name, and dual-handle range slider.
 from __future__ import annotations
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, Signal, QTimer
+from PySide6.QtCore import Qt, QSize, Signal, QTimer, QObject, QEvent
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSizePolicy, QColorDialog, QFrame, QSlider,
-    QTabWidget, QLineEdit
+    QTabWidget, QLineEdit, QApplication
 )
 
 
@@ -595,6 +595,9 @@ class ChannelPanel(QWidget):
             if state["done"]:
                 return
             state["done"] = True
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(outside_click_filter)
             new_name = editor.text().strip()
             top_layout.removeWidget(editor)
             editor.deleteLater()
@@ -602,6 +605,25 @@ class ChannelPanel(QWidget):
             if commit and new_name:
                 self._model.setData(self._model.index(row), new_name,
                                     ChannelListModel.NameRole)
+
+        # The surrounding labels/frames have NoFocus policy, so clicking them
+        # does not move keyboard focus off the editor and ``editingFinished``
+        # never fires — leaving the editor stuck open. Watch for any mouse
+        # press outside the editor and commit + close it then.
+        class _OutsideClickFilter(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Type.MouseButtonPress:
+                    inside = obj is editor or (
+                        isinstance(obj, QWidget) and editor.isAncestorOf(obj)
+                    )
+                    if not inside:
+                        finish(True)
+                return False
+
+        outside_click_filter = _OutsideClickFilter(editor)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(outside_click_filter)
 
         editor.editingFinished.connect(lambda: finish(True))
 

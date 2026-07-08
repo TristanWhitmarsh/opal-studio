@@ -73,7 +73,6 @@ NGFF_VERSION = "0.5-dev-spatialdata"
 
 # Default spatial chunk edge (Y/X). One channel per c-chunk for images.
 _CHUNK_EDGE = 1024
-_ILLEGAL_DIR_CHARS = '<>:"/\\|?*'
 
 # zstd codec block used by the hand-written anndata-v3 encoder.
 _ANNDATA_ZSTD = {"name": "zstd", "configuration": {"level": 5, "checksum": False}}
@@ -88,13 +87,18 @@ def _software_version() -> str:
 
 
 def _safe_dirname(key: str, used: set[str]) -> str:
-    """Map a logical key to a unique, filesystem-safe directory name.
+    """Map a logical key to a unique, SpatialData-valid directory name.
 
-    The true key is preserved in element metadata, so this is only cosmetic /
-    collision-avoidance for the on-disk name.
+    SpatialData validates element names against ``[A-Za-z0-9_.-]`` (alphanumeric,
+    underscore, dot, hyphen) and rejects anything else — spaces included — so a
+    store with e.g. a ``"Tumor cells"`` mask cannot be opened by the
+    ``spatialdata`` library.  We therefore replace every disallowed character
+    (not just Windows-illegal ones) with ``_``.  The true key is preserved
+    verbatim in element metadata (``opal_studio.key``), so this is a lossless,
+    on-disk-only mapping.
     """
-    base = "".join("_" if (c in _ILLEGAL_DIR_CHARS or ord(c) < 32) else c
-                   for c in str(key)).strip().rstrip(".") or "element"
+    base = "".join(c if (c.isascii() and (c.isalnum() or c in "_.-")) else "_"
+                   for c in str(key)).strip("_").rstrip(".") or "element"
     name = base
     i = 1
     while name in used:
