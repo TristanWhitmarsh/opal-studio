@@ -45,6 +45,34 @@ from skimage.measure import find_contours
 from skimage.morphology import white_tophat, opening, closing, disk
 
 
+def _app_version() -> str:
+    """Return the app version for the title bar.
+
+    Prefers the version in ``pyproject.toml`` (source / editable checkouts, where
+    it is always current even if the package hasn't been reinstalled), and falls
+    back to the installed package metadata for wheel installs.
+    """
+    try:
+        import re
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        if pyproject.exists():
+            m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']',
+                          pyproject.read_text(encoding="utf-8"))
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    try:
+        import importlib.metadata as _md
+        return _md.version("opal-studio")
+    except Exception:
+        return ""
+
+
+_APP_VERSION = _app_version()
+_APP_TITLE = f"Opal Studio {_APP_VERSION}".rstrip()
+
+
 def project_io_unique(existing: dict, name: str) -> str:
     """Return a key based on *name* that is not already present in *existing*."""
     if name not in existing:
@@ -168,7 +196,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         print("DEBUG: MainWindow initializing...")
-        self.setWindowTitle("Opal Studio")
+        self.setWindowTitle(_APP_TITLE)
         self.resize(1400, 900)
 
         # Data model
@@ -439,7 +467,7 @@ class MainWindow(QMainWindow):
         """Open a SpatialData directory and set it as the active image."""
         try:
             self._project_path = None
-            self.setWindowTitle("Opal Studio")
+            self.setWindowTitle(_APP_TITLE)
             collection = open_spatialdata_collection(path)
             img = collection.open_image(0)
             self._image = img
@@ -595,7 +623,7 @@ class MainWindow(QMainWindow):
         self._spatialdata_slice_index = 0
         self._pending_spatialdata_slice = 0
         self._brightfield_rgb = None
-        self.setWindowTitle("Opal Studio")
+        self.setWindowTitle(_APP_TITLE)
         self._slice_controls.hide()
 
         self._channel_model.set_channels([])
@@ -612,7 +640,7 @@ class MainWindow(QMainWindow):
         try:
             self._slice_load_timer.stop()
             self._project_path = None
-            self.setWindowTitle("Opal Studio")
+            self.setWindowTitle(_APP_TITLE)
             self._spatialdata_collection = None
             self._slice_controls.hide()
             img = open_image(path)
@@ -1737,7 +1765,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             n = self._save_project(path)
             self._project_path = path
-            self.setWindowTitle(f"Opal Studio — {Path(path).name}")
+            self.setWindowTitle(f"{_APP_TITLE} — {Path(path).name}")
             self._status.showMessage(
                 f"Saved project ({n} elements) to {Path(path).name}", 5000)
         except Exception as e:
@@ -1992,7 +2020,7 @@ class MainWindow(QMainWindow):
         self._restore_session_state(doc)
 
         self._project_path = path
-        self.setWindowTitle(f"Opal Studio — {Path(path).name}")
+        self.setWindowTitle(f"{_APP_TITLE} — {Path(path).name}")
         self._status.showMessage(
             f"Loaded project {Path(path).name}", 5000)
 
