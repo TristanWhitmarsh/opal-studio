@@ -36,24 +36,58 @@ On Windows this creates an `Opal Studio.lnk` shortcut on the desktop. On Linux i
 
 ### University Server / Darkroom Setup
 
-First-time installation, when a new wheel is released:
+Opal Studio is deployed as a source checkout installed into a conda env (it is not
+published to PyPI). Install or update to the latest code with:
 
 ```bash
-source /opt/conda/etc/profile.d/conda.sh
-conda activate /storage/scratch.space/envs/opal-env-j4
-PIP_REQUIRE_VIRTUALENV=0 pip install opal_studio-0.1.3-py3-none-any.whl
-python -m opal_studio --create-launcher
-```
+# 1) Get / update the code
+cd /home/tristan/Storage/scratch.space/users/tristan/opal-studio
+git pull        # first time instead: git clone https://github.com/TristanWhitmarsh/opal-studio.git .
 
-Launching after installation:
-
-```bash
+# 2) Activate the conda env
 source /opt/conda/etc/profile.d/conda.sh
-conda activate /storage/scratch.space/envs/opal-env-j4
+conda activate /home/tristan/Storage/scratch.space/envs/opal-env-j4
+
+# 3) Install the pinned dependencies, then the package itself
+PIP_REQUIRE_VIRTUALENV=0 pip install -r requirements.txt
+PIP_REQUIRE_VIRTUALENV=0 pip install --force-reinstall --no-deps --no-build-isolation .
+
+# 4) Create the desktop launcher
 python -m opal_studio --create-launcher
 ```
 
 Then double-click the **Opal Studio** icon on the desktop.
+
+Notes:
+- `pip install -r requirements.txt` installs the full dependency stack; run it on the
+  first install and whenever `requirements.txt` changes. (Skipping it is why clustering,
+  phenotyping, brightfield, or project-save features may report missing modules.)
+- `--force-reinstall --no-deps` reinstalls only the `opal_studio` code — picking up new
+  code even when the version number is unchanged — without re-resolving dependencies.
+- `--no-build-isolation` builds in place instead of copying the whole checkout to `/tmp`.
+- Do **not** launch with `python -m opal_studio` from *inside* the checkout directory —
+  that imports the checkout (which has no `models/`, see below) instead of the installed
+  package. Use the desktop launcher, the `opal-studio` console script, or run from `~`.
+
+#### Segmentation models
+
+The model weights (InstanSeg, StarDist, Cellpose, Mesmer) are gitignored and are not
+shipped in the wheel, so they must be placed next to the **installed** package, in the
+conda env's `site-packages`:
+
+```
+<env>/lib/python3.9/site-packages/opal_studio/models/
+```
+
+For example, uploading a compressed `models/` folder and extracting it there:
+
+```bash
+cd /home/tristan/Storage/scratch.space/envs/opal-env-j4/lib/python3.9/site-packages/opal_studio/
+tar xzf ~/models.tar.gz                                    # archive containing the models/ folder
+ls models/instanseg/single_channel_nuclei/instanseg.pt     # verify one model resolved
+```
+
+Re-check the models are still present after any `--force-reinstall`.
 
 ## Supported Data
 
