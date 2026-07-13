@@ -1,5 +1,12 @@
 graft .
 prune images
 prune models
+prune opal_studio/models
+prune build
+prune dist
+prune tests
 prune .git
+prune .claude
+prune .agents
+exclude screenshot.jpg
 global-exclude *.py[cod] __pycache__ *.so *.dylib .gitignore

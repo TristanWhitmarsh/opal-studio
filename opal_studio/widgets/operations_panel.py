@@ -1425,6 +1425,7 @@ class CellSamplerTab(QWidget):
         self._strategy_combo = QComboBox()
         self._strategy_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._strategy_combo.setMinimumWidth(50)
+        self._strategy_combo.addItem("Simple merge", "simple")
         self._strategy_combo.addItem("Largest cell count", "pop")
         self._strategy_combo.addItem("Highest Jaccard", "j1")
         self._strategy_combo.addItem("Min area variance", "cstd")
@@ -1440,7 +1441,7 @@ class CellSamplerTab(QWidget):
         layout.addLayout(form)
 
         # Run Button
-        self._run_btn = QPushButton("Run CellSampler")
+        self._run_btn = QPushButton("Run Merge")
         self._run_btn.clicked.connect(self._on_run)
         layout.addWidget(self._run_btn)
         
@@ -2432,7 +2433,7 @@ class OperationsPanel(QWidget):
         
         self._cell_sampler_tab = CellSamplerTab(self._channel_model)
         self._cell_sampler_tab.runRequested.connect(self._on_run_mask_processing)
-        self._mask_tabs.addTab(self._cell_sampler_tab, self._spacer_icon, "Sampler")
+        self._mask_tabs.addTab(self._cell_sampler_tab, self._spacer_icon, "Merge")
         
         self._expansion_tab = MaskExpansionTab(self._channel_model)
         self._expansion_tab.runRequested.connect(self._on_run_mask_processing)

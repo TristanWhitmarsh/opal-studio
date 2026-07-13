@@ -108,6 +108,44 @@ def expand_labels_labelmap(labels, expansion_pixels=6):
     return expand_labels(labels, distance=expansion_pixels)
 
 
+def _simple_merge_masks(masks: list[np.ndarray]) -> np.ndarray:
+    """Overlay label masks in list order (top → bottom), later masks winning.
+
+    Each mask is laid onto the running result in order.  Wherever a cell in the
+    current mask overlaps one or more cells already placed by an earlier mask,
+    those earlier cells are removed **in full** (not just the overlapping
+    pixels) and the current cell takes their place.  Labels are offset per mask
+    so every surviving cell keeps a unique id.
+
+    Parameters
+    ----------
+    masks:
+        2-D integer label arrays (0 = background), all the same shape, ordered
+        top-to-bottom as shown in the Merge tab's list.
+
+    Returns
+    -------
+    np.ndarray
+        int32 label array with the merged cells.
+    """
+    result = np.zeros_like(np.asarray(masks[0]), dtype=np.int32)
+    offset = 0
+    for m in masks:
+        m = np.asarray(m, dtype=np.int32)
+        fg = m > 0
+        if not fg.any():
+            continue
+        # Earlier cells that this mask's foreground touches — evict them whole.
+        overlapped = np.unique(result[fg])
+        overlapped = overlapped[overlapped > 0]
+        if overlapped.size:
+            result[np.isin(result, overlapped)] = 0
+        # Place this mask's cells, offsetting ids to stay globally unique.
+        result[fg] = m[fg] + offset
+        offset = int(result.max())
+    return result
+
+
 class MainWindow(QMainWindow):
     """Top-level window for Opal Studio."""
 
@@ -2490,12 +2528,22 @@ class MainWindow(QMainWindow):
             source_marker=source_marker,
             index=-1
         )
+        # If the user has a region selected (e.g. iterating segmentation methods
+        # over the same "Selected region"), keep that region selected rather than
+        # stealing the selection to the new mask — the single-selection model
+        # would otherwise deselect the region and force the user to reselect it.
+        region_selected = any(
+            getattr(ch, 'is_region', False) and ch.selected
+            for ch in self._channel_model._channels
+        )
+
         self._channel_model.add_channel(new_ch)
-        
-        # Select it!
-        new_idx = self._channel_model.rowCount() - 1
-        idx_qt = self._channel_model.index(new_idx)
-        self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
+
+        if not region_selected:
+            # Select it!
+            new_idx = self._channel_model.rowCount() - 1
+            idx_qt = self._channel_model.index(new_idx)
+            self._channel_model.setData(idx_qt, True, ChannelListModel.SelectedRole)
 
         self._status.showMessage(f"Task Complete: {mask_name}", 5000)
 
@@ -2524,19 +2572,27 @@ class MainWindow(QMainWindow):
 
             def _run_sampler():
                 try:
-                    from opal_studio.uber import UBM
                     import numpy as np
-                    
-                    carray = np.stack(labels_list)
+
                     merit = params.get("merit", "pop")
-                    nsize = params.get("nsize", 40)
-                    joint_mask, method_mask = UBM(carray).form_um(merit=merit, nsize=nsize)
-                    mask_result = joint_mask.astype(np.int32)
-                    
-                    merit_suffixes = {"pop": "_Count", "j1": "_Jac", "cstd": "_Var"}
-                    suffix = merit_suffixes.get(merit, f"_{merit}")
-                    new_name = f"Sampled{suffix}"
-                    
+                    if merit == "simple":
+                        # Simple merge: lay each mask down top → bottom.  A new
+                        # cell that overlaps a cell from an earlier mask evicts
+                        # that earlier cell entirely and takes its place, so the
+                        # lower masks in the list win any overlap.
+                        mask_result = _simple_merge_masks(labels_list)
+                        new_name = "Merged"
+                    else:
+                        from opal_studio.uber import UBM
+                        carray = np.stack(labels_list)
+                        nsize = params.get("nsize", 40)
+                        joint_mask, method_mask = UBM(carray).form_um(merit=merit, nsize=nsize)
+                        mask_result = joint_mask.astype(np.int32)
+
+                        merit_suffixes = {"pop": "_Count", "j1": "_Jac", "cstd": "_Var"}
+                        suffix = merit_suffixes.get(merit, f"_{merit}")
+                        new_name = f"Sampled{suffix}"
+
                     contour_data = self._get_contour_data(mask_result)
                     self.segmentationResultReady.emit(mask_result, new_name, False, None, contour_data, "", False, -1, None, True, None)
                 except Exception as e:
