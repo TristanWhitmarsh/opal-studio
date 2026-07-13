@@ -483,9 +483,26 @@ class BrightfieldTab(QWidget):
 
     def _on_preset_changed(self, name):
         import json
-        from multiplex2brightfield.configuration_presets import GetConfiguration
+        # 'multiplex2brightfield' is an optional dependency — it is deliberately
+        # NOT installed in the standard environment because it pins
+        # tensorflow==2.14, which conflicts with the Mesmer/DeepCell stack.
+        # Degrade gracefully instead of crashing the whole app at startup.
+        try:
+            from multiplex2brightfield.configuration_presets import GetConfiguration
+        except ImportError:
+            self._config_edit.setPlainText(
+                "# Brightfield generation is unavailable in this environment.\n"
+                "#\n"
+                "# The 'multiplex2brightfield' package is not installed. It pins\n"
+                "# tensorflow==2.14, which is incompatible with the Mesmer/DeepCell\n"
+                "# stack, so it is not part of the default dependencies. Install it\n"
+                "# in a separate environment to use this feature."
+            )
+            self._run_btn.setEnabled(False)
+            return
         config = GetConfiguration(name)
         self._config_edit.setPlainText(json.dumps(config, indent=2))
+        self._run_btn.setEnabled(True)
 
     def _on_run(self):
         self.runRequested.emit({
