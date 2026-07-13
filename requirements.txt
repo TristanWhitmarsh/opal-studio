@@ -94,6 +94,11 @@ zarr==2.18.2
 numcodecs==0.12.1      # zstd chunk codec used directly by image_loader / project_io
 numexpr==2.10.2
 
+# ── Project I/O (SpatialData save/load: GeoParquet shapes + cell table) ───────
+geopandas==1.0.1
+shapely==2.0.7
+pyarrow==21.0.0
+
 seaborn==0.13.2
 
 # ── Clustering (Phenotyping) ──────────────────────────────────────────────────

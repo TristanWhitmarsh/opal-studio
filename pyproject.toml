@@ -88,4 +88,6 @@ include-package-data = true
 "opal_studio" = ["icons/*", "*.png", "*.ico"]
 
 [tool.setuptools.exclude-package-data]
+# Model weights are NOT shipped in the wheel (they are ~600 MB and change
+# rarely). Copy them into the installed package's models/ dir separately.
 "opal_studio" = ["models/*", "models/**/*"]
