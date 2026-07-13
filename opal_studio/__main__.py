@@ -77,7 +77,7 @@ if "--create-launcher" in sys.argv:
             # a safe no-op on desktops or clusters without a system CUDA install.
             cuda_lib = "/usr/local/cuda/lib64"
             if os.path.isdir(cuda_lib):
-                cuda_export = f"export LD_LIBRARY_PATH={cuda_lib}:$LD_LIBRARY_PATH && "
+                cuda_export = f'export LD_LIBRARY_PATH="{cuda_lib}:$LD_LIBRARY_PATH"\n'
             else:
                 cuda_export = ""
 
@@ -85,22 +85,50 @@ if "--create-launcher" in sys.argv:
             # `opal-studio` console script, whose shebang may be hardcoded to the
             # original installer's home directory and inaccessible to other users.
             python = sys.executable
-            exec_cmd = f'bash -c "{cuda_export}{python} -m opal_studio"'
+
+            # Run Opal Studio through a small launch script rather than inlining
+            # the command in the .desktop Exec line.  The script keeps the
+            # Terminal=true window open when the app exits with an error, so the
+            # traceback stays on screen instead of the terminal closing instantly.
+            script_dir = os.path.join(home, ".local", "share", "opal-studio")
+            os.makedirs(script_dir, exist_ok=True)
+            script_path = os.path.join(script_dir, "opal-studio-launch.sh")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(f"""#!/bin/bash
+set -u
+
+pause_on_error() {{
+    status="$1"
+    if [ "$status" -ne 0 ]; then
+        echo
+        echo "[opal-studio] Opal Studio exited with error code: $status"
+        echo "[opal-studio] The terminal is kept open so you can read the error above."
+        echo
+        read -r -p "Press Enter to close this terminal..."
+    fi
+    exit "$status"
+}}
+
+{cuda_export}"{python}" -m opal_studio
+pause_on_error "$?"
+""")
+            os.chmod(script_path, 0o755)
 
             icon_str = icon_path if icon_path else "utilities-terminal"
-            
+
             with open(desktop_path, "w") as f:
                 f.write(f"""[Desktop Entry]
 Version=1.0
 Type=Application
 Name=Opal Studio
 Comment=Launch Opal Studio Viewer
-Exec={exec_cmd}
+Exec=bash -lc "{script_path}"
 Icon={icon_str}
 Terminal=true
 """)
             os.chmod(desktop_path, 0o755)
             print(f"[opal-studio] Linux Launcher created at: {desktop_path}")
+            print(f"[opal-studio] Launch script written to: {script_path}")
 
         else:
             print(f"[opal-studio] Launcher creation is not fully supported on {platform.system()} yet.")
