@@ -186,7 +186,7 @@ class MainWindow(QMainWindow):
     preprocessingError = Signal(str)
     operationProgress = Signal(int, int)
     operationFinished = Signal(int)
-    thresholdMeansReady = Signal(object, object, object, int)  # labels, cell_means dict, all_thresholds dict, mask_model_idx
+    thresholdMeansReady = Signal(object, object, object, int, object)  # labels, cell_means dict, all_thresholds dict, mask_model_idx, cell_ids
     clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
     clusteringDimReductionReady = Signal(object, object, object, object)  # tsne_coords, umap_coords, cluster_labels, cluster_colors
     clusteringMetricsReady = Signal(str)
@@ -2939,7 +2939,7 @@ class MainWindow(QMainWindow):
                         data = None                            # free before next read
                         self.operationProgress.emit(done, total)
 
-                self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx)
+                self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx, cell_ids)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -2947,11 +2947,12 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
-    @Slot(object, object, object, int)
-    def _on_threshold_means_ready(self, labels, cell_means, thresholds, mask_model_idx):
+    @Slot(object, object, object, int, object)
+    def _on_threshold_means_ready(self, labels, cell_means, thresholds, mask_model_idx, cell_ids=None):
         """Deliver computed means to the Thresholds tab (main thread)."""
         self._ops_panel.stop_loading()
-        self._ops_panel._thresh_tab.receive_means(labels, cell_means, thresholds, mask_model_idx)
+        self._ops_panel._thresh_tab.receive_means(
+            labels, cell_means, thresholds, mask_model_idx, cell_ids)
 
     @Slot(dict)
     def _apply_threshold_positivity(self, params: dict):
@@ -2991,8 +2992,18 @@ class MainWindow(QMainWindow):
         # but store the positivity classification in a LUT (pos_lut).
         # This allows per-cell contours and individual cell manipulation.
         
+        # Classify EVERY real cell. The set of real cells comes from the label map
+        # (computed once alongside the means), NOT from `means_lut > 0`: a cell whose
+        # mean intensity in this channel is exactly 0 (no signal — common for a sparse
+        # marker on IMC ion-count data) is still a real cell and must be marked
+        # negative. Using `means_lut > 0` left those cells at state 0, which the
+        # renderer does not draw, so they silently vanished from the pos/neg mask.
         pos_lut = np.zeros(len(means_lut), dtype=np.int16)
-        cell_ids = np.flatnonzero(means_lut > 0)
+        cell_ids = thresh_tab._cell_ids
+        if cell_ids is None:                      # fallback for pre-existing state
+            cell_ids = np.flatnonzero(means_lut > 0)
+        cell_ids = np.asarray(cell_ids)
+        cell_ids = cell_ids[cell_ids < len(means_lut)]
         if len(cell_ids):
             pos_lut[cell_ids] = np.where(means_lut[cell_ids] >= threshold, 2, 1).astype(np.int16)
 
@@ -3041,6 +3052,22 @@ class MainWindow(QMainWindow):
         # Register so future slider moves update in-place
         thresh_tab.register_generated_channel(ch_model_idx, new_idx)
         self._status.showMessage(f"Threshold positivity: {new_name}", 3000)
+
+    def _clear_type_masks(self) -> int:
+        """Remove every existing cell-type mask channel.
+
+        Identifying cells produces a fresh, complete set of type masks, so the
+        previous run's types are replaced rather than accumulated alongside the
+        new ones (which would otherwise pile up as "Tumor cells1", "Tumor
+        cells2", …).  The Types tab is a filtered view of these channels, so
+        clearing them also resets that list.
+        """
+        removed = 0
+        for i in range(self._channel_model.rowCount() - 1, -1, -1):
+            if self._channel_model.channel(i).is_type_mask:
+                self._channel_model.remove_channel(i)
+                removed += 1
+        return removed
 
     @Slot(dict)
     def _run_cluster_cell_identification(self, params: dict):
@@ -3166,6 +3193,9 @@ class MainWindow(QMainWindow):
             self._ops_panel.stop_loading()
             self.statusBar().showMessage("No cell types defined in the Phenotyping tab.", 5000)
             return
+
+        # Replace, don't accumulate: drop the previous run's type masks first.
+        self._clear_type_masks()
 
         # Build per-marker positivity maps: 0=background, 1=negative, 2=positive
         # ch.mask_data is the label map; ch.pos_lut maps label -> positivity state

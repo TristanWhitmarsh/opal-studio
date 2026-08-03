@@ -732,8 +732,8 @@ class ImageCanvas(QWidget):
                             if ch.pos_lut is not None and lid < len(ch.pos_lut):
                                 state = ch.pos_lut[lid]
                             
-                            # Inverted colors for contrast: Red contour on Green cell, Green contour on Red cell
-                            col = QColor(255, 0, 0) if state == 2 else QColor(0, 255, 0) # 2=pos (red contour), 1=neg (green contour)
+                            # Match the cell fill: 2=pos -> green, 1=neg -> red
+                            col = QColor(0, 255, 0) if state == 2 else QColor(255, 0, 0)
                         pen.setColor(col)
                         p.setPen(pen)
                         for qpoly in data["polygons"]:

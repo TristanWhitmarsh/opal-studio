@@ -1538,6 +1538,7 @@ class ThresholdPositivityTab(QWidget):
         # index 0 = background (always 0)
         self._cell_means: dict[int, np.ndarray] = {}
         self._labels: np.ndarray | None = None          # the label map used for compute
+        self._cell_ids: np.ndarray | None = None        # label IDs of the real cells
         self._mask_model_index: int = -1                # which mask channel was used
         self._thresholds: dict[int, float] = {}  # ch_model_idx → threshold for the last-run method
         self._generated_ch_indices: dict[int, int] = {} # ch_model_idx → result channel model idx
@@ -1640,7 +1641,8 @@ class ThresholdPositivityTab(QWidget):
         method = self._method_combo.currentData()
         self.runThresholdComputeRequested.emit({"mask_index": mask_idx, "method": method})
 
-    def receive_means(self, labels, cell_means: dict, thresholds: dict, mask_model_index: int):
+    def receive_means(self, labels, cell_means: dict, thresholds: dict,
+                      mask_model_index: int, cell_ids=None):
         """
         Called from MainWindow (main thread via signal) when per-cell
         means are ready.
@@ -1651,9 +1653,13 @@ class ThresholdPositivityTab(QWidget):
         cell_means        : {ch_model_idx: np.ndarray[max_label+1]}  (index 0 = bg)
         thresholds        : {ch_model_idx: float}  — one threshold per channel
         mask_model_index  : which mask channel was used
+        cell_ids          : label IDs of the real cells. Kept so thresholding can
+                            classify every cell — including cells whose mean is 0
+                            in a given channel, which must still be marked negative.
         """
         self._labels = labels
         self._cell_means = cell_means
+        self._cell_ids = cell_ids
         self._thresholds = thresholds
         self._mask_model_index = mask_model_index
         self._generated_ch_indices = {}

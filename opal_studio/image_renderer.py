@@ -741,12 +741,13 @@ def _composite_channel(
                 # Fallback to direct state map (0,1,2)
                 m1, m2 = labels == 1, labels == 2
                 
+            # state 1 = negative -> red,  state 2 = positive -> green
             if np.any(m1):
                 canvas[m1] = ((1.0 - alpha_mask) * canvas[m1]
-                              + alpha_mask * np.array([0.0, 1.0, 0.0], np.float32))
+                              + alpha_mask * np.array([1.0, 0.0, 0.0], np.float32))
             if np.any(m2):
                 canvas[m2] = ((1.0 - alpha_mask) * canvas[m2]
-                              + alpha_mask * np.array([1.0, 0.0, 0.0], np.float32))
+                              + alpha_mask * np.array([0.0, 1.0, 0.0], np.float32))
 
         elif ch.is_type_mask:
             col = np.array([ch.color.redF(), ch.color.greenF(), ch.color.blueF()],
