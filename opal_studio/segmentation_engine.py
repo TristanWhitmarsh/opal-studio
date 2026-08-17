@@ -470,82 +470,142 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
 def run_positivity_task(queue, params, data):
     """
     Worker function for AI cell positivity detection.
+
+    Mirrors Inference.ipynb of CellMarkerPositivity: for every cell and every
+    marker channel the model is handed a 64x64 crop centred on the cell holding
+    the target channel with N_SIDE neighbouring metal channels on each side,
+    the binary mask of the target cell and the binary mask of the other cells.
     """
     try:
         import tensorflow as tf
-        from scipy.ndimage import label as cc_label
-        
+        from scipy import ndimage
+
         labels = data["labels"]
         markers = data["markers"]
-        
-        model_path = os.path.join(os.path.dirname(__file__), "models", "cellpos", "marker_cnn_epoch_100.h5")
-        model = tf.keras.models.load_model(model_path, compile=False)
-        
-        PATCH_SIZE = 64
-        THRESHOLD = 0.5
-        CHUNK_SIZE = 500
-        
-        S = markers.shape[2]
-        results = []
 
-        # Cells are defined by the mask, which does not change across marker
-        # channels, so label connected components once up front.
-        labeled_slice, num_components = cc_label(labels > 0)
+        # Take the GPU as it is needed rather than reserving all of it up front,
+        # so a card shared with the rest of the application still works.
+        for gpu in tf.config.list_physical_devices("GPU"):
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+
+        model_path = os.path.join(os.path.dirname(__file__), "models", "cellpos", "marker_cnn_epoch_200.h5")
+        model = tf.keras.models.load_model(model_path, compile=False)
+
+        # The checkpoint records how it was trained. The marker channels are an
+        # odd number, so the channel count alone says whether the mask of the
+        # other cells is there as well.
+        crop = int(model.input_shape[1])
+        n_channels = int(model.input_shape[-1])
+        use_other_cells = n_channels % 2 == 1
+        n_markers = n_channels - 1 - int(use_other_cells)
+        n_side = (n_markers - 1) // 2
+        half = crop // 2
+
+        threshold = float(params.get("threshold", 0.5))
+        batch_size = int(params.get("batch_size", 512))
+
+        S = markers.shape[2]
+
+        # Opal Studio hands over a label map, which is what the notebook's
+        # connected component analysis reconstructs from its binary mask. Using
+        # it directly keeps touching cells apart.
+        cells = np.ascontiguousarray(labels).astype(np.int32)
+        if cells.shape != markers.shape[:2]:
+            raise ValueError(f"mask is {cells.shape}, markers are {markers.shape[:2]}")
+
+        cell_ids = np.unique(cells)
+        cell_ids = cell_ids[cell_ids > 0]
+        n_cells = cell_ids.size
+
+        if n_cells == 0:
+            for z in range(S):
+                queue.put({"type": "channel", "z": z, "positive": 0.0,
+                           "slice": np.zeros_like(cells, dtype=np.int16)})
+            queue.put({"type": "done"})
+            return
+
+        # Every crop is taken whole, so an image smaller than the crop is padded.
+        orig_h, orig_w = cells.shape
+        pad_y = max(0, crop - orig_h)
+        pad_x = max(0, crop - orig_w)
+        if pad_y or pad_x:
+            cells = np.pad(cells, ((0, pad_y), (0, pad_x)))
+            markers = np.pad(markers, ((0, pad_y), (0, pad_x), (0, 0)))
+        height, width = cells.shape
+
+        centres = np.asarray(ndimage.center_of_mass(
+            cells > 0, cells, cell_ids)).astype(np.int32)
+
+        def make_sample(z, cell_id, centre_y, centre_x):
+            """The same crop the model was trained on."""
+            y = min(max(int(centre_y) - half, 0), height - crop)
+            x = min(max(int(centre_x) - half, 0), width - crop)
+
+            # Channels beyond either end of the stack do not exist and stay empty.
+            wanted = np.arange(z - n_side, z + n_side + 1)
+            exists = (wanted >= 0) & (wanted < S)
+
+            planes = np.zeros((crop, crop, n_markers), dtype=np.float32)
+            planes[..., exists] = markers[y:y + crop, x:x + crop, wanted[exists]]
+
+            patch = cells[y:y + crop, x:x + crop]
+            stack = [planes, (patch == cell_id)[..., None]]
+            if use_other_cells:
+                stack.append(((patch > 0) & (patch != cell_id))[..., None])
+
+            return np.concatenate(stack, axis=-1).astype(np.float32)
+
+        def predict(batch):
+            """Probabilities for one batch of crops.
+
+            Keras' predict() uploads each batch through a tf.data pipeline whose
+            tensors it never lets go of, so calling it once per batch fills the
+            card after a few dozen batches. Calling the model keeps one batch on
+            the device at a time. A card smaller than the batch still asks for
+            too much at once, so the batch is halved until it fits.
+            """
+            nonlocal batch_size
+            while True:
+                try:
+                    return np.concatenate([
+                        np.asarray(model(batch[i:i + batch_size], training=False)).ravel()
+                        for i in range(0, len(batch), batch_size)])
+                except tf.errors.ResourceExhaustedError:
+                    if batch_size <= 16:
+                        raise
+                    batch_size //= 2
+                    print(f"[AI] GPU out of memory, retrying with batch {batch_size}",
+                          flush=True)
+
+        call = np.zeros(int(cell_ids.max()) + 1, dtype=np.int16)
+
+        # Fixed, so that predict() halving batch_size cannot move the staging
+        # boundaries and leave cells out.
+        chunk = batch_size
 
         for z in range(S):
-            img_curr = markers[:, :, z]
-            # Neighbour logic matches the reference get_neighbor_slices():
-            # edges repeat, interior uses z-1 / z+1.
-            img_prev = markers[:, :, max(0, z-1)]
-            img_next = markers[:, :, min(S-1, z+1)]
+            probability = np.empty(n_cells, dtype=np.float32)
 
-            if num_components == 0:
-                results.append((np.zeros_like(labels, dtype=np.int16), z))
-                continue
+            for start in range(0, n_cells, chunk):
+                rows = np.arange(start, min(start + chunk, n_cells))
+                batch = np.stack([make_sample(z, cell_ids[i], *centres[i])
+                                  for i in rows])
+                probability[rows] = predict(batch)
 
-            slice_out = np.zeros_like(labels, dtype=np.int16)
-            patches = []
-            cell_ids = []
-            
-            # Identify cell centers and crop patches
-            # This is a bit slow in Python, but isolating it helps with memory/DLLs
-            for comp_id in range(1, num_components + 1):
-                mask = (labeled_slice == comp_id)
-                ys, xs = np.where(mask)
-                if ys.size == 0: continue
-                cy, cx = int(np.mean(ys)), int(np.mean(xs))
-                
-                y0, x0 = max(0, cy - 32), max(0, cx - 32)
-                y1, x1 = min(labels.shape[0], y0 + 64), min(labels.shape[1], x0 + 64)
-                # Ensure 64x64
-                if y1 - y0 < 64: y0 = max(0, y1 - 64)
-                if x1 - x0 < 64: x0 = max(0, x1 - 64)
-                
-                p_curr = img_curr[y0:y1, x0:x1]
-                p_prev = img_prev[y0:y1, x0:x1]
-                p_next = img_next[y0:y1, x0:x1]
-                p_mask = mask[y0:y1, x0:x1].astype(np.float32)
-                
-                stacked = np.stack([p_prev, p_curr, p_next, p_mask], axis=-1)
-                patches.append(stacked)
-                cell_ids.append(comp_id)
-                
-                if len(patches) >= CHUNK_SIZE:
-                    X = np.stack(patches, axis=0)
-                    probs = model.predict(X, batch_size=512, verbose=0).reshape(-1)
-                    for cid, p in zip(cell_ids, probs):
-                        slice_out[labeled_slice == cid] = 2 if p >= THRESHOLD else 1
-                    patches.clear()
-                    cell_ids.clear()
-            
-            if patches:
-                X = np.stack(patches, axis=0)
-                probs = model.predict(X, batch_size=512, verbose=0).reshape(-1)
-                for cid, p in zip(cell_ids, probs):
-                    slice_out[labeled_slice == cid] = 2 if p >= THRESHOLD else 1
-                    
-            results.append((slice_out, z))
-            
-        queue.put({"success": True, "results": results})
+            # 0 stays background, 1 is negative and 2 is positive, as in the
+            # training masks.
+            call[:] = 0
+            call[cell_ids] = np.where(probability >= threshold, 2, 1)
+
+            # Sent as it is finished rather than all at the end, so the caller
+            # can show progress and neither side has to hold every channel.
+            queue.put({"type": "channel", "z": z,
+                       "positive": float((probability >= threshold).mean()),
+                       "slice": call[cells][:orig_h, :orig_w].copy()})
+
+        queue.put({"type": "done"})
     except Exception as e:
-        queue.put({"success": False, "error": str(e), "traceback": traceback.format_exc()})
+        queue.put({"type": "error", "error": str(e), "traceback": traceback.format_exc()})

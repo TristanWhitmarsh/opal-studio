@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Slot, QPoint, QRect
+from PySide6.QtCore import Qt, Slot, QPoint, QRect, QTimer
 from PySide6.QtGui import QColor, QBrush, QPen
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -17,6 +17,9 @@ class PhenotypingTab(QWidget):
         self._cell_states = {}
         self._cell_types = []
         self._channel_names = []
+        # Set while the column order is being put back to match the list, so
+        # the moves that does are not mistaken for the user dragging again.
+        self._reordering = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -66,6 +69,7 @@ class PhenotypingTab(QWidget):
                 border: 1px solid #d0d0d0;
             }
         """)
+        self._table.horizontalHeader().sectionMoved.connect(self._on_section_moved)
         self._table.horizontalHeader().sectionDoubleClicked.connect(self._rename_cell_type)
         self._table.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.horizontalHeader().customContextMenuRequested.connect(self._on_header_context_menu)
@@ -157,6 +161,55 @@ class PhenotypingTab(QWidget):
                 del self._cell_states[k]
             self._refresh_table_ui()
 
+    @Slot(int, int, int)
+    def _on_section_moved(self, logical_index, old_visual, new_visual):
+        """Fold a dragged column back into the cell type list.
+
+        Qt records a drag as a visual permutation and leaves the table's own
+        order untouched, so on its own a drag would move the column on screen
+        without changing anything that reads ``_cell_types`` — the gating, the
+        colours or the saved project. Rewriting the list instead keeps one
+        order for all of them, the one the user arranged.
+
+        Reordering from inside the header's own signal is not safe, so it waits
+        until the drag has finished being handled.
+        """
+        if self._reordering:
+            return
+        QTimer.singleShot(0, self._apply_column_order)
+
+    def _apply_column_order(self):
+        """Reorder the cell types to the order the columns are shown in."""
+        header = self._table.horizontalHeader()
+        if self._reordering or header.count() != len(self._cell_types):
+            return
+
+        order = [header.logicalIndex(v) for v in range(header.count())]
+        if order == list(range(len(order))):
+            return
+
+        self._cell_types = [self._cell_types[i] for i in order]
+        # _refresh_table_ui puts the columns back in step with the new list.
+        self._refresh_table_ui()
+
+    def _reset_section_order(self):
+        """Show the columns in list order, undoing any permutation from a drag.
+
+        Every drag is folded into ``_cell_types``, so the visual and the logical
+        order are meant to be the same. Qt keeps its permutation across changes
+        to the column count, which would otherwise scramble the labels once a
+        type is added, deleted or loaded from a project.
+        """
+        header = self._table.horizontalHeader()
+        self._reordering = True
+        try:
+            for target in range(header.count()):
+                current = header.visualIndex(target)
+                if current != target:
+                    header.moveSection(current, target)
+        finally:
+            self._reordering = False
+
     @Slot()
     def _refresh_rows(self):
         # We only want physical channels as markers, exclude segmentation masks
@@ -182,7 +235,8 @@ class PhenotypingTab(QWidget):
                 item = QTableWidgetItem()
                 self._update_item_appearance(item, state)
                 self._table.setItem(r, c, item)
-                
+
+        self._reset_section_order()
         self._table.resizeColumnsToContents()
 
     def _on_cell_clicked(self, row, col):

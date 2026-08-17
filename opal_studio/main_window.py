@@ -2697,6 +2697,8 @@ class MainWindow(QMainWindow):
 
         def _run():
             try:
+                from queue import Empty
+
                 from opal_studio.image_loader import _get_yx
                 from opal_studio.segmentation_engine import run_positivity_task
                 
@@ -2707,8 +2709,9 @@ class MainWindow(QMainWindow):
                 # channel order, and feed their raw pixel values. Processed /
                 # derived channels (CLAHE, background-subtracted, merges) have a
                 # different intensity distribution and no raw backing (index<0),
-                # so including them would corrupt the prev/curr/next neighbour
-                # context and shift predictions.
+                # so including them would corrupt the neighbouring-metal context
+                # the model reads around each target channel and shift
+                # predictions.
                 target_channels = []
                 for i in range(self._channel_model.rowCount()):
                     ch = self._channel_model.channel(i)
@@ -2735,42 +2738,66 @@ class MainWindow(QMainWindow):
                 
                 proc = ctx.Process(target=run_positivity_task, args=(queue, params, {"labels": labels, "markers": markers}))
                 proc.start()
-                
-                try:
-                    worker_res = queue.get()
-                except Exception:
-                    raise Exception("Worker process failed to return result.")
-                finally:
-                    proc.join()
-                
-                if not worker_res.get("success"):
-                    raise Exception(f"Worker Error: {worker_res.get('error')}\n{worker_res.get('traceback')}")
-                
-                # Extract individual contours using original labels
+
+                # The contours only depend on the mask, so build them while the
+                # worker is still loading the model.
                 contour_data = self._get_contour_data(labels)
                 max_id = int(np.max(labels))
+                mask_active = labels > 0
+                active_ids = labels[mask_active]
 
-                for slice_out, z_idx in worker_res.get("results", []):
-                    ch = target_channels[z_idx]
-                    
-                    # AI returns slice_out (0/1/2 map). Convert to pos_lut (ID -> state)
-                    pos_lut = np.zeros(max_id + 1, dtype=np.int16)
-                    mask_active = labels > 0
-                    if np.any(mask_active):
-                        pos_lut[labels[mask_active]] = slice_out[mask_active]
+                self.operationProgress.emit(0, S)
 
-                    self.segmentationResultReady.emit(
-                        labels, ch.name, True, ch.color, contour_data, 
-                        ch.name, False, -1, pos_lut, False, None
-                    )
-                    self.operationProgress.emit(z_idx + 1, S)
+                # The worker sends one message per channel, so the progress bar
+                # and the log follow the run instead of jumping at the end.
+                done = 0
+                missing = 0
+                try:
+                    while True:
+                        try:
+                            msg = queue.get(timeout=1.0)
+                        except Empty:
+                            if proc.is_alive():
+                                continue
+                            # A dead worker can still have a message in flight,
+                            # so only give up once nothing more arrives.
+                            missing += 1
+                            if missing >= 3:
+                                raise Exception(
+                                    f"Worker process died after {done}/{S} channels "
+                                    f"(exit code {proc.exitcode}).")
+                            continue
 
-                print("[AI] Cell positivity detection complete.")
-                self.operationFinished.emit(S)
+                        missing = 0
+                        kind = msg.get("type")
+                        if kind == "error":
+                            raise Exception(f"Worker Error: {msg.get('error')}\n{msg.get('traceback')}")
+                        if kind == "done":
+                            break
 
-            except Exception as e:
-                import traceback; traceback.print_exc()
-                self.segmentationError.emit(str(e))
+                        z_idx = msg["z"]
+                        ch = target_channels[z_idx]
+
+                        # AI returns slice_out (0/1/2 map). Convert to pos_lut (ID -> state)
+                        pos_lut = np.zeros(max_id + 1, dtype=np.int16)
+                        if active_ids.size:
+                            pos_lut[active_ids] = msg["slice"][mask_active]
+
+                        self.segmentationResultReady.emit(
+                            labels, ch.name, True, ch.color, contour_data,
+                            ch.name, False, -1, pos_lut, False, None
+                        )
+
+                        done += 1
+                        self.operationProgress.emit(done, S)
+                        print(f"[AI] channel {done}/{S} {ch.name}: "
+                              f"{msg['positive']:.1%} positive", flush=True)
+                finally:
+                    # A worker abandoned on error must not keep the GPU.
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=5)
 
                 print("[AI] Cell positivity detection complete.")
                 self.operationFinished.emit(S)
