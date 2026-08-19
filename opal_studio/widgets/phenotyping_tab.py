@@ -210,15 +210,28 @@ class PhenotypingTab(QWidget):
         finally:
             self._reordering = False
 
+    def _current_channel_names(self) -> list:
+        """The markers the table has rows for: image channels only.
+
+        Every kind of mask is excluded, not just the segmentation and positivity
+        ones: phenotype masks are named after cell types and regions after areas
+        of tissue, so leaving either in put "Lesion", "Lung" and a list of cell
+        types down the marker axis.
+        """
+        names = []
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if (ch.is_mask or ch.is_cell_mask
+                    or getattr(ch, "is_type_mask", False)
+                    or getattr(ch, "is_region", False)):
+                continue
+            names.append(ch.name)
+        return names
+
     @Slot()
     def _refresh_rows(self):
         # We only want physical channels as markers, exclude segmentation masks
-        self._channel_names = []
-        for i in range(self._channel_model.rowCount()):
-            ch = self._channel_model.channel(i)
-            if not ch.is_mask and not ch.is_cell_mask:
-                self._channel_names.append(ch.name)
-        
+        self._channel_names = self._current_channel_names()
         self._refresh_table_ui()
         
     def _refresh_table_ui(self):
@@ -314,16 +327,27 @@ class PhenotypingTab(QWidget):
                     elif val == "-": state = 2
                     csv_states[(ch_name, c_type)] = state
             
-            # Update columns
+            # The table is the current channels down the side and this file's cell
+            # types across the top, matched up by marker name. So the file replaces
+            # what was there outright, and only markers that are actually channels
+            # are kept.
+            #
+            # Both halves matter. Merging into the old states would leave behind
+            # the cell types this file drops, and filtering to the channel list is
+            # what clears markers a previous file — or a project saved against a
+            # different image — left in the table. Neither kind of leftover is
+            # visible in the table, but both are saved back into the project and
+            # reappear later.
+            self._channel_names = self._current_channel_names()
+            known = set(self._channel_names)
+
             self._cell_types = new_types
-            
-            # Update states only for existing markers (already in self._channel_names)
-            # and reset others to 0
-            for ch_name in self._channel_names:
-                for c_type in self._cell_types:
-                    self._cell_states[(ch_name, c_type)] = csv_states.get((ch_name, c_type), 0)
-            
+            self._cell_states = {(ch, ct): st for (ch, ct), st in csv_states.items()
+                                 if st and ch in known}
+
+            ignored = sorted({ch for ch, _ in csv_states} - known)
             self._refresh_table_ui()
+            return ignored
 
     def get_phenotype_definitions(self) -> dict:
         """

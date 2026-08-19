@@ -30,6 +30,7 @@ from opal_studio.image_loader import (
     ImageData, open_image, open_spatialdata_collection,
     spatialdata_channel_maxima, get_tile, _get_yx
 )
+from opal_studio.region_io import geojson_region_parts
 from opal_studio.widgets.channel_panel import ChannelPanel
 from opal_studio.widgets.image_canvas import ImageCanvas
 from opal_studio.widgets.operations_panel import OperationsPanel
@@ -810,8 +811,16 @@ class MainWindow(QMainWindow):
         if not path: return
         
         try:
-            self._phenotyping_tab.load_from_csv(path)
-            self._status.showMessage(f"Imported phenotypes from {Path(path).name}", 5000)
+            ignored = self._phenotyping_tab.load_from_csv(path) or []
+            msg = f"Imported phenotypes from {Path(path).name}"
+            if ignored:
+                # Dropping them is intended — the table only has rows for real
+                # channels — but say so, since a typo in a marker name looks
+                # exactly like a marker that is simply not loaded.
+                shown = ", ".join(ignored[:5])
+                more = f" and {len(ignored) - 5} more" if len(ignored) > 5 else ""
+                msg += f" — ignored {len(ignored)} marker(s) not in the channel list: {shown}{more}"
+            self._status.showMessage(msg, 8000)
         except Exception as e:
             QMessageBox.critical(self, "Import Error", f"Could not import phenotypes: {e}")
 
@@ -1072,23 +1081,15 @@ class MainWindow(QMainWindow):
                 1 for i in range(self._channel_model.rowCount())
                 if getattr(self._channel_model.channel(i), 'is_region', False)
             )
-            colors = generate_spaced_colors(len(features) + existing_regions + 1)
+            region_parts = []
+            for feat in features:
+                fallback_name = f"Region {existing_regions + len(region_parts) + 1}"
+                region_parts.extend(geojson_region_parts(feat, fallback_name))
+
+            colors = generate_spaced_colors(len(region_parts) + existing_regions + 1)
 
             imported_count = 0
-            for feat in features:
-                geom = feat.get("geometry", {})
-                props = feat.get("properties", {})
-                name = props.get("name", f"Region {existing_regions + imported_count + 1}")
-                geom_type = geom.get("type", "")
-                coords = geom.get("coordinates", [])
-
-                if geom_type == "Polygon" and coords:
-                    ring_coords = coords[0]
-                elif geom_type == "MultiPolygon" and coords:
-                    ring_coords = coords[0][0]
-                else:
-                    continue
-
+            for name, ring_coords in region_parts:
                 points = [QPointF(c[0], c[1]) for c in ring_coords]
                 # Normalise: strip any existing closing duplicate, then always re-append it.
                 # This matches the format that _simplify_contour produces for drawn regions,
