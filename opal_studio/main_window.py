@@ -2526,6 +2526,13 @@ class MainWindow(QMainWindow):
             # Update existing
             try:
                 ch = self._channel_model.channel(target_idx)
+                if is_cell_mask and source_marker:
+                    # A project saved before positivity masks were named after
+                    # their marker holds this one as "<marker>1". The mask is
+                    # matched by source_marker, so it is found and overwritten
+                    # either way — and overwriting it is the moment to put the
+                    # marker's own name back.
+                    ch.name = source_marker
                 ch.mask_data = labels
                 ch.contour_data = contour_data
                 ch.pos_lut = pos_lut
@@ -2541,7 +2548,16 @@ class MainWindow(QMainWindow):
                 pass
 
         # Create new
-        mask_name = self._channel_model.get_unique_name(name if name else "Mask")
+        if is_cell_mask and source_marker:
+            # A cell mask is keyed by source_marker everywhere — the lookup above,
+            # phenotype gating, export and project save — and that lookup has
+            # already overwritten any existing mask for this marker, so there can
+            # never be two. Uniquifying would only append a "1" that collides with
+            # nothing and leaves the channel named differently from the marker it
+            # belongs to. The threshold path names these the same way.
+            mask_name = name or source_marker
+        else:
+            mask_name = self._channel_model.get_unique_name(name if name else "Mask")
         row_color = color if color else QColor(255, 255, 255)
         
         new_ch = Channel(
@@ -3048,6 +3064,9 @@ class MainWindow(QMainWindow):
             # Update existing channel in-place
             try:
                 tgt_ch = self._channel_model.channel(target_ch_idx)
+                # As above: an older project may hold this as "<marker>1", and
+                # overwriting it restores the marker's own name.
+                tgt_ch.name = ch_name
                 tgt_ch.mask_data = working_labels
                 tgt_ch.pos_lut = pos_lut
                 idx_qt = self._channel_model.index(target_ch_idx)
