@@ -515,6 +515,17 @@ class BrightfieldTab(QWidget):
         self._run_btn.setEnabled(enabled)
 
 
+def _dedupe(entries):
+    """Drop repeated model names, keeping the first -- a published model and a
+    stray local copy of it would otherwise both be listed."""
+    seen, out = set(), []
+    for name, data in entries:
+        if name not in seen:
+            seen.add(name)
+            out.append((name, data))
+    return out
+
+
 class StarDistTab(QWidget):
     """Sub-widget for StarDist segmentation parameters."""
     runRequested = Signal(dict)
@@ -544,9 +555,13 @@ class StarDistTab(QWidget):
         self._model_combo = QComboBox()
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._model_combo.setMinimumWidth(50)
-        self._model_combo.addItems(["2D_versatile_fluo", "2D_paper_dsb2018"])
-        self._scan_models()
-        self._model_combo.setToolTip("Pre-trained StarDist models for different imaging modalities (e.g., fluorescence nuclei).")
+        self._model_catalog = self._build_model_catalog()
+        self._refresh_models()
+        self._channel_combo.currentIndexChanged.connect(self._refresh_models)
+        self._model_combo.setToolTip(
+            "Pre-trained StarDist models for different imaging modalities. "
+            "2D_versatile_fluo for fluorescence nuclei; 2D_versatile_he for "
+            "H&E / brightfield RGB.")
         form.addRow("Model:", self._model_combo)
 
         self._prob_thresh = QLineEdit()
@@ -582,18 +597,49 @@ class StarDistTab(QWidget):
             if (not ch.is_mask and not ch.is_cell_mask
                     and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
+        # A brightfield / H&E scan has no marker channels, so it is offered here
+        # as index -1 rather than as a row in the channel list.
+        if getattr(self._channel_model, "has_brightfield", False):
+            self._channel_combo.addItem("Brightfield (RGB)", -1)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
         
 
-    def _scan_models(self):
-        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "stardist")
-        if not os.path.exists(models_dir): return
-        for folder in os.listdir(models_dir):
-            path = os.path.join(models_dir, folder)
-            if os.path.isdir(path) and os.path.exists(os.path.join(path, "config.json")):
-                if self._model_combo.findText(folder) == -1:
-                    self._model_combo.addItem(folder, folder)
+    #: Models that take a three-channel RGB image. Everything else takes one.
+    RGB_MODELS = {"2D_versatile_he"}
+
+    def _build_model_catalog(self):
+        """Every model on offer.
+
+        StarDist's own pretrained models (data None) are fetched by StarDist.
+        Opal Studio's are listed whether or not they have been downloaded yet, and
+        fetched the first time they are run.
+        """
+        from opal_studio import model_store as ms
+        catalog = [(n, None) for n in
+                   ("2D_versatile_fluo", "2D_paper_dsb2018", "2D_versatile_he")]
+        catalog += [(m.name, ms.ref(m.key)) for m in ms.for_method("stardist")]
+        catalog += [(k.split("/", 1)[1], ms.ref(k)) for k in ms.local_models("stardist")]
+        return _dedupe(catalog)
+
+    def _refresh_models(self):
+        """Offer only the models that match the selected channel.
+
+        An H&E model wants a three-channel RGB image and a fluorescence model
+        wants a single channel, so showing both for a given input only invites a
+        run that cannot work.
+        """
+        rgb = self._channel_combo.currentData() == -1
+        current = self._model_combo.currentText()
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        for text, data in self._model_catalog:
+            if (text in self.RGB_MODELS) == rgb:
+                self._model_combo.addItem(text, data)
+        idx = self._model_combo.findText(current)
+        if idx >= 0:
+            self._model_combo.setCurrentIndex(idx)
+        self._model_combo.blockSignals(False)
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
@@ -641,7 +687,7 @@ class CellposeTab(QWidget):
         self._model_combo = QComboBox()
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._model_combo.setMinimumWidth(50)
-        self._model_combo.addItems(["nuclei", "cyto", "cyto2"])
+        self._model_combo.addItems(["nuclei", "cyto", "cyto2", "cyto3"])
         self._scan_models()
         self._model_combo.setToolTip("Pre-trained Cellpose models. 'nuclei' for nuclear staining, 'cyto' or 'cyto2' for cytoplasmic/cellular staining.")
         form.addRow("Model:", self._model_combo)
@@ -685,22 +731,21 @@ class CellposeTab(QWidget):
             if (not ch.is_mask and not ch.is_cell_mask
                     and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
+        # A brightfield / H&E scan has no marker channels, so it is offered here
+        # as index -1 rather than as a row in the channel list.
+        if getattr(self._channel_model, "has_brightfield", False):
+            self._channel_combo.addItem("Brightfield (RGB)", -1)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
     def _scan_models(self):
-        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "cellpose")
-        if not os.path.exists(models_dir): return
-        for folder in os.listdir(models_dir):
-            folder_path = os.path.join(models_dir, folder)
-            if os.path.isdir(folder_path):
-                # Find the model file inside the folder (largest non-metadata file)
-                files = [f for f in os.listdir(folder_path) if not f.endswith(('.json', '.txt', '.ipynb', '.png', '.jpg', '.jpeg'))]
-                if files:
-                    model_file_name = max(files, key=lambda f: os.path.getsize(os.path.join(folder_path, f)))
-                    model_file = os.path.join(folder_path, model_file_name)
-                    if self._model_combo.findText(folder) == -1:
-                        self._model_combo.addItem(folder, model_file)
+        """Opal Studio's Cellpose models, fetched on first use, plus local ones."""
+        from opal_studio import model_store as ms
+        entries = [(m.name, ms.ref(m.key)) for m in ms.for_method("cellpose")]
+        entries += [(k.split("/", 1)[1], ms.ref(k)) for k in ms.local_models("cellpose")]
+        for name, data in _dedupe(entries):
+            if self._model_combo.findText(name) == -1:
+                self._model_combo.addItem(name, data)
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
@@ -804,12 +849,15 @@ class OmniposeTab(QWidget):
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
     def _scan_models(self):
-        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "omnipose")
-        if not os.path.exists(models_dir): return
-        for file in os.listdir(models_dir):
-            path = os.path.join(models_dir, file)
-            if os.path.isfile(path) and not file.endswith('.txt') and not file.endswith('.ipynb'):
-                self._model_combo.addItem(f"Custom: {file[:30]}...", path)
+        """Omnipose models someone has placed in the models directory."""
+        from opal_studio import model_store as ms
+        for base in ms.search_dirs():
+            models_dir = base / "omnipose"
+            if not models_dir.is_dir():
+                continue
+            for path in sorted(models_dir.iterdir()):
+                if path.is_file() and path.suffix not in (".txt", ".ipynb"):
+                    self._model_combo.addItem(f"Custom: {path.name[:30]}...", str(path))
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
@@ -866,12 +914,12 @@ class InstanSegTab(QWidget):
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._model_combo.setMinimumWidth(50)
         self._model_combo.setEditable(True)
-        self._model_combo.addItems([
-            "single_channel_nuclei",
-            "fluorescence_nuclei_and_cells",
-        ])
-        self._scan_models()
-        self._model_combo.setToolTip("InstanSeg models for single-channel nuclei or multi-channel fluorescence (nuclei and cells).")
+        self._model_catalog = self._build_model_catalog()
+        self._refresh_models()
+        self._channel_combo.currentIndexChanged.connect(self._refresh_models)
+        self._model_combo.setToolTip(
+            "InstanSeg models for single-channel nuclei, multi-channel "
+            "fluorescence (nuclei and cells), or brightfield / H&E RGB.")
         form.addRow("Model:", self._model_combo)
 
         # Pixel Size
@@ -911,18 +959,44 @@ class InstanSegTab(QWidget):
             if (not ch.is_mask and not ch.is_cell_mask
                     and not ch.is_type_mask and not getattr(ch, "is_region", False)):
                 self._channel_combo.addItem(ch.name, i)
+        # A brightfield / H&E scan has no marker channels, so it is offered here
+        # as index -1 rather than as a row in the channel list.
+        if getattr(self._channel_model, "has_brightfield", False):
+            self._channel_combo.addItem("Brightfield (RGB)", -1)
         idx = self._channel_combo.findText(current)
         if idx >= 0: self._channel_combo.setCurrentIndex(idx)
 
-    def _scan_models(self):
-        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "instanseg")
-        if not os.path.exists(models_dir): return
-        for folder in os.listdir(models_dir):
-            folder_path = os.path.join(models_dir, folder)
-            if os.path.isdir(folder_path):
-                if os.path.exists(os.path.join(folder_path, "model_weights.pth")):
-                    if self._model_combo.findText(folder) == -1:
-                        self._model_combo.addItem(folder, folder_path)
+    #: The brightfield model takes an RGB image; the others take channels.
+    RGB_MODELS = {"brightfield_nuclei"}
+
+    def _build_model_catalog(self):
+        """Every model on offer.
+
+        InstanSeg fetches its zoo models itself (data None). single_channel_nuclei
+        is in InstanSeg's releases but not the installed library's index, so Opal
+        Studio fetches it; it and Opal Studio's own models are fetched on first use.
+        """
+        from opal_studio import model_store as ms
+        catalog = [("single_channel_nuclei", ms.ref("instanseg/single_channel_nuclei")),
+                   ("fluorescence_nuclei_and_cells", None),
+                   ("brightfield_nuclei", None)]
+        catalog += [(m.name, ms.ref(m.key)) for m in ms.for_method("instanseg")]
+        catalog += [(k.split("/", 1)[1], ms.ref(k)) for k in ms.local_models("instanseg")]
+        return _dedupe(catalog)
+
+    def _refresh_models(self):
+        """Offer only the models that match the selected channel."""
+        rgb = self._channel_combo.currentData() == -1
+        current = self._model_combo.currentText()
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        for text, data in self._model_catalog:
+            if (text in self.RGB_MODELS) == rgb:
+                self._model_combo.addItem(text, data)
+        idx = self._model_combo.findText(current)
+        if idx >= 0:
+            self._model_combo.setCurrentIndex(idx)
+        self._model_combo.blockSignals(False)
 
     def _on_run(self):
         if self._channel_combo.currentIndex() < 0: return
@@ -1066,20 +1140,13 @@ class MesmerTab(QWidget):
 
 
     def _scan_models(self):
-        """Scan models/mesmer/ for subfolders containing a .keras model file."""
-        models_dir = os.path.join(os.path.dirname(__file__), "..", "models", "mesmer")
-        if not os.path.exists(models_dir):
-            return
-        for folder in os.listdir(models_dir):
-            folder_path = os.path.join(models_dir, folder)
-            if not os.path.isdir(folder_path):
-                continue
-            # Find the .keras model file in the folder
-            keras_files = [f for f in os.listdir(folder_path) if f.endswith(".keras")]
-            if keras_files:
-                model_file = os.path.join(folder_path, keras_files[0])
-                if self._model_combo.findText(folder) == -1:
-                    self._model_combo.addItem(folder, model_file)
+        """Opal Studio's Mesmer models, fetched on first use, plus local ones."""
+        from opal_studio import model_store as ms
+        entries = [(m.name, ms.ref(m.key)) for m in ms.for_method("mesmer")]
+        entries += [(k.split("/", 1)[1], ms.ref(k)) for k in ms.local_models("mesmer")]
+        for name, data in _dedupe(entries):
+            if self._model_combo.findText(name) == -1:
+                self._model_combo.addItem(name, data)
 
     def _on_model_changed(self, index):
         """Show/hide the membrane channel selector and update defaults."""

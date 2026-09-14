@@ -2,6 +2,7 @@ graft .
 prune images
 prune models
 prune opal_studio/models
+prune model_release
 prune build
 prune dist
 prune tests

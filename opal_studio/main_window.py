@@ -20,7 +20,7 @@ from PySide6.QtGui import (
      QImage, QPainter, QPixmap, QColor, QIcon, QPolygonF, QAction
 )
 from PySide6.QtWidgets import (
-    QMainWindow, QFileDialog, QSplitter, QWidget,
+    QMainWindow, QFileDialog, QSplitter, QWidget, QStackedWidget,
     QHBoxLayout, QVBoxLayout, QStatusBar, QMessageBox, QTabWidget,
     QApplication, QScrollBar, QLabel
 )
@@ -72,6 +72,16 @@ def _app_version() -> str:
 
 _APP_VERSION = _app_version()
 _APP_TITLE = f"Opal Studio {_APP_VERSION}".rstrip()
+
+# Display range for a deconvolved stain channel. Optical density runs roughly
+# 0-0.2 on an H&E scan, so this is the top of the useful range rather than a
+# hard limit; the channel's own slider adjusts it like any other.
+DECONVOLUTION_DISPLAY_MAX = 0.25
+
+# Largest area, in megapixels, that a brightfield segmentation run will read at
+# full resolution in one go. A whole-slide scan is orders of magnitude bigger;
+# above this the run stops and points at the region modes instead.
+BRIGHTFIELD_MAX_MEGAPIXELS = 120.0
 
 
 def project_io_unique(existing: dict, name: str) -> str:
@@ -217,6 +227,10 @@ class MainWindow(QMainWindow):
         self._tsne_tab = ScatterPlotTab("t-SNE")
         self._umap_tab = ScatterPlotTab("UMAP")
         self._brightfield_view = BrightfieldView(self._channel_model)
+        # A loaded brightfield / H&E scan is a pyramidal image like any other, so
+        # it gets a real canvas — lazy tile loading and zoom to full resolution —
+        # rather than the single-raster view used for a generated brightfield.
+        self._bf_canvas = ImageCanvas(self._channel_model)
         self._active_cluster_ids: list[int] = []
         self._cluster_cell_ids: "np.ndarray | None" = None
         self._cluster_labels_arr: "np.ndarray | None" = None
@@ -259,10 +273,14 @@ class MainWindow(QMainWindow):
         # Connect drawing signals between panel and canvas / brightfield view
         self._channel_panel._draw_btn.toggled.connect(self._canvas.set_draw_mode)
         self._channel_panel._draw_btn.toggled.connect(self._brightfield_view.set_draw_mode)
+        self._channel_panel._draw_btn.toggled.connect(self._bf_canvas.set_draw_mode)
         self._channel_panel._simplification_spin.valueChanged.connect(self._canvas.set_simplification_epsilon)
         self._channel_panel._simplification_spin.valueChanged.connect(self._brightfield_view.set_simplification_epsilon)
+        self._channel_panel._simplification_spin.valueChanged.connect(self._bf_canvas.set_simplification_epsilon)
         self._canvas.regionDrawn.connect(self._on_region_drawn)
         self._brightfield_view.regionDrawn.connect(self._on_region_drawn)
+        self._bf_canvas.regionDrawn.connect(self._on_region_drawn)
+        self._bf_canvas.pixelHovered.connect(self._on_pixel_hovered)
 
         # Sync viewport between multiplex canvas and brightfield view
         self._viewport_syncing = False
@@ -275,11 +293,11 @@ class MainWindow(QMainWindow):
         
         self._center_tabs = QTabWidget()
 
-        self._image_tab = QWidget()
-        image_layout = QVBoxLayout(self._image_tab)
-        image_layout.setContentsMargins(0, 0, 0, 0)
-        image_layout.setSpacing(0)
-        image_layout.addWidget(self._canvas, 1)
+        self._multiplex_tab = QWidget()
+        multiplex_layout = QVBoxLayout(self._multiplex_tab)
+        multiplex_layout.setContentsMargins(0, 0, 0, 0)
+        multiplex_layout.setSpacing(0)
+        multiplex_layout.addWidget(self._canvas, 1)
 
         self._slice_controls = QWidget()
         slice_layout = QHBoxLayout(self._slice_controls)
@@ -293,7 +311,7 @@ class MainWindow(QMainWindow):
         slice_layout.addWidget(self._slice_label)
         slice_layout.addWidget(self._slice_scrollbar, 1)
         self._slice_controls.hide()
-        image_layout.addWidget(self._slice_controls)
+        multiplex_layout.addWidget(self._slice_controls)
 
         self._slice_load_timer = QTimer(self)
         self._slice_load_timer.setSingleShot(True)
@@ -306,8 +324,15 @@ class MainWindow(QMainWindow):
         spacer_icon = QIcon(spacer_pixmap)
         
         self._center_tabs.setIconSize(QSize(1, 24))
-        self._center_tabs.addTab(self._image_tab, spacer_icon, "Image")
-        self._center_tabs.addTab(self._brightfield_view, spacer_icon, "Brightfield")
+        # The Brightfield tab shows whichever of the two applies: a canvas for a
+        # loaded RGB scan, or the single-raster view for one generated from the
+        # multiplex channels.
+        self._brightfield_stack = QStackedWidget()
+        self._brightfield_stack.addWidget(self._brightfield_view)   # index 0
+        self._brightfield_stack.addWidget(self._bf_canvas)          # index 1
+
+        self._center_tabs.addTab(self._multiplex_tab, spacer_icon, "Multiplex")
+        self._center_tabs.addTab(self._brightfield_stack, spacer_icon, "Brightfield")
         self._center_tabs.addTab(self._phenotyping_tab, spacer_icon, "Phenotyping")
         self._center_tabs.addTab(self._clustering_heatmap_tab, spacer_icon, "Heatmap")
         self._center_tabs.addTab(self._tsne_tab, spacer_icon, "t-SNE")
@@ -447,6 +472,15 @@ class MainWindow(QMainWindow):
         act = QAction("Cell &Data…", self)
         act.triggered.connect(self._on_export_cells)
         export_menu.addAction(act)
+
+        file_menu.addSeparator()
+
+        download_act = QAction("&Download All Models…", self)
+        download_act.setToolTip(
+            "Fetch every segmentation and positivity model now, so Opal Studio "
+            "works later without an internet connection.")
+        download_act.triggered.connect(self._on_download_all_models)
+        file_menu.addAction(download_act)
 
         file_menu.addSeparator()
 
@@ -627,9 +661,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(_APP_TITLE)
         self._slice_controls.hide()
 
+        self._channel_model.has_brightfield = False
         self._channel_model.set_channels([])
         self._canvas.clear()
+        self._bf_canvas.force_rgb = False
+        self._bf_canvas.clear()
         self._brightfield_view.clear()
+        self._brightfield_stack.setCurrentWidget(self._brightfield_view)
         self._ops_panel.reset()
         self._phenotyping_tab.clear()
         self._clustering_heatmap_tab.clear()
@@ -648,7 +686,18 @@ class MainWindow(QMainWindow):
             self._image = img
             
             if img.is_rgb:
-                self._channel_model.set_channels([])
+                # A brightfield / H&E scan carries no marker channels, but the
+                # two stains can be separated out of the RGB. The haematoxylin
+                # channel is offered as an ordinary channel so the single-channel
+                # nuclei models can work on it; it holds no pixels of its own and
+                # is computed from the RGB wherever it is needed.
+                self._channel_model.has_brightfield = True
+                self._channel_model.set_channels([Channel(
+                    name="Hematoxylin", color=QColor(255, 255, 255), visible=True,
+                    data_min=0.0, data_max=DECONVOLUTION_DISPLAY_MAX,
+                    index=-1, deconvolution="hematoxylin",
+                )])
+                self._show_brightfield_image(img)
             else:
                 from opal_studio.channel_model import generate_spaced_colors
                 palette = generate_spaced_colors(len(img.channel_names))
@@ -660,9 +709,16 @@ class MainWindow(QMainWindow):
                         name=name, color=QColor(*rgb),
                         visible=True, data_min=float(dmin), data_max=float(dmax), index=i
                     ))
+                # Clear the flag before the reset: set_channels emits modelReset,
+                # which is what makes the segmentation tabs rebuild their channel
+                # lists, and they read the flag as they do it.
+                self._channel_model.has_brightfield = False
                 self._channel_model.set_channels(channels)
+                self._canvas.set_image(img)
+                self._bf_canvas.force_rgb = False
+                self._bf_canvas.clear()
+                self._brightfield_stack.setCurrentWidget(self._brightfield_view)
 
-            self._canvas.set_image(img)
             self._ops_panel.reset()
             self._phenotyping_tab.clear()
             self._clustering_heatmap_tab.clear()
@@ -1420,15 +1476,140 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _show_brightfield_image(self, img):
+        """Put a loaded RGB scan on the Brightfield tab's canvas.
+
+        The Multiplex tab is cleared: an H&E scan has no marker channels to
+        so there is nothing for it to show.
+        """
+        self._brightfield_rgb = None
+        # Both tabs show the same scan: the Brightfield tab as it was scanned,
+        # the Multiplex tab as the deconvolved stain channels the channel list
+        # offers. force_rgb is what keeps the scan itself on the Brightfield tab.
+        self._bf_canvas.force_rgb = True
+        self._canvas.set_image(img)
+        # Show the canvas before handing it the image. A widget that is still
+        # hidden inside the stack reports its default 640x480, and the first
+        # render would be built for that size — leaving part of the view filled
+        # with the stretched overview until something forced a re-render.
+        self._brightfield_stack.setCurrentWidget(self._bf_canvas)
+        self._focus_brightfield_tab()
+        self._bf_canvas.set_image(img)
+
+    def _focus_brightfield_tab(self):
+        # Looked up by widget rather than by label, so renaming a tab cannot
+        # silently stop this working.
+        idx = self._center_tabs.indexOf(self._brightfield_stack)
+        if idx >= 0:
+            self._center_tabs.setCurrentIndex(idx)
+
+    def _model_download_progress(self, label):
+        """A progress callback that reports a model download in the status bar."""
+        state = {"last": -1}
+
+        def report(done, total):
+            pct = int(100 * done / total) if total else -1
+            if pct == state["last"]:
+                return
+            state["last"] = pct
+            if total:
+                self.operationProgress.emit(done, total)
+                self.segmentationStatus.emit(
+                    f"Downloading model {label}… {pct}% ({done / 1e6:.0f} of "
+                    f"{total / 1e6:.0f} MB)")
+            else:
+                self.segmentationStatus.emit(
+                    f"Downloading model {label}… {done / 1e6:.0f} MB")
+        return report
+
+    def _resolve_model_refs(self, params: dict):
+        """Replace any model reference in *params* with a local path.
+
+        Dropdowns carry a reference for Opal Studio's own models rather than a
+        path, because those may not have been downloaded yet. Runs off the GUI
+        thread: a first download can take a while.
+        """
+        from opal_studio import model_store
+        for field in ("model_path", "model_folder"):
+            value = params.get(field)
+            if model_store.is_ref(value):
+                key = value[len(model_store.STORE_PREFIX):]
+                params[field] = model_store.resolve(
+                    value, self._model_download_progress(key))
+                print(f"[Models] {key} -> {params[field]}")
+
+    def _on_download_all_models(self):
+        """File > Download All Models: fetch everything for offline use."""
+        from PySide6.QtWidgets import QDialog, QPlainTextEdit, QDialogButtonBox
+        from opal_studio import model_store
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Download All Models")
+        dlg.resize(640, 380)
+        lay = QVBoxLayout(dlg)
+        info = QLabel(
+            f"Models are saved to:\n{model_store.models_dir()}\n\n"
+            "Opal Studio's own models come from its GitHub release; StarDist, "
+            "Cellpose and InstanSeg fetch their pretrained models into their own "
+            "caches. Anything already present is skipped.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        log = QPlainTextEdit()
+        log.setReadOnly(True)
+        lay.addWidget(log, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setEnabled(False)
+        lay.addWidget(buttons)
+
+        # Log lines arrive from the worker thread, so go through a queued signal.
+        from PySide6.QtCore import QObject, Signal
+
+        class _Bridge(QObject):
+            line = Signal(str)
+            finished = Signal(dict)
+
+        bridge = _Bridge(dlg)
+        bridge.line.connect(log.appendPlainText)
+
+        def on_finished(results):
+            failed = [k for k, v in results.items() if str(v).startswith("FAILED")]
+            log.appendPlainText("")
+            log.appendPlainText(
+                f"Finished: {len(results) - len(failed)} of {len(results)} models "
+                f"available." + (f" {len(failed)} failed — see above." if failed else ""))
+            buttons.button(QDialogButtonBox.StandardButton.Close).setEnabled(True)
+
+        bridge.finished.connect(on_finished)
+
+        def work():
+            try:
+                bridge.finished.emit(model_store.download_all(log=bridge.line.emit))
+            except Exception as exc:
+                bridge.line.emit(f"Error: {exc}")
+                bridge.finished.emit({})
+
+        threading.Thread(target=work, daemon=True).start()
+        dlg.exec()
+
+    def _active_canvas(self):
+        """The canvas currently showing the image.
+
+        A brightfield / H&E scan is displayed on the Brightfield tab, everything
+        else on the Multiplex tab, so anything working from the visible region has
+        ask which of the two is live.
+        """
+        if self._image is not None and self._image.is_rgb:
+            return self._bf_canvas
+        return self._canvas
+
     @Slot(object)
     def _on_brightfield_complete(self, rgb_array):
         self._brightfield_rgb = rgb_array
         self._ops_panel.stop_loading()
         self._brightfield_view.set_image(rgb_array)
-        for i in range(self._center_tabs.count()):
-            if self._center_tabs.tabText(i) == "Brightfield":
-                self._center_tabs.setCurrentIndex(i)
-                break
+        self._brightfield_stack.setCurrentWidget(self._brightfield_view)
+        self._focus_brightfield_tab()
         self._status.showMessage("Brightfield image generated", 3000)
 
     def _on_export_brightfield(self):
@@ -2101,6 +2282,11 @@ class MainWindow(QMainWindow):
 
         def _run():
             try:
+                # Opal Studio's own models are fetched on first use. Do it here,
+                # in this thread and before the worker process starts, so a
+                # download shows progress and the worker only ever sees paths.
+                self._resolve_model_refs(params)
+
                 method = params.get("method", "stardist")
                 indices = params["channel_indices"]
                 region_mode = params.get("region_mode", "full")
@@ -2148,13 +2334,100 @@ class MainWindow(QMainWindow):
                         r_top, r_bottom = int(min(ys)), int(max(ys))
                         r_left, r_right = int(min(xs)), int(max(xs))
                 
+                # ---- Brightfield / H&E ----------------------------------------
+                # Two things read from the RGB scan rather than from a stored
+                # channel: the whole scan (offered by the tabs as index -1, since
+                # it is not a row in the channel list) and any stain deconvolved
+                # from it. Both are read a region at a time, so a whole-slide scan
+                # never has to be held at full resolution.
+                stains = [self._channel_model.channel(i).deconvolution
+                          for i in indices
+                          if i is not None and i >= 0
+                          and getattr(self._channel_model.channel(i), "deconvolution", "")]
+                brightfield = any(i is not None and i < 0 for i in indices) or bool(stains)
+                if brightfield:
+                    from opal_studio.image_loader import get_tile, _get_yx
+
+                    if not self._image.is_rgb:
+                        raise ValueError("No brightfield image is loaded.")
+                    viewport = self._active_canvas()._viewport
+                    bh, bw = _get_yx(self._image.base_shape, self._image.axes,
+                                     self._image.is_rgb)
+                    full_shape = (bh, bw)
+
+                    if region_mode == "visible":
+                        v_top = int(max(0, viewport.top()))
+                        v_left = int(max(0, viewport.left()))
+                        v_bottom = int(min(bh, viewport.bottom()))
+                        v_right = int(min(bw, viewport.right()))
+                        if v_top >= v_bottom or v_left >= v_right:
+                            raise ValueError("Visible region is completely outside the image.")
+                        y0, y1, x0, x1 = v_top, v_bottom, v_left, v_right
+                    elif region_mode == "selected_region":
+                        r_top, r_left = int(max(0, r_top)), int(max(0, r_left))
+                        r_bottom, r_right = int(min(bh, r_bottom)), int(min(bw, r_right))
+                        if r_top >= r_bottom or r_left >= r_right:
+                            raise ValueError("Selected region bounding box is outside the image.")
+                        y0, y1, x0, x1 = r_top, r_bottom, r_left, r_right
+                    else:
+                        y0, y1, x0, x1 = 0, bh, 0, bw
+
+                    # Segmentation works in full-resolution coordinates, so the
+                    # crop is read at level 0. A whole slide is far too large to
+                    # hold at that resolution, so say so rather than exhausting
+                    # memory — that is what the region modes are for.
+                    megapixels = (y1 - y0) * (x1 - x0) / 1e6
+                    if megapixels > BRIGHTFIELD_MAX_MEGAPIXELS:
+                        raise ValueError(
+                            f"The requested area is {megapixels:.0f} megapixels, over the "
+                            f"{BRIGHTFIELD_MAX_MEGAPIXELS:.0f} MP limit for one run. "
+                            f"Segment a part of the slide instead — choose 'Visible region' "
+                            f"and zoom in, or draw a region and choose 'Selected region'.")
+
+                    print(f"[Segmentation] Brightfield RGB crop "
+                          f"y[{y0}:{y1}] x[{x0}:{x1}] ({megapixels:.1f} MP) at level 0")
+                    rgb = np.asarray(get_tile(self._image, 0, None,
+                                              slice(y0, y1), slice(x0, x1)))
+                    if rgb.ndim == 2:
+                        rgb = np.repeat(rgb[..., None], 3, axis=-1)
+                    rgb = rgb[..., :3]
+
+                    if stains:
+                        # A single-channel model gets the stain on its own. The
+                        # deconvolution returns optical density, so a stained
+                        # nucleus is already bright against dark background —
+                        # which is the polarity these models were trained on, and
+                        # why nothing is inverted here.
+                        from opal_studio.deconvolution import separate
+                        for stain in stains:
+                            od = separate(rgb, stain)
+                            p_lo, p_hi = np.percentile(od, (1, 99.8))
+                            data = np.clip((od - p_lo) / (p_hi - p_lo + 1e-6), 0, 1)
+                            input_channels_data.append(data.astype(np.float32))
+                            print(f"[Segmentation] {stain} from RGB: "
+                                  f"OD {od.min():.4f}-{od.max():.4f}, "
+                                  f"scaled on p1={p_lo:.4f} p99.8={p_hi:.4f}")
+                    else:
+                        # An H&E model takes the RGB itself. Scaled by the dtype's
+                        # own range rather than per-crop percentiles, which would
+                        # stretch the stain balance differently for every crop and
+                        # make the result depend on where you were looking.
+                        rgbf = rgb.astype(np.float32)
+                        top = (float(np.iinfo(self._image.dtype).max)
+                               if np.issubdtype(self._image.dtype, np.integer)
+                               else max(float(rgbf.max()), 1e-6))
+                        input_channels_data.append(np.clip(rgbf / top, 0.0, 1.0))
+
+                    x = input_channels_data[0]
+                    indices = []          # the loop below has nothing left to read
+
                 for idx in indices:
                     ch = self._channel_model.channel(idx)
                     if ch.is_processed and ch.processed_data is not None:
                         raw = ch.processed_data.astype(np.float32)
                     else:
                         raw = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
-                    
+
                     full_shape = raw.shape
                     if region_mode == "visible":
                         v_top = int(max(0, self._canvas._viewport.top()))
@@ -2718,6 +2991,10 @@ class MainWindow(QMainWindow):
 
                 from opal_studio.image_loader import _get_yx
                 from opal_studio.segmentation_engine import run_positivity_task
+                from opal_studio import model_store
+
+                params["model_path"] = model_store.resolve(
+                    model_store.ref("cellpos"), self._model_download_progress("cellpos"))
                 
                 print(f"[AI] Starting cell positivity detection for mask: {original_mask_ch.name}")
                 

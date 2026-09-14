@@ -91,12 +91,13 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
 
         if method == "stardist":
             from stardist.models import StarDist2D
-            model_folder = params.get("model_folder", params["model_name"])
-            # Ensure we look in the correct directory relative to the app
-            basedir = os.path.join(os.path.dirname(__file__), "models", "stardist")
-            
-            if os.path.isdir(os.path.join(basedir, model_folder)):
-                model = StarDist2D(None, name=model_folder, basedir=basedir)
+            model_folder = params.get("model_folder") or params["model_name"]
+            # The main process has already resolved Opal Studio's own models to a
+            # folder on disk (downloading them if needed). Anything else is one of
+            # StarDist's pretrained models, which StarDist fetches and caches.
+            if os.path.isdir(model_folder):
+                model = StarDist2D(None, name=os.path.basename(os.path.normpath(model_folder)),
+                                   basedir=os.path.dirname(os.path.normpath(model_folder)))
             else:
                 model = StarDist2D.from_pretrained(params["model_name"])
 
@@ -109,7 +110,14 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
             n_tiles = None
             if x.shape[0] > 1024 or x.shape[1] > 1024:
                 n_tiles = (int(np.ceil(x.shape[0] / 1024)), int(np.ceil(x.shape[1] / 1024)))
-            
+                if x.ndim == 3:
+                    # An H&E model takes RGB, so n_tiles needs an entry per axis;
+                    # the colour axis is never split.
+                    n_tiles = n_tiles + (1,)
+
+            print(f"[StarDist] '{model_folder}' on a {x.shape[0]}x{x.shape[1]} "
+                  f"{'RGB' if x.ndim == 3 else 'single-channel'} image"
+                  f"{f', {n_tiles} tiles' if n_tiles else ''}…", flush=True)
             labels, _ = model.predict_instances(x, n_tiles=n_tiles, **kwargs)
             results.append((labels, params.get("override_name", "StarDist"), False))
 
@@ -162,7 +170,16 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
             
             model_name = params["model_name"]
             model_path = params.get("model_path")
-            
+
+            # A resolved folder is either a model trained here (model_weights.pth,
+            # loaded through the training code below) or one in InstanSeg's own
+            # format (instanseg.pt, loaded by InstanSeg itself).
+            zoo_dir = None
+            if (model_path and os.path.isdir(model_path)
+                    and os.path.exists(os.path.join(model_path, "instanseg.pt"))
+                    and not os.path.exists(os.path.join(model_path, "model_weights.pth"))):
+                zoo_dir, model_path = model_path, None
+
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             x = input_channels_data[0]
             
@@ -291,10 +308,11 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                 
             else:
                 from instanseg import InstanSeg
-                local_model_dir = os.path.join(os.path.dirname(__file__), "models", "instanseg", model_name)
-                if os.path.exists(os.path.join(local_model_dir, "instanseg.pt")):
-                    model_name = local_model_dir
-                
+                # Either a folder the main process resolved, or the name of a model
+                # InstanSeg fetches and caches for itself.
+                if zoo_dir:
+                    model_name = zoo_dir
+
                 model = InstanSeg(model_name, device=device)
                 
                 x_input = x
@@ -337,10 +355,14 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                         )
 
                 if labels_tensor.ndim == 3:
-                    # First channel is nuclei, rest are cells
+                    # First channel is nuclei, rest are cells. Both are plain
+                    # segmentations, so neither is flagged as a cell mask — that
+                    # flag means "per-cell positivity for one marker", which is
+                    # what puts a channel in the Positivity panel and gives it a
+                    # pos_lut. A segmentation has no marker and no positivity.
                     results.append((labels_tensor[0], "InstanSeg Nuclei", False))
                     for c in range(1, labels_tensor.shape[0]):
-                        results.append((labels_tensor[c], "InstanSeg Cells", True))
+                        results.append((labels_tensor[c], "InstanSeg Cells", False))
                 else:
                     results.append((labels_tensor, "InstanSeg", False))
 
@@ -491,7 +513,16 @@ def run_positivity_task(queue, params, data):
             except RuntimeError:
                 pass
 
-        model_path = os.path.join(os.path.dirname(__file__), "models", "cellpos", "marker_cnn_epoch_200.h5")
+        model_path = params.get("model_path")
+        if not model_path:
+            from opal_studio import model_store
+            found = model_store.find("cellpos")
+            if found is None:
+                raise FileNotFoundError(
+                    "The cell positivity model is not installed. It is downloaded "
+                    "automatically when positivity is run, or from File > Download "
+                    "All Models.")
+            model_path = str(model_store.entrypoint("cellpos", found))
         model = tf.keras.models.load_model(model_path, compile=False)
 
         # The checkpoint records how it was trained. The marker channels are an

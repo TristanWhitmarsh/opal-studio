@@ -111,6 +111,10 @@ class Channel:
     pos_lut: np.ndarray | None = None
     random_contour_colors: bool = True
     is_region: bool = False
+    # Non-empty for a stain separated out of a brightfield / H&E scan, e.g.
+    # "hematoxylin". Such a channel has no pixels of its own — it is computed
+    # from the RGB on demand, so it costs nothing on a whole-slide scan.
+    deconvolution: str = ""
 
 
 class ChannelListModel(QAbstractListModel):
@@ -140,6 +144,10 @@ class ChannelListModel(QAbstractListModel):
         self._brightness: float = 1.0
         self._cell_opacity: float = 1.0
         self._type_opacity: float = 1.0
+        # True while a brightfield / H&E scan is open. Such a scan has no marker
+        # channels, so the list stays empty; this is how the segmentation tabs
+        # know there is still something to segment.
+        self.has_brightfield: bool = False
 
     # ---- public helpers ------------------------------------------------
 

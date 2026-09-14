@@ -207,6 +207,10 @@ class ImageCanvas(QWidget):
         self._loading_seq = -1
         self._loading_active = False
 
+        #: Set on a canvas that displays a brightfield scan as-is, so a stain
+        #: deconvolved from it is not painted over the scan.
+        self.force_rgb = False
+
         # Low-res overview — entire image at coarsest level
         self._overview: Optional[QImage] = None
         # Channel version when the overview was last rendered.
@@ -498,11 +502,23 @@ class ImageCanvas(QWidget):
 
     # ── Overview (background fallback) ────────────────────────────────────────
 
+    def _render_channels(self):
+        """The channels this canvas should draw.
+
+        A canvas showing a brightfield scan as-is skips any stain deconvolved
+        from it — that belongs on the Multiplex tab. Masks and regions are
+        unaffected, so segmentation results still appear on both.
+        """
+        channels = self._model.visible_channels()
+        if self.force_rgb:
+            channels = [c for c in channels if not getattr(c, "deconvolution", "")]
+        return channels
+
     def _load_overview(self):
         """Initial synchronous overview load."""
         if not self._img or not self._img.levels:
             return
-        channels = self._model.visible_channels()
+        channels = self._render_channels()
         try:
             self._overview = render_overview(self._img, channels, self._model.brightness)
             self._overview_channel_version = self._channel_version
@@ -516,7 +532,7 @@ class ImageCanvas(QWidget):
         """Request an asynchronous overview update from the worker thread."""
         if not self._img or not self._img.levels:
             return
-        channels = self._model.visible_channels()
+        channels = self._render_channels()
         if not channels and not self._img.is_rgb:
             self._overview = None
             self._overview_channel_version = self._channel_version
@@ -561,7 +577,11 @@ class ImageCanvas(QWidget):
         if not self._img:
             return
 
-        channels = self._model.visible_channels()
+        # Remember the size this render is being built for, so showEvent can tell
+        # whether what is on screen was rendered for a different one.
+        self._render_size = (self.width(), self.height())
+
+        channels = self._render_channels()
         if not channels and not self._img.is_rgb:
             self._display_image = None
             self._overview = None
@@ -968,6 +988,32 @@ class ImageCanvas(QWidget):
         super().contextMenuEvent(event)
 
     # ── Resize ────────────────────────────────────────────────────────────────
+
+    def showEvent(self, event):
+        """Re-render if what is displayed was built for a different widget size.
+
+        A canvas living in a stacked widget or an unselected tab is laid out at a
+        default size while hidden, so a render submitted then covers only part of
+        the view once it is shown — the rest falls back to the stretched overview.
+        """
+        super().showEvent(event)
+        if not self._img:
+            return
+        w, h = self.width(), self.height()
+        rendered = getattr(self, "_render_size", None)
+        if w <= 0 or h <= 0 or rendered == (w, h):
+            return
+
+        if rendered and rendered[0] > 0 and self._viewport.width() > 0:
+            # Keep the magnification and centre the user had; only the visible
+            # extent changes with the widget.
+            spp = rendered[0] / self._viewport.width()
+            cx, cy = self._viewport.center().x(), self._viewport.center().y()
+            vw, vh = w / spp, h / spp
+            self._viewport = QRectF(cx - vw / 2, cy - vh / 2, vw, vh)
+        else:
+            self._fit_viewport()
+        self._schedule_render(immediate_progressive=True)
 
     def resizeEvent(self, event):
         old_size = event.oldSize()

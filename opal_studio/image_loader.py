@@ -869,6 +869,65 @@ def best_level_for_zoom(img: ImageData, screen_pixels_per_image_pixel: float) ->
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Brightfield (RGB) helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rgb_display_level(img: ImageData, max_edge: int = 8192) -> int:
+    """Finest pyramid level whose longest edge fits within *max_edge*.
+
+    A whole-slide brightfield scan is routinely tens of gigapixels, far too much
+    to hold as a single displayable image, so the viewer shows a pyramid level
+    instead. Levels run finest → coarsest, so the first that fits is the most
+    detailed one that does; if none fit, the coarsest is the best available.
+    """
+    for lvl in img.levels:
+        h, w = _get_yx(lvl.shape, img.axes, img.is_rgb)
+        if max(h, w) <= max_edge:
+            return lvl.index
+    return img.levels[-1].index
+
+
+def read_rgb(img: ImageData, level: int | None = None,
+             max_edge: int = 8192) -> tuple[np.ndarray, int]:
+    """Read one whole pyramid level of an RGB image as (H, W, 3) uint8.
+
+    Returns the array and the level it came from, so the caller can relate the
+    pixels back to full-resolution coordinates.
+    """
+    if not img.is_rgb:
+        raise ValueError("read_rgb requires an RGB image")
+    if level is None:
+        level = rgb_display_level(img, max_edge)
+    level = max(0, min(level, len(img.levels) - 1))
+
+    h, w = _get_yx(img.levels[level].shape, img.axes, img.is_rgb)
+    arr = np.asarray(get_tile(img, level, None, slice(0, h), slice(0, w)))
+    return _as_rgb8(arr), level
+
+
+def _as_rgb8(arr: np.ndarray) -> np.ndarray:
+    """Coerce a raster to contiguous (H, W, 3) uint8."""
+    arr = np.asarray(arr)
+    if arr.ndim == 2:                       # greyscale scan
+        arr = np.repeat(arr[..., None], 3, axis=-1)
+    if arr.ndim != 3:
+        raise ValueError(f"expected a 2-D or 3-D raster, got shape {arr.shape}")
+    if arr.shape[-1] > 3:                   # drop alpha / extra samples
+        arr = arr[..., :3]
+    elif arr.shape[-1] < 3:
+        arr = np.repeat(arr[..., :1], 3, axis=-1)
+
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        top = float(arr.max())
+        # 16-bit scans and float scans both land here; scale by the actual range
+        # rather than assuming a fixed bit depth.
+        scale = 255.0 / top if top > 0 else 1.0
+        arr = np.clip(arr * scale, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
 

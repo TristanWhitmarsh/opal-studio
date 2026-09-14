@@ -252,7 +252,8 @@ def render_viewport_tiled(
     Result is a single image -- atomic swap, no visible tile seams.
     """
     if img.is_rgb:
-        return _render_viewport_rgb(cache, img, level_idx, viewport, tile_size)
+        return _render_viewport_rgb(cache, img, channels, level_idx, viewport,
+                                    tile_size, brightness)
     return _render_viewport_multichannel(
         cache, img, channels, level_idx, viewport, brightness, tile_size,
         layer_cache,
@@ -312,7 +313,9 @@ def render_viewport(
 # RGB paths
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_viewport_rgb(cache: TileCache, img: ImageData, level_idx: int, viewport: QRectF, tile_size: int) -> tuple:
+def _render_viewport_rgb(cache: TileCache, img: ImageData, channels: List[Channel],
+                         level_idx: int, viewport: QRectF, tile_size: int,
+                         brightness: float = 1.0) -> tuple:
     lvl = img.levels[level_idx]
     ds = lvl.downsample
     lh, lw = _get_yx(lvl.shape, img.axes, img.is_rgb)
@@ -325,7 +328,53 @@ def _render_viewport_rgb(cache: TileCache, img: ImageData, level_idx: int, viewp
     if lv_y1 <= lv_y0 or lv_x1 <= lv_x0:
         return _blank_qimage(1, 1), actual_rect
     tile = _read_channel_slice(cache, img, level_idx, None, slice(lv_y0, lv_y1), slice(lv_x0, lv_x1), tile_size)
-    return _rgb_array_to_qimage(_to_uint8(tile)), actual_rect
+    rgb8 = _to_uint8(tile)
+
+    # A stain separated out of the scan replaces it as the base layer. It is
+    # computed from this tile rather than stored, so it works at any zoom and
+    # costs nothing on a whole-slide scan.
+    stain = next((c for c in (channels or [])
+                  if getattr(c, "deconvolution", "") and c.visible), None)
+    if stain is not None:
+        from opal_studio.deconvolution import separate
+        try:
+            od = separate(rgb8, stain.deconvolution)
+            lo, hi = float(stain.data_min), float(stain.data_max)
+            if hi <= lo:
+                lo, hi = float(od.min()), float(od.max())
+            norm = np.clip((od - lo) / (hi - lo + 1e-9), 0.0, 1.0)
+            col = np.array([stain.color.redF(), stain.color.greenF(),
+                            stain.color.blueF()], dtype=np.float32)
+            rgb8 = (np.clip(norm[..., None] * col * brightness, 0.0, 1.0)
+                    * 255).astype(np.uint8)
+        except Exception as exc:                # never lose the view over this
+            print(f"[Opal] deconvolution render failed: {exc}")
+
+    # Segmentation run on a brightfield scan produces the same mask channels as
+    # on a multiplex image, so they are painted on top here too — the RGB is the
+    # base layer instead of the summed intensity channels.
+    mask_channels = [c for c in (channels or [])
+                     if (c.is_mask or c.is_cell_mask or c.is_type_mask)
+                     and c.visible and c.mask_data is not None]
+    if mask_channels:
+        canvas = rgb8.astype(np.float32) / 255.0
+        if canvas.ndim == 2:
+            canvas = np.repeat(canvas[..., None], 3, axis=-1)
+        canvas = np.ascontiguousarray(canvas[..., :3])
+        height, width = canvas.shape[:2]
+
+        by0 = int(lv_y0 * ds);  by1 = int(lv_y1 * ds)
+        bx0 = int(lv_x0 * ds);  bx1 = int(lv_x1 * ds)
+        for ch in sorted(mask_channels, key=_composite_order):
+            raw = ch.mask_data[by0:by1, bx0:bx1].astype(np.float32)
+            if raw.shape[:2] != (height, width):
+                raw = _fast_resize(raw, height, width)
+            _composite_channel(canvas, raw, ch, 1.0)
+
+        np.clip(canvas, 0.0, 1.0, out=canvas)
+        rgb8 = (canvas * 255).astype(np.uint8)
+
+    return _rgb_array_to_qimage(rgb8), actual_rect
 
 
 def _render_rgb(img, level_idx, vy, vx) -> QImage:

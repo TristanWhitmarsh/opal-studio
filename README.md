@@ -66,28 +66,42 @@ Notes:
   code even when the version number is unchanged — without re-resolving dependencies.
 - `--no-build-isolation` builds in place instead of copying the whole checkout to `/tmp`.
 - Do **not** launch with `python -m opal_studio` from *inside* the checkout directory —
-  that imports the checkout (which has no `models/`, see below) instead of the installed
-  package. Use the desktop launcher, the `opal-studio` console script, or run from `~`.
+  that imports the checkout instead of the installed package. Use the desktop launcher,
+  the `opal-studio` console script, or run from `~`.
 
-#### Segmentation models
+#### Models
 
-The model weights (InstanSeg, StarDist, Cellpose, Mesmer) are gitignored and are not
-shipped in the wheel, so they must be placed next to the **installed** package, in the
-conda env's `site-packages`:
+Model weights are not part of the package — they come to about 640 MB. They are
+downloaded automatically the first time they are needed:
 
-```
-<env>/lib/python3.9/site-packages/opal_studio/models/
-```
+- **Opal Studio's own models** (cell positivity, and the IMC / General segmentation
+  models) come from the [`models-v1` release](https://github.com/TristanWhitmarsh/opal-studio/releases/tag/models-v1)
+  of this repository.
+- **StarDist, Cellpose and InstanSeg** fetch their own pretrained models into their own
+  caches, from their own sources.
 
-For example, uploading a compressed `models/` folder and extracting it there:
+Downloaded models are stored inside the installed package, in `opal_studio/models/`
+under your environment's `site-packages` — next to the code, so nothing is left
+elsewhere on the machine. Deleting the `opal_studio` folder deletes its models too.
+
+pip only removes files it installed itself, so downloaded models survive
+`--force-reinstall`, and `pip uninstall` leaves the `models/` folder behind in
+`site-packages/opal_studio/`. To fetch a model again, delete its folder there; it is
+downloaded afresh the next time it is used.
+
+**Working offline, or on a cluster whose compute nodes have no internet:** run
+**File → Download All Models** once on a machine that is online (a login node, say).
+To keep the models somewhere else — shared storage, for instance — set
+`OPAL_STUDIO_MODELS` to a directory before starting Opal Studio:
 
 ```bash
-cd /home/tristan/Storage/scratch.space/envs/opal-env-j4/lib/python3.9/site-packages/opal_studio/
-tar xzf ~/models.tar.gz                                    # archive containing the models/ folder
-ls models/instanseg/single_channel_nuclei/instanseg.pt     # verify one model resolved
+export OPAL_STUDIO_MODELS=/home/tristan/Storage/scratch.space/opal-models
 ```
 
-Re-check the models are still present after any `--force-reinstall`.
+To use a model you trained yourself, place its folder under
+`<models>/<engine>/<name>/` (for example `stardist/MyModel/`) and it will appear in
+that engine's model list. See [MODELS.md](MODELS.md) for every model, its source and
+its licence.
 
 ## Supported Data
 
@@ -310,7 +324,7 @@ Open **Segmentation** in the right panel. Choose a region mode, a target mode, a
 | **Cellpose** | One channel, nuclei/cyto/cyto2 or local model, diameter, cell probability threshold, flow threshold. | Flexible cell or nuclei segmentation. |
 | **Omnipose** | One channel, specialized Omnipose/custom model, diameter, mask threshold, flow threshold. | Bacteria, elongated objects, plant cells, worms, and other non-round shapes. |
 
-Deep-learning engines run in a separate worker process to reduce TensorFlow/PyTorch conflicts. Local model folders are auto-discovered under `opal_studio/models/<engine>/` when present.
+Deep-learning engines run in a separate worker process to reduce TensorFlow/PyTorch conflicts. Models are downloaded on first use (see [Models](#models)); your own model folders are auto-discovered under `<models>/<engine>/`.
 
 ## Mask Processing
 

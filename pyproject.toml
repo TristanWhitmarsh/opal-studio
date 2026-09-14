@@ -88,6 +88,8 @@ include-package-data = true
 "opal_studio" = ["icons/*", "*.png", "*.ico"]
 
 [tool.setuptools.exclude-package-data]
-# Model weights are NOT shipped in the wheel (they are ~600 MB and change
-# rarely). Copy them into the installed package's models/ dir separately.
+# Model weights are NOT shipped in the wheel (they are ~550 MB). Opal Studio's
+# own models are downloaded from the GitHub release into opal_studio/models/ on
+# first use, and the segmentation libraries fetch their pretrained models
+# themselves. See MODELS.md and opal_studio/model_store.py.
 "opal_studio" = ["models/*", "models/**/*"]

@@ -32,6 +32,12 @@ class BrightfieldView(QWidget):
         super().__init__(parent)
         self._model = channel_model
         self._pixmap: QPixmap | None = None
+        # Size of the coordinate space the view works in — full-resolution image
+        # pixels. The pixmap may be a coarser pyramid level (a whole-slide scan is
+        # far too large to hold at full resolution), so every coordinate, viewport
+        # and overlay is expressed against these instead of the pixmap's own size.
+        self._img_w = 0
+        self._img_h = 0
         self._zoom = 1.0
         self._offset = QPointF()
         self._pan_start: QPointF | None = None
@@ -55,7 +61,8 @@ class BrightfieldView(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
 
-        lbl = QLabel("Generate a brightfield image using the\nBrightfield tab in Pre-processing.")
+        lbl = QLabel("Open an RGB brightfield / H&&E image, or generate one from\n"
+                     "the multiplex channels using the Brightfield tab in Pre-processing.")
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setStyleSheet("color: #888;")
         lay = QVBoxLayout(self)
@@ -68,12 +75,21 @@ class BrightfieldView(QWidget):
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def set_image(self, rgb_array: np.ndarray):
-        """Accept a (H, W, 3) uint8 numpy array and display it."""
+    def set_image(self, rgb_array: np.ndarray, image_size: tuple | None = None):
+        """Display a (H, W, 3) uint8 array.
+
+        *image_size* is the (height, width) of the full-resolution image this
+        raster represents. Pass it when showing a downsampled pyramid level of a
+        large scan, so masks, contours and the shared viewport stay in
+        full-resolution coordinates and keep lining up with the Multiplex tab.
+        Defaults to the array's own size, which is the case for a brightfield
+        generated from the multiplex channels.
+        """
         arr = np.ascontiguousarray(rgb_array.astype(np.uint8))
         h, w = arr.shape[:2]
         qimg = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888)
         self._pixmap = QPixmap.fromImage(qimg.copy())
+        self._img_h, self._img_w = image_size if image_size else (h, w)
         self._placeholder.setVisible(False)
         self._zoom = 1.0
         self._offset = QPointF(0, 0)
@@ -82,6 +98,7 @@ class BrightfieldView(QWidget):
 
     def clear(self):
         self._pixmap = None
+        self._img_w = self._img_h = 0
         self._overlay_cache.clear()
         self._placeholder.setVisible(True)
         self.update()
@@ -94,7 +111,7 @@ class BrightfieldView(QWidget):
         spp = fit * self._zoom
         if spp <= 0:
             return None
-        iW, iH = self._pixmap.width(), self._pixmap.height()
+        iW, iH = self._img_w, self._img_h
         W, H = self.width(), self.height()
         ox = (W - iW * fit * self._zoom) / 2 + self._offset.x()
         oy = (H - iH * fit * self._zoom) / 2 + self._offset.y()
@@ -112,7 +129,7 @@ class BrightfieldView(QWidget):
         fit = self._fit_scale()
         if fit <= 0:
             return
-        iW, iH = self._pixmap.width(), self._pixmap.height()
+        iW, iH = self._img_w, self._img_h
         # Target: spp derived from viewport width to match canvas magnification
         target_spp = self.width() / vp.width()
         new_zoom = max(0.05, min(50.0, target_spp / fit))
@@ -152,8 +169,8 @@ class BrightfieldView(QWidget):
         """Convert widget pixel position to image-space coordinates."""
         spp = self._screen_pixels_per_image_pixel()
         fit = self._fit_scale()
-        draw_w = self._pixmap.width()  * fit * self._zoom
-        draw_h = self._pixmap.height() * fit * self._zoom
+        draw_w = self._img_w  * fit * self._zoom
+        draw_h = self._img_h * fit * self._zoom
         ox = (self.width()  - draw_w) / 2 + self._offset.x()
         oy = (self.height() - draw_h) / 2 + self._offset.y()
         return (mx - ox) / spp, (my - oy) / spp
@@ -162,8 +179,8 @@ class BrightfieldView(QWidget):
         """Convert image-space coordinates to widget pixel position."""
         spp = self._screen_pixels_per_image_pixel()
         fit = self._fit_scale()
-        draw_w = self._pixmap.width()  * fit * self._zoom
-        draw_h = self._pixmap.height() * fit * self._zoom
+        draw_w = self._img_w  * fit * self._zoom
+        draw_h = self._img_h * fit * self._zoom
         ox = (self.width()  - draw_w) / 2 + self._offset.x()
         oy = (self.height() - draw_h) / 2 + self._offset.y()
         return ox + ix * spp, oy + iy * spp
@@ -358,8 +375,8 @@ class BrightfieldView(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
         fit = self._fit_scale()
-        draw_w = self._pixmap.width()  * fit * self._zoom
-        draw_h = self._pixmap.height() * fit * self._zoom
+        draw_w = self._img_w  * fit * self._zoom
+        draw_h = self._img_h * fit * self._zoom
         ox = (self.width()  - draw_w) / 2 + self._offset.x()
         oy = (self.height() - draw_h) / 2 + self._offset.y()
         dst = QRectF(ox, oy, draw_w, draw_h)
@@ -572,7 +589,7 @@ class BrightfieldView(QWidget):
                     self._drawn_points, self._simplification_epsilon)
                 if self._pixmap is not None:
                     simplified = clip_polygon_to_rect(
-                        simplified, self._pixmap.width(), self._pixmap.height())
+                        simplified, self._img_w, self._img_h)
                 if len(simplified) >= 4:  # 3 unique vertices + closing point
                     self.regionDrawn.emit(simplified)
             self._drawn_points = []
@@ -595,8 +612,8 @@ class BrightfieldView(QWidget):
         my = event.position().y()
         fit = self._fit_scale()
 
-        draw_w = self._pixmap.width()  * fit * self._zoom
-        draw_h = self._pixmap.height() * fit * self._zoom
+        draw_w = self._img_w  * fit * self._zoom
+        draw_h = self._img_h * fit * self._zoom
         ox = (self.width()  - draw_w) / 2 + self._offset.x()
         oy = (self.height() - draw_h) / 2 + self._offset.y()
 
@@ -604,8 +621,8 @@ class BrightfieldView(QWidget):
         img_y = (my - oy) / (fit * self._zoom)
 
         new_zoom = max(0.05, min(50.0, self._zoom * factor))
-        new_draw_w = self._pixmap.width()  * fit * new_zoom
-        new_draw_h = self._pixmap.height() * fit * new_zoom
+        new_draw_w = self._img_w  * fit * new_zoom
+        new_draw_h = self._img_h * fit * new_zoom
 
         new_ox = mx - img_x * fit * new_zoom
         new_oy = my - img_y * fit * new_zoom
@@ -641,5 +658,5 @@ class BrightfieldView(QWidget):
     def _fit_scale(self) -> float:
         if self._pixmap is None:
             return 1.0
-        return min(self.width() / max(1, self._pixmap.width()),
-                   self.height() / max(1, self._pixmap.height()))
+        return min(self.width() / max(1, self._img_w),
+                   self.height() / max(1, self._img_h))
