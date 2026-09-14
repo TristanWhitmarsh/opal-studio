@@ -1,12 +1,24 @@
 # Opal Studio
 
-<img src="screenshot.jpg" width="100%">
+<img src="https://raw.githubusercontent.com/TristanWhitmarsh/opal-studio/main/screenshot.jpg" width="100%">
 
 **Opal Studio** is a cross-platform viewer and analysis application for highly multiplexed imaging data, including Imaging Mass Cytometry (IMC), large OME-TIFF files, pyramid TIFF data, and SpatialData/Zarr V3 image directories.
 
 The application combines fast multi-channel image rendering with practical workflows for preprocessing, segmentation, mask refinement, cell positivity, phenotype gating, clustering, and export.
 
 ## Quick Start
+
+### Install From PyPI
+
+Opal Studio needs Python 3.9 or 3.10 (TensorFlow 2.8, used by Mesmer, is not built for
+newer versions).
+
+```bash
+conda create -n opal-env python=3.9
+conda activate opal-env
+pip install opal-studio
+opal-studio
+```
 
 ### Install From Source
 
@@ -36,8 +48,9 @@ On Windows this creates an `Opal Studio.lnk` shortcut on the desktop. On Linux i
 
 ### University Server / Darkroom Setup
 
-Opal Studio is deployed as a source checkout installed into a conda env (it is not
-published to PyPI). Install or update to the latest code with:
+On the server, Opal Studio is deployed as a source checkout installed into a conda env,
+so it can run the latest code rather than the last PyPI release. Install or update
+with:
 
 ```bash
 # 1) Get / update the code
@@ -100,7 +113,7 @@ export OPAL_STUDIO_MODELS=/home/tristan/Storage/scratch.space/opal-models
 
 To use a model you trained yourself, place its folder under
 `<models>/<engine>/<name>/` (for example `stardist/MyModel/`) and it will appear in
-that engine's model list. See [MODELS.md](MODELS.md) for every model, its source and
+that engine's model list. See [MODELS.md](https://github.com/TristanWhitmarsh/opal-studio/blob/main/MODELS.md) for every model, its source and
 its licence.
 
 ## Supported Data

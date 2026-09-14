@@ -9,35 +9,25 @@ import os
 import platform
 from pathlib import Path
 
+# The application icon ships in the package: icon.ico for Windows (window,
+# taskbar and desktop shortcut), logo.png everywhere else.
+_ROOT = Path(__file__).resolve().parent
+_ICON_ICO = _ROOT / "icon.ico"
+_ICON_PNG = _ROOT / "logo.png"
+
+
+def _icon_file() -> str:
+    """The icon file for this platform, or "" if neither is present."""
+    preferred = [_ICON_ICO, _ICON_PNG] if platform.system() == "Windows" else [_ICON_PNG, _ICON_ICO]
+    return next((str(p) for p in preferred if p.exists()), "")
+
+
 # Handle launcher creation BEFORE any GUI code
 if "--create-launcher" in sys.argv:
     try:
         print("[opal-studio] Creating launcher...")
-        
-        # Try to find icon and convert to .ico on Windows
-        icon_path = ""
-        try:
-            import opal_studio
-            pkg_dir = os.path.dirname(opal_studio.__file__)
-            png_path = os.path.join(pkg_dir, "icon.png")
-            ico_path = os.path.join(pkg_dir, "icon.ico")
-            
-            if os.path.exists(png_path):
-                if platform.system() == "Windows" and not os.path.exists(ico_path):
-                    try:
-                        from PySide6.QtGui import QImage
-                        img = QImage(png_path)
-                        if not img.isNull():
-                            img.save(ico_path, "ICO")
-                    except Exception as e:
-                        print(f"[opal-studio] Could not convert PNG to ICO: {e}")
-                
-                if platform.system() == "Windows" and os.path.exists(ico_path):
-                    icon_path = ico_path
-                else:
-                    icon_path = png_path
-        except ImportError:
-            pass
+
+        icon_path = _icon_file()
 
         if platform.system() == "Windows":
             import win32com.client
@@ -142,9 +132,21 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QFont, QIcon
 from opal_studio.main_window import MainWindow
 
-# Resolve icon path relative to this file
-_ROOT = Path(__file__).resolve().parent
-_ICON = _ROOT / "icon.png"
+
+def _set_windows_app_id():
+    """Give the process its own taskbar identity on Windows.
+
+    Without one, Windows groups the window under the executable that started it
+    — python.exe or pip's opal-studio.exe launcher — and shows that program's
+    icon in the taskbar instead of Opal Studio's.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpalStudio.OpalStudio")
+    except Exception:
+        pass
 
 
 def main():
@@ -156,12 +158,14 @@ def main():
     
     sys.excepthook = exception_hook
 
+    _set_windows_app_id()               # must happen before any window exists
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
     # Application icon
-    if _ICON.exists():
-        app.setWindowIcon(QIcon(str(_ICON)))
+    icon = _icon_file()
+    if icon:
+        app.setWindowIcon(QIcon(icon))
 
     # Use a clean sans-serif font
     font = QFont("Segoe UI", 10)  # Falls back to system default on Linux/macOS
@@ -169,8 +173,8 @@ def main():
 
     try:
         window = MainWindow()
-        if _ICON.exists():
-            window.setWindowIcon(QIcon(str(_ICON)))
+        if icon:
+            window.setWindowIcon(QIcon(icon))
         window.show()
         sys.exit(app.exec())
     except Exception:

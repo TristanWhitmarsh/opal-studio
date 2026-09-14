@@ -4,13 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opal-studio"
-version = "0.1.4"
-description = "Cross-platform IMC and H&E OME-TIFF image viewer"
+# The version is opal_studio.__version__ (opal_studio/__init__.py).
+dynamic = ["version"]
+description = "Cross-platform viewer and analysis application for multiplexed (IMC) and H&E OME-TIFF images"
+readme = "README.md"
 authors = [
-    {name = "Tristan"}
+    {name = "Tristan Whitmarsh", email = "tw401@cam.ac.uk"}
 ]
+# The full text is in LICENSE, which setuptools adds to the sdist and wheel. Kept in
+# the {text = ...} form rather than an SPDX expression (license = "LicenseRef-...",
+# license-files = [...]) because that needs setuptools>=77, and the runtime pin
+# below keeps setuptools<70 in the app's own environment, where
+# `pip install --no-build-isolation .` builds with it.
 license = {text = "MIT + Commons Clause"}
-requires-python = ">=3.9"
+# TensorFlow 2.8 (needed by DeepCell/Mesmer) is only built for Python 3.7-3.10.
+requires-python = ">=3.9,<3.11"
+keywords = ["imaging mass cytometry", "IMC", "multiplexed imaging", "H&E", "OME-TIFF",
+            "cell segmentation", "phenotyping", "microscopy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
 dependencies = [
     "PySide6==6.4.3",
     "tifffile==2024.8.30",
@@ -77,6 +99,15 @@ dependencies = [
 
 [project.scripts]
 opal-studio = "opal_studio.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/TristanWhitmarsh/opal-studio"
+Source = "https://github.com/TristanWhitmarsh/opal-studio"
+Issues = "https://github.com/TristanWhitmarsh/opal-studio/issues"
+Models = "https://github.com/TristanWhitmarsh/opal-studio/releases/tag/models-v1"
+
+[tool.setuptools.dynamic]
+version = {attr = "opal_studio.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["opal_studio*"]

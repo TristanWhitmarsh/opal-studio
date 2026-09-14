@@ -1,13 +1,10 @@
-graft .
-prune images
-prune models
+# What goes into the source distribution (sdist) uploaded to PyPI, beyond the
+# Python modules setuptools finds by itself. Listed explicitly — a blanket
+# `graft .` would also sweep in untracked working files (Projects/, notebooks,
+# model_weights.h5, model_release/) and the downloaded model weights.
+include README.md LICENSE MODELS.md requirements.txt
+recursive-include opal_studio *.png *.ico
+
+# Model weights are downloaded on first use and never shipped (see MODELS.md).
 prune opal_studio/models
-prune model_release
-prune build
-prune dist
-prune tests
-prune .git
-prune .claude
-prune .agents
-exclude screenshot.jpg
-global-exclude *.py[cod] __pycache__ *.so *.dylib .gitignore
+global-exclude *.py[cod] __pycache__
