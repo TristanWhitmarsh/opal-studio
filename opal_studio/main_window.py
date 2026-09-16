@@ -198,6 +198,7 @@ class MainWindow(QMainWindow):
     operationProgress = Signal(int, int)
     operationFinished = Signal(int)
     thresholdMeansReady = Signal(object, object, object, int, object)  # labels, cell_means dict, all_thresholds dict, mask_model_idx, cell_ids
+    contoursReady = Signal(object, object)  # label map, contour_data built from it
     clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
     clusteringDimReductionReady = Signal(object, object, object, object)  # tsne_coords, umap_coords, cluster_labels, cluster_colors
     clusteringMetricsReady = Signal(str)
@@ -212,6 +213,10 @@ class MainWindow(QMainWindow):
 
         # Data model
         self._channel_model = ChannelListModel()
+        # Mask outlines are built on demand and shared by every channel that
+        # uses the same label map (see _ensure_contours).
+        self._contour_cache: dict = {}        # id(labels) -> (weakref(labels), contour_data)
+        self._contour_pending: dict = {}      # id(labels) -> labels, while being built
         self._image: ImageData | None = None
         self._project_path: str | None = None   # current .zarr project file, if any
         self._spatialdata_collection = None
@@ -252,6 +257,7 @@ class MainWindow(QMainWindow):
         self.segmentationStatus.connect(lambda m: self._status.showMessage(m))
         self.operationFinished.connect(self._on_operation_complete)
         self.thresholdMeansReady.connect(self._on_threshold_means_ready)
+        self.contoursReady.connect(self._on_contours_ready)
         self.clusteringHeatmapReady.connect(self._on_clustering_heatmap_ready)
         self.clusterTypesIdentified.connect(self._on_cluster_types_identified)
         self.clusteringDimReductionReady.connect(self._on_dim_reduction_ready)
@@ -884,6 +890,12 @@ class MainWindow(QMainWindow):
         if not self._image: return
         
         ch = self._channel_model.selected_channel()
+        if ch and not ch.contour_data and self._contour_source(ch) is not None:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self._ensure_contours(ch, wait=True)
+            finally:
+                QApplication.restoreOverrideCursor()
         if not ch or not ch.contour_data:
             QMessageBox.warning(self, "Export Contours", "Please select a computed mask or cell channel with contours.")
             return
@@ -2156,7 +2168,7 @@ class MainWindow(QMainWindow):
                 if mask is None:
                     continue
                 common["mask_data"] = np.asarray(mask)
-                common["contour_data"] = self._get_contour_data(common["mask_data"])
+                # Outlines are built when first shown (see _ensure_contours below).
                 common["is_cell_mask"] = (kind == "cell_mask")
                 common["is_type_mask"] = (kind == "type_mask")
                 common["is_mask"] = (kind == "mask")
@@ -2177,6 +2189,9 @@ class MainWindow(QMainWindow):
 
         self._channel_model.set_channels(channels)
         self._canvas.set_image(img)
+        for ch in channels:
+            if ch.contour_visible:
+                self._ensure_contours(ch)
 
         # ── Slice controls (SpatialData multi-slice) ────────────────────────
         if collection is not None and len(collection) > 1:
@@ -2732,6 +2747,14 @@ class MainWindow(QMainWindow):
             try:
                 ch = self._channel_model.channel(target_mask_index)
                 if ch.mask_data is not None:
+                    # Label maps can be shared (positivity masks reuse their
+                    # cell mask's array; a loaded project shares identical maps).
+                    # Copy before editing so the other channels keep theirs.
+                    if any(o is not ch and (o.mask_data is ch.mask_data
+                                            or o.processed_data is ch.mask_data)
+                           for o in self._channel_model._channels):
+                        ch.mask_data = ch.mask_data.copy()
+                    self._contour_cache.pop(id(ch.mask_data), None)
                     ch.mask_data[y0:y1, x0:x1] = tile_labels
                     idx_qt = self._channel_model.index(target_mask_index)
                     self._channel_model.dataChanged.emit(idx_qt, idx_qt, [])
@@ -3033,9 +3056,9 @@ class MainWindow(QMainWindow):
                 proc = ctx.Process(target=run_positivity_task, args=(queue, params, {"labels": labels, "markers": markers}))
                 proc.start()
 
-                # The contours only depend on the mask, so build them while the
-                # worker is still loading the model.
-                contour_data = self._get_contour_data(labels)
+                # Outlines are built only when shown (_ensure_contours); reuse
+                # them if this mask already has some.
+                contour_data = self._cached_contours(labels)
                 max_id = int(np.max(labels))
                 mask_active = labels > 0
                 active_ids = labels[mask_active]
@@ -3289,6 +3312,11 @@ class MainWindow(QMainWindow):
         ch_color        = params["ch_color"]
         target_ch_idx   = params["target_ch_index"]  # -1 = not yet created
 
+        rows = self._channel_model.rowCount()
+        if not 0 <= mask_idx < rows or not 0 <= ch_model_idx < rows:
+            return                         # stale rows: the channels were replaced
+        if target_ch_idx >= rows:
+            target_ch_idx = -1
         mask_ch = self._channel_model.channel(mask_idx)
         labels  = mask_ch.mask_data
         if labels is None:
@@ -3357,7 +3385,9 @@ class MainWindow(QMainWindow):
         # marker — the positivity map is keyed by source_marker everywhere (lookup,
         # export, project save), and cell masks live in their own panel, so there
         # is no need to append a uniquifying "1" that collides with the marker name.
-        contour_data = self._get_contour_data(labels)   # One contour per cell ID
+        # Outlines are built only when shown (_ensure_contours); reuse them if
+        # this label map already has some.
+        contour_data = self._cached_contours(working_labels)
         new_name = ch_name
         new_ch = Channel(
             name=new_name,
@@ -3928,6 +3958,9 @@ class MainWindow(QMainWindow):
         from opal_studio.channel_model import ChannelListModel
         row = top_left.row()
         ch = self._channel_model.channel(row)
+        if (ch and ch.contour_visible and not ch.contour_data
+                and (not roles or ChannelListModel.ContourVisibleRole in roles)):
+            self._ensure_contours(ch)
         if not ch or not ch.is_type_mask:
             return
         if not roles or ChannelListModel.ColorRole in roles:
@@ -4087,6 +4120,77 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         super().closeEvent(event)
 
+    # ------------------------------------------------------------------
+    # On-demand mask outlines
+    # ------------------------------------------------------------------
+    # Mask fills are drawn from the label map; the vector outlines are only
+    # used by the outline overlay and contour export. Building them takes about
+    # a minute per ~1M cells, and a project can hold dozens of masks that share
+    # one label map (one positivity mask per marker), so they are built only
+    # when needed, once per label map, and shared by every channel using it.
+
+    @staticmethod
+    def _contour_source(ch):
+        """The label map a mask channel's outlines are built from."""
+        if not (ch.is_mask or ch.is_cell_mask or ch.is_type_mask):
+            return None
+        # Expanded masks keep their per-cell labels in processed_data.
+        if ch.processed_data is not None:
+            return ch.processed_data
+        return ch.mask_data
+
+    def _cached_contours(self, labels):
+        entry = self._contour_cache.get(id(labels))
+        if entry is not None and entry[0]() is labels:
+            return entry[1]
+        return None
+
+    def _ensure_contours(self, ch, wait: bool = False):
+        """Give ``ch`` its outlines, building them if no channel has them yet.
+
+        By default the build runs in the background and the channels are filled
+        in by _on_contours_ready (returns None meanwhile). ``wait`` builds on the
+        calling thread and returns the outlines.
+        """
+        if ch.contour_data:
+            return ch.contour_data
+        labels = self._contour_source(ch)
+        if labels is None:
+            return None
+        cached = self._cached_contours(labels)
+        if cached is None and wait:
+            cached = self._get_contour_data(labels)
+        if cached is not None:
+            self._on_contours_ready(labels, cached)
+            return cached
+        if id(labels) in self._contour_pending:
+            return None
+        self._contour_pending[id(labels)] = labels
+        self._status.showMessage(f"Building outlines for {ch.name}…")
+
+        def _build():
+            self.contoursReady.emit(labels, self._get_contour_data(labels))
+
+        threading.Thread(target=_build, daemon=True).start()
+        return None
+
+    @Slot(object, object)
+    def _on_contours_ready(self, labels, contour_data):
+        import weakref
+        self._contour_pending.pop(id(labels), None)
+        self._contour_cache = {k: v for k, v in self._contour_cache.items()
+                               if v[0]() is not None}
+        self._contour_cache[id(labels)] = (weakref.ref(labels), contour_data)
+        changed = False
+        for i in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(i)
+            if not ch.contour_data and self._contour_source(ch) is labels:
+                ch.contour_data = contour_data
+                changed = True
+        if changed:
+            self._channel_model.channels_changed.emit()
+            self._status.clearMessage()
+
     def _get_contour_data(self, labels: np.ndarray) -> dict:
         """Generate vector contours from a label image (Pre-cached as QPolygonF)."""
         try:
@@ -4106,15 +4210,13 @@ class MainWindow(QMainWindow):
                 if not cnts: continue
                 
                 polygons = []
+                offset = (loc[1].start + 0.5, loc[0].start + 0.5)   # (x, y)
                 for c in cnts:
                     if len(c) < 3: continue
-                    qpoly = QPolygonF()
-                    for pt in c:
-                        px, py = pt[0]
-                        # Offset back to original image space
-                        oy = loc[0].start + py + 0.5
-                        ox = loc[1].start + px + 0.5
-                        qpoly.append(QPointF(ox, oy))
+                    # Offset back to original image space. Building the polygon
+                    # from one list is ~10x faster than appending point by point.
+                    pts = (c.reshape(-1, 2) + offset).tolist()
+                    qpoly = QPolygonF([QPointF(x, y) for x, y in pts])
                     # Close the polygon
                     qpoly.append(qpoly.at(0))
                     polygons.append(qpoly)

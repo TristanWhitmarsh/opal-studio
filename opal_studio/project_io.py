@@ -46,9 +46,12 @@ Public API
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -61,6 +64,12 @@ try:
 except ImportError:  # pragma: no cover - numcodecs ships with the env
     _numcodecs = None
     _ZSTD = None
+
+# Aux arrays up to this many elements are written as a single chunk.
+_AUX_SINGLE_CHUNK = 64_000_000
+
+# Threads used to read and decode array chunks.
+_IO_WORKERS = min(32, (os.cpu_count() or 4) * 2)
 
 PROJECT_SCHEMA_VERSION = 2
 
@@ -168,7 +177,8 @@ def _array_meta(shape: tuple[int, ...], dtype: np.dtype,
     }
 
 
-def _write_v3_array(array_dir: Path, data: np.ndarray) -> dict:
+def _write_v3_array(array_dir: Path, data: np.ndarray,
+                    chunk: Optional[tuple[int, ...]] = None) -> dict:
     """Write *data* (any rank) as a Zarr V3 array; return its metadata dict."""
     if _ZSTD is None:
         raise RuntimeError("numcodecs is required to write Opal Studio projects")
@@ -176,7 +186,8 @@ def _write_v3_array(array_dir: Path, data: np.ndarray) -> dict:
     dt = data.dtype.newbyteorder("<")            # force little-endian on disk
     data = np.ascontiguousarray(data, dtype=dt)
     shape = data.shape
-    chunk = _pick_chunks(shape)
+    if chunk is None:
+        chunk = _pick_chunks(shape)
     meta = _array_meta(shape, data.dtype, chunk)
 
     array_dir.mkdir(parents=True, exist_ok=True)
@@ -203,33 +214,73 @@ def _write_v3_array(array_dir: Path, data: np.ndarray) -> dict:
     return meta
 
 
-def _read_v3_array(array_dir: Path) -> np.ndarray:
-    """Read a Zarr V3 array written by :func:`_write_v3_array` into memory."""
+def _read_v3_array(array_dir: Path, shared: Optional[dict] = None) -> np.ndarray:
+    """Read a Zarr V3 array written by :func:`_write_v3_array` into memory.
+
+    ``shared`` maps a digest of the stored bytes to an already-read array. When
+    given, an array whose shape, dtype and compressed chunks match one read
+    earlier is returned as that same object, without decompressing it again.
+    Projects store every positivity mask as its own copy of one label map, so
+    this keeps a single copy in memory instead of one per marker.
+    """
     meta = json.loads((array_dir / "zarr.json").read_text())
     shape = tuple(meta["shape"])
     dtype = np.dtype(meta["data_type"]).newbyteorder("<")
     chunk = tuple(meta["chunk_grid"]["configuration"]["chunk_shape"])
 
-    out = np.zeros(shape, dtype=dtype)
     n_chunks = [(shape[d] + chunk[d] - 1) // chunk[d] for d in range(len(shape))]
-    full_size = int(np.prod(chunk))
-    for idx in itertools.product(*[range(n) for n in n_chunks]):
-        chunk_path = array_dir.joinpath("c", *map(str, idx))
-        if not chunk_path.exists():
-            continue                              # implicit fill_value (0)
-        raw = _ZSTD.decode(chunk_path.read_bytes())
-        slices = tuple(slice(idx[d] * chunk[d], min((idx[d] + 1) * chunk[d], shape[d]))
-                       for d in range(len(shape)))
-        block_shape = tuple(s.stop - s.start for s in slices)
-        vals = np.frombuffer(raw, dtype=dtype)
-        if vals.size == full_size:
-            # Spec-compliant full chunk: reshape then trim to the valid region.
-            block = vals.reshape(chunk)[tuple(slice(0, b) for b in block_shape)]
-        else:
-            # Legacy clipped edge chunk (older opal-studio stores).
-            block = vals.reshape(block_shape)
-        out[slices] = block
-    return out.astype(out.dtype.newbyteorder("="), copy=False)
+    indices = list(itertools.product(*[range(n) for n in n_chunks]))
+
+    def _load(idx):
+        # A missing chunk is the implicit fill_value (0).
+        try:
+            data = array_dir.joinpath("c", *map(str, idx)).read_bytes()
+        except FileNotFoundError:
+            return None
+        if shared is None:
+            return data, None
+        return data, hashlib.blake2b(data, digest_size=32).digest()
+
+    # File opens dominate on Windows (thousands of small chunk files), and file
+    # I/O, hashing and zstd decoding all release the GIL, so run them in threads.
+    with ThreadPoolExecutor(max_workers=_IO_WORKERS) as pool:
+        loaded = list(pool.map(_load, indices))
+        stored = [(idx, item) for idx, item in zip(indices, loaded) if item is not None]
+
+        digest = None
+        if shared is not None:
+            h = hashlib.blake2b(digest_size=32)
+            h.update(repr((shape, dtype.str, chunk)).encode())
+            for idx, (_, chunk_digest) in stored:
+                h.update(repr(idx).encode())
+                h.update(chunk_digest)
+            digest = h.digest()
+            if digest in shared:
+                return shared[digest]
+
+        out = np.zeros(shape, dtype=dtype)
+        full_size = int(np.prod(chunk))
+
+        def _decode(entry):
+            idx, (data, _) = entry
+            raw = _ZSTD.decode(data)
+            slices = tuple(slice(idx[d] * chunk[d], min((idx[d] + 1) * chunk[d], shape[d]))
+                           for d in range(len(shape)))
+            block_shape = tuple(s.stop - s.start for s in slices)
+            vals = np.frombuffer(raw, dtype=dtype)
+            if vals.size == full_size:
+                # Spec-compliant full chunk: reshape then trim to the valid region.
+                block = vals.reshape(chunk)[tuple(slice(0, b) for b in block_shape)]
+            else:
+                # Legacy clipped edge chunk (older opal-studio stores).
+                block = vals.reshape(block_shape)
+            out[slices] = block          # chunks never overlap
+
+        list(pool.map(_decode, stored))
+    out = out.astype(out.dtype.newbyteorder("="), copy=False)
+    if digest is not None:
+        shared[digest] = out
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -623,7 +674,11 @@ def save_project(store_path: str | Path, doc: ProjectDocument) -> None:
             arr = np.asarray(arr)
             orig_shape = list(arr.shape)
             elem = aux_dir / _safe_dirname(key, used)
-            _write_v3_array(elem, _to_3d(arr))
+            arr3 = _to_3d(arr)
+            # Aux arrays are Opal-private, not rasters: store small ones (e.g. a
+            # per-cell LUT) as one chunk rather than hundreds of 1024-value files.
+            one_chunk = tuple(max(s, 1) for s in arr3.shape) if arr3.size <= _AUX_SINGLE_CHUNK else None
+            _write_v3_array(elem, arr3, chunk=one_chunk)
             meta_path = elem / "zarr.json"
             meta = json.loads(meta_path.read_text())
             meta["attributes"]["opal_orig_shape"] = orig_shape
@@ -686,14 +741,21 @@ def load_project(store_path: str | Path) -> ProjectDocument:
             }
 
     # ── Labels ──────────────────────────────────────────────────────────────
+    # Identical label maps (every positivity mask stores the same cell labels)
+    # come back as one shared array object. Code that edits a mask in place
+    # must copy it first if another channel uses the same array.
     labels_dir = store_path / "labels"
+    shared_labels: dict = {}
+    label_views: dict = {}     # id(array) -> the 2-D map, so shared maps stay one object
     if labels_dir.is_dir():
         for elem in sorted(labels_dir.iterdir()):
             if not (elem / "0" / "zarr.json").exists():
                 continue
             key = _read_element_key(elem / "zarr.json", elem.name)
-            arr = _read_v3_array(elem / "0")
-            doc.labels[key] = arr[0] if arr.ndim == 3 else arr
+            arr = _read_v3_array(elem / "0", shared=shared_labels)
+            if id(arr) not in label_views:
+                label_views[id(arr)] = arr[0] if arr.ndim == 3 else arr
+            doc.labels[key] = label_views[id(arr)]
 
     # ── Shapes ──────────────────────────────────────────────────────────────
     shapes_dir = store_path / "shapes"

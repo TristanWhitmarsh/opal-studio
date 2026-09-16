@@ -1680,13 +1680,52 @@ class ThresholdPositivityTab(QWidget):
 
         self._refresh_masks()
         self._channel_model.modelReset.connect(self._refresh_masks)
+        self._channel_model.modelReset.connect(self._clear_computed)
         self._channel_model.rowsInserted.connect(lambda: self._refresh_masks())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_masks())
+        self._channel_model.rowsRemoved.connect(self._on_rows_removed)
         self._channel_model.dataChanged.connect(self._on_model_data_changed)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _clear_computed(self):
+        """Drop the computed means. They refer to channels by model row, and the
+        rows no longer exist once the model is reset (e.g. a project or image
+        was loaded), so a later slider move would address the wrong channel."""
+        self._cell_means = {}
+        self._labels = None
+        self._cell_ids = None
+        self._mask_model_index = -1
+        self._thresholds = {}
+        self._generated_ch_indices = {}
+        self._controls.setVisible(False)
+
+    def _on_rows_removed(self, _parent, first: int, last: int):
+        """Keep the stored model rows pointing at the same channels after rows
+        are removed (a channel deleted, old type masks cleared by clustering)."""
+        if self._labels is None:
+            return
+        n = last - first + 1
+
+        def shift(row: int):
+            if first <= row <= last:
+                return None
+            return row - n if row > last else row
+
+        mask_row = shift(self._mask_model_index)
+        if mask_row is None:          # the mask the means came from is gone
+            self._clear_computed()
+            return
+        self._mask_model_index = mask_row
+        self._cell_means = {shift(k): v for k, v in self._cell_means.items()
+                            if shift(k) is not None}
+        self._thresholds = {shift(k): v for k, v in self._thresholds.items()
+                            if shift(k) is not None}
+        self._generated_ch_indices = {
+            shift(k): shift(v) for k, v in self._generated_ch_indices.items()
+            if shift(k) is not None and shift(v) is not None}
 
     def _refresh_masks(self):
         current = self._mask_combo.currentText()
