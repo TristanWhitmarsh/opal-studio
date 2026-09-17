@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import os
+import math
 import threading
 import multiprocessing
 from pathlib import Path
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QApplication, QScrollBar, QLabel
 )
 
+from opal_studio.cell_area import PolygonArea, cells_in_area, label_centroids
 from opal_studio.channel_model import Channel, ChannelListModel
 from opal_studio.image_loader import (
     ImageData, open_image, open_spatialdata_collection,
@@ -82,6 +84,38 @@ DECONVOLUTION_DISPLAY_MAX = 0.25
 # full resolution in one go. A whole-slide scan is orders of magnitude bigger;
 # above this the run stops and points at the region modes instead.
 BRIGHTFIELD_MAX_MEGAPIXELS = 120.0
+
+# A channel's display range runs between these intensity percentiles. IMC
+# channels are mostly zero or near it and carry saturated hot pixels, so the
+# maximum (a hot pixel) renders almost black and a low percentile renders every
+# cell at full brightness; the 99.9th percentile clips only the brightest pixels.
+DISPLAY_PERCENTILES = (1.0, 99.9)
+
+# Pixels a pyramid level needs before its percentiles are used for the range.
+DISPLAY_RANGE_MIN_PIXELS = 2_000_000
+
+
+def display_range(data: np.ndarray) -> tuple[float, float]:
+    """(data_min, data_max) for rendering a channel: its DISPLAY_PERCENTILES.
+
+    Very large arrays are subsampled first. When almost every pixel is at the
+    lower value (a near-empty channel), the upper end comes from the pixels
+    above it, so its few signal pixels still show.
+    """
+    values = np.asarray(data)
+    if values.size > 4 * DISPLAY_RANGE_MIN_PIXELS and values.ndim >= 2:
+        step = int(np.ceil(np.sqrt(values.size / (4 * DISPLAY_RANGE_MIN_PIXELS))))
+        values = values[::step, ::step]
+    values = values.ravel()
+    if np.issubdtype(values.dtype, np.floating):
+        values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0, 1.0
+    low, high = (float(v) for v in np.percentile(values, DISPLAY_PERCENTILES))
+    if high <= low:
+        above = values[values > low]
+        high = float(np.percentile(above, DISPLAY_PERCENTILES[1])) if above.size else low + 1.0
+    return low, high
 
 
 def project_io_unique(existing: dict, name: str) -> str:
@@ -707,9 +741,10 @@ class MainWindow(QMainWindow):
             else:
                 from opal_studio.channel_model import generate_spaced_colors
                 palette = generate_spaced_colors(len(img.channel_names))
+                ranges = self._channel_display_ranges(img, range(len(img.channel_names)))
                 channels = []
                 for i, name in enumerate(img.channel_names):
-                    dmin, dmax = self._quick_percentile_range(img, i)
+                    dmin, dmax = ranges[i]
                     rgb = palette[i]
                     channels.append(Channel(
                         name=name, color=QColor(*rgb),
@@ -1276,15 +1311,35 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _quick_percentile_range(img: ImageData, channel: int) -> tuple[float, float]:
-        if not img.levels: return 0.0, 1.0
-        coarsest = img.levels[-1]
-        h, w = _get_yx(coarsest.shape, img.axes, img.is_rgb)
+        """Display range (data_min, data_max) of one image channel.
+
+        Read from the smallest pyramid level with enough pixels for the upper
+        percentile to be reliable (the levels are subsampled, so their intensity
+        distribution matches full resolution), falling back to the finest level.
+        """
+        if not img.levels:
+            return 0.0, 1.0
+        level = img.levels[0]
+        for candidate in reversed(img.levels):
+            h, w = _get_yx(candidate.shape, img.axes, img.is_rgb)
+            if h * w >= DISPLAY_RANGE_MIN_PIXELS:
+                level = candidate
+                break
+        h, w = _get_yx(level.shape, img.axes, img.is_rgb)
         try:
-            data = get_tile(img, coarsest.index, channel, slice(0, h), slice(0, w))
-            low, high = np.percentile(data, (5, 95))
-            if high <= low: return float(np.min(data)), float(np.max(data))
-            return float(low), float(high)
-        except: return 0.0, 1.0
+            data = get_tile(img, level.index, channel, slice(0, h), slice(0, w))
+            return display_range(data)
+        except Exception:
+            import traceback; traceback.print_exc()
+            return 0.0, 1.0
+
+    @classmethod
+    def _channel_display_ranges(cls, img: ImageData, channels) -> dict:
+        """{channel index: display range} for several channels, read in parallel."""
+        from concurrent.futures import ThreadPoolExecutor
+        channels = list(channels)
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(channels)))) as pool:
+            return dict(zip(channels, pool.map(lambda c: cls._quick_percentile_range(img, c), channels)))
 
     # ------------------------------------------------------------------
     # Pre-processing
@@ -1407,8 +1462,9 @@ class MainWindow(QMainWindow):
                         # 4. Rescale back to original intensity range
                         x = x * diff + p_low_val
                 
-                # Use full range for pre-processed image rendering
-                data_min, data_max = float(np.min(x)), float(np.max(x))
+                # Same display range as an image channel; a full min-max range
+                # is set by the odd hot pixel and renders the result almost black.
+                data_min, data_max = display_range(x)
                 
                 self.preprocessingResultReady.emit(original_name, suffix, x, data_min, data_max)
             except Exception as e:
@@ -2139,6 +2195,19 @@ class MainWindow(QMainWindow):
 
         # ── Rebuild channels from saved display state + element arrays ──────
         derived = doc.images.get("derived", {}).get("data")
+        # Display ranges are derived from the data, not chosen by the user (the
+        # limits slider stores range_min/range_max), so they are recomputed rather
+        # than trusting the saved ones — projects saved before the percentile
+        # range carry values that render IMC channels binary or black.
+        # SpatialData keeps its own per-chunk ranges, as when it is opened.
+        image_ranges = {}
+        if backend != "spatialdata":
+            wanted = sorted({int(e.get("index", -1)) for e in doc.session.get("channels", [])
+                             if e.get("kind", "original") == "original"
+                             and 0 <= int(e.get("index", -1)) < len(img.channel_names)})
+            self._status.showMessage("Computing channel display ranges…")
+            QApplication.processEvents()
+            image_ranges = self._channel_display_ranges(img, wanted)
         channels: list = []
         for entry in doc.session.get("channels", []):
             kind = entry.get("kind", "original")
@@ -2159,9 +2228,12 @@ class MainWindow(QMainWindow):
                 index=int(entry.get("index", -1)),
             )
 
+            if kind == "original" and common["index"] in image_ranges:
+                common["data_min"], common["data_max"] = image_ranges[common["index"]]
             if kind == "derived" and derived is not None and ref_:
                 common["is_processed"] = True
                 common["processed_data"] = derived[int(ref_[1])]
+                common["data_min"], common["data_max"] = display_range(common["processed_data"])
             elif kind in ("cell_mask", "mask", "type_mask") and ref_:
                 key = ref_[1]
                 mask = doc.labels.get(key)
@@ -2289,6 +2361,30 @@ class MainWindow(QMainWindow):
     # Segmentation
     # ------------------------------------------------------------------
 
+    def _region_polygons(self, region_mode: str, region_ch=None) -> list:
+        """Outlines for the region area modes, as point lists in image coordinates.
+
+        "selected_region" takes every outline of ``region_ch``; "regions" every
+        outline of every region channel. Raises ValueError when there are none.
+        Reads Qt polygons, so call it on the main thread or with the model idle.
+        """
+        chs = ([region_ch] if region_mode == "selected_region"
+               else [ch for ch in self._channel_model._channels if getattr(ch, "is_region", False)])
+        polygons = []
+        for ch in chs:
+            if ch is None:
+                continue
+            for entry in (ch.contour_data or {}).values():
+                for poly in entry.get("polygons", []):
+                    pts = [(pt.x(), pt.y()) for pt in poly]
+                    if len(pts) >= 3:
+                        polygons.append(pts)
+        if not polygons:
+            raise ValueError("The selected region has no polygon data."
+                             if region_mode == "selected_region"
+                             else "There are no regions with polygon data.")
+        return polygons
+
     def _start_segmentation(self, params: dict):
         if not self._image: return
         if hasattr(self, "_segmentation_thread") and self._segmentation_thread.is_alive():
@@ -2324,30 +2420,22 @@ class MainWindow(QMainWindow):
                 v_top, v_bottom, v_left, v_right = 0, 0, 0, 0
                 full_shape = None
 
-                # ---- Selected region: resolve bounding box and polygon --------
-                region_polygon = None   # QPolygonF
+                # ---- Region modes: resolve polygons and their bounding box ----
+                # "selected_region" segments inside the selected region;
+                # "regions" inside every region at once, in one run over the
+                # box that holds them all. Either way only cells whose centroid
+                # falls inside a polygon are kept.
+                polygon_mode = region_mode in ("selected_region", "regions")
+                region_polygons = []    # [[(x, y), ...], ...] in image coordinates
                 r_top = r_bottom = r_left = r_right = 0
-                if region_mode == "selected_region":
-                    region_ch_idx = params.get("region_channel_index")
-                    if region_ch_idx is None:
-                        raise ValueError("No region channel index provided for 'selected_region' mode.")
-                    region_ch = self._channel_model.channel(region_ch_idx)
-                    if not region_ch.contour_data:
-                        raise ValueError("The selected region has no polygon data.")
-                    # Region channels store their polygon in contour_data[1]["polygons"][0]
-                    first_entry = region_ch.contour_data.get(1, {})
-                    polys = first_entry.get("polygons", [])
-                    if not polys:
-                        raise ValueError("The selected region polygon is empty.")
-                    region_polygon = polys[0]
-                    bbox = first_entry.get("bbox")  # [y0, x0, y1, x1]
-                    if bbox:
-                        r_top, r_left, r_bottom, r_right = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                    else:
-                        xs = [region_polygon.at(i).x() for i in range(region_polygon.count())]
-                        ys = [region_polygon.at(i).y() for i in range(region_polygon.count())]
-                        r_top, r_bottom = int(min(ys)), int(max(ys))
-                        r_left, r_right = int(min(xs)), int(max(xs))
+                if polygon_mode:
+                    region_polygons = self._region_polygons(
+                        region_mode, self._channel_model.channel(params["region_channel_index"])
+                        if region_mode == "selected_region" else None)
+                    all_x = [p[0] for pts in region_polygons for p in pts]
+                    all_y = [p[1] for pts in region_polygons for p in pts]
+                    r_top, r_bottom = int(math.floor(min(all_y))), int(math.ceil(max(all_y)))
+                    r_left, r_right = int(math.floor(min(all_x))), int(math.ceil(max(all_x)))
                 
                 # ---- Brightfield / H&E ----------------------------------------
                 # Two things read from the RGB scan rather than from a stored
@@ -2378,11 +2466,11 @@ class MainWindow(QMainWindow):
                         if v_top >= v_bottom or v_left >= v_right:
                             raise ValueError("Visible region is completely outside the image.")
                         y0, y1, x0, x1 = v_top, v_bottom, v_left, v_right
-                    elif region_mode == "selected_region":
+                    elif polygon_mode:
                         r_top, r_left = int(max(0, r_top)), int(max(0, r_left))
                         r_bottom, r_right = int(min(bh, r_bottom)), int(min(bw, r_right))
                         if r_top >= r_bottom or r_left >= r_right:
-                            raise ValueError("Selected region bounding box is outside the image.")
+                            raise ValueError("The region bounding box is outside the image.")
                         y0, y1, x0, x1 = r_top, r_bottom, r_left, r_right
                     else:
                         y0, y1, x0, x1 = 0, bh, 0, bw
@@ -2396,8 +2484,8 @@ class MainWindow(QMainWindow):
                         raise ValueError(
                             f"The requested area is {megapixels:.0f} megapixels, over the "
                             f"{BRIGHTFIELD_MAX_MEGAPIXELS:.0f} MP limit for one run. "
-                            f"Segment a part of the slide instead — choose 'Visible region' "
-                            f"and zoom in, or draw a region and choose 'Selected region'.")
+                            f"Segment a part of the slide instead — choose 'Visible' "
+                            f"and zoom in, or draw a region and choose 'Region'.")
 
                     print(f"[Segmentation] Brightfield RGB crop "
                           f"y[{y0}:{y1}] x[{x0}:{x1}] ({megapixels:.1f} MP) at level 0")
@@ -2452,13 +2540,13 @@ class MainWindow(QMainWindow):
                         if v_top >= v_bottom or v_left >= v_right:
                             raise ValueError("Visible region is completely outside the image.")
                         raw = raw[v_top:v_bottom, v_left:v_right]
-                    elif region_mode == "selected_region":
+                    elif polygon_mode:
                         r_top = int(max(0, r_top))
                         r_left = int(max(0, r_left))
                         r_bottom = int(min(full_shape[0], r_bottom))
                         r_right = int(min(full_shape[1], r_right))
                         if r_top >= r_bottom or r_left >= r_right:
-                            raise ValueError("Selected region bounding box is outside the image.")
+                            raise ValueError("The region bounding box is outside the image.")
                         raw = raw[r_top:r_bottom, r_left:r_right]
 
                     # Normalize for deep learning models to prevent NMS hangs or junk results
@@ -2472,39 +2560,19 @@ class MainWindow(QMainWindow):
                     input_channels_data.append(data)
                     x = data if x is None else x + data
                 
-                def _cell_centroid_in_polygon(labels_crop, poly, offset_y, offset_x):
-                    """
-                    Keep only cells whose centroid (in full-image coords) lies inside `poly`.
-                    Returns a filtered label array (same shape as labels_crop).
-                    """
-                    from scipy.ndimage import find_objects
-                    from PySide6.QtCore import QPointF, Qt
+                region_area = PolygonArea(region_polygons) if polygon_mode else None
 
-                    cell_ids = np.unique(labels_crop)
-                    cell_ids = cell_ids[cell_ids > 0]
-                    if len(cell_ids) == 0:
+                def _keep_cells_in_regions(labels_crop, offset_y, offset_x):
+                    """Zero every cell whose centroid is outside the region polygons."""
+                    if labels_crop.max() <= 0:
                         return labels_crop
-
-                    locs = find_objects(labels_crop)
-                    ids_to_keep = []
-                    for cell_id in cell_ids:
-                        loc = locs[cell_id - 1]
-                        if loc is None:
-                            continue
-                        binary = (labels_crop[loc] == cell_id)
-                        ys, xs = np.where(binary)
-                        if len(ys) == 0:
-                            continue
-                        cy = float(np.mean(ys)) + loc[0].start + offset_y
-                        cx = float(np.mean(xs)) + loc[1].start + offset_x
-                        if poly.containsPoint(QPointF(cx, cy), Qt.FillRule.OddEvenFill):
-                            ids_to_keep.append(cell_id)
-
-                    if len(ids_to_keep) == len(cell_ids):
+                    ids, cy, cx = label_centroids(labels_crop)
+                    inside = region_area.contains(cy + offset_y, cx + offset_x)
+                    if inside.all():
                         return labels_crop
-                    keep_set = set(ids_to_keep)
-                    mask_keep = np.vectorize(lambda v: v if v in keep_set else 0)(labels_crop).astype(labels_crop.dtype)
-                    return mask_keep
+                    lut = np.zeros(int(labels_crop.max()) + 1, dtype=labels_crop.dtype)
+                    lut[ids[inside]] = ids[inside]
+                    return lut[labels_crop]
 
                 def process_and_emit(out_labels, out_name, out_is_cell):
                     if out_labels is None: return
@@ -2552,35 +2620,21 @@ class MainWindow(QMainWindow):
                             full_labels[v_top:v_bottom, v_left:v_right] = out_labels
                             final_labels = full_labels
 
-                    elif region_mode == "selected_region":
-                        from PySide6.QtCore import Qt
-                        # Filter: keep only cells whose centroid is inside the polygon
-                        if out_labels.max() > 0 and region_polygon is not None:
-                            out_labels = _cell_centroid_in_polygon(out_labels, region_polygon, r_top, r_left)
+                    elif polygon_mode:
+                        # Keep only cells whose centroid is inside a region polygon
+                        out_labels = _keep_cells_in_regions(out_labels, r_top, r_left)
+
+                        if existing_labels is not None and existing_labels.max() > 0:
+                            # Remove existing cells whose centroids are inside the regions
+                            ids, cy, cx = label_centroids(existing_labels)
+                            inside = region_area.contains(cy, cx)
+                            if inside.any():
+                                lut = np.arange(int(existing_labels.max()) + 1,
+                                                dtype=existing_labels.dtype)
+                                lut[ids[inside]] = 0
+                                existing_labels = lut[existing_labels]
 
                         if existing_labels is not None:
-                            # Remove existing cells whose centroids are inside the region polygon
-                            if region_polygon is not None:
-                                from PySide6.QtCore import QPointF
-                                from scipy.ndimage import find_objects
-                                locs = find_objects(existing_labels)
-                                ids_in_region = []
-                                for cell_id_m1, loc in enumerate(locs):
-                                    if loc is None:
-                                        continue
-                                    cell_id = cell_id_m1 + 1
-                                    binary = (existing_labels[loc] == cell_id)
-                                    ys, xs = np.where(binary)
-                                    if len(ys) == 0:
-                                        continue
-                                    cy = float(np.mean(ys)) + loc[0].start
-                                    cx = float(np.mean(xs)) + loc[1].start
-                                    if region_polygon.containsPoint(QPointF(cx, cy), Qt.FillRule.OddEvenFill):
-                                        ids_in_region.append(cell_id)
-                                if ids_in_region:
-                                    mask_remove = np.isin(existing_labels, ids_in_region)
-                                    existing_labels[mask_remove] = 0
-
                             # Merge new detections into existing mask
                             if out_labels.max() > 0:
                                 max_id = existing_labels.max()
@@ -2665,8 +2719,8 @@ class MainWindow(QMainWindow):
 
                     worker_params = params.copy()
                     worker_params["override_name"] = override_name
-                    worker_params["crop_offset_y"] = v_top if region_mode == "visible" else (r_top if region_mode == "selected_region" else 0)
-                    worker_params["crop_offset_x"] = v_left if region_mode == "visible" else (r_left if region_mode == "selected_region" else 0)
+                    worker_params["crop_offset_y"] = v_top if region_mode == "visible" else (r_top if polygon_mode else 0)
+                    worker_params["crop_offset_x"] = v_left if region_mode == "visible" else (r_left if polygon_mode else 0)
                     worker_params["full_shape"] = list(full_shape) if full_shape is not None else None
                     worker_params["target_mode"] = target_mode
                     worker_params["target_mask_index"] = target_mask_index
@@ -2998,17 +3052,73 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _clear_positivity_maps(self) -> int:
+        """Remove every positivity map (the channels listed in the Positivity tab).
+
+        A positivity run replaces the whole set, so clearing it first means the
+        maps that appear are the ones this run produced.
+        """
+        removed = 0
+        for i in range(self._channel_model.rowCount() - 1, -1, -1):
+            if self._channel_model.channel(i).is_cell_mask:
+                self._channel_model.remove_channel(i)
+                removed += 1
+        return removed
+
+    def _positivity_area(self, params: dict) -> dict:
+        """Resolve a positivity run's area on the main thread.
+
+        Returns {"mode", "viewport", "polygons"} for cells_in_area: the viewport as
+        (left, top, right, bottom) and the region outlines as plain point lists,
+        so the worker thread never touches the canvas or Qt polygons. Raises
+        ValueError when the area cannot be used.
+        """
+        mode = params.get("region_mode", "full")
+        area = {"mode": mode, "viewport": None, "polygons": None}
+        if mode == "visible":
+            vp = self._active_canvas()._viewport
+            area["viewport"] = (vp.left(), vp.top(), vp.right(), vp.bottom())
+        elif mode in ("selected_region", "regions"):
+            region_ch = (self._channel_model.channel(params["region_channel_index"])
+                         if mode == "selected_region" else None)
+            area["polygons"] = self._region_polygons(mode, region_ch)
+        return area
+
+    _AREA_NAMES = {"full": "the image", "visible": "the visible area",
+                   "selected_region": "the selected region", "regions": "the regions"}
+
+    def _start_positivity(self, params: dict):
+        """Common start of both positivity runs: resolve the mask and the area,
+        then clear the existing positivity maps. Returns (mask_ch, area), or None
+        after reporting why the run cannot start."""
+        mask_ch = self._channel_model.channel(params["mask_index"])
+        if mask_ch is None or mask_ch.mask_data is None:
+            self._ops_panel.stop_loading()
+            return None
+        try:
+            area = self._positivity_area(params)
+        except ValueError as e:
+            self._ops_panel.stop_loading()
+            QMessageBox.warning(self, "Cell positivity", str(e))
+            return None
+        # The positivity tab offers plain masks only, so the chosen mask is never
+        # one of the maps removed here; rows shift, so it is held by object.
+        self._clear_positivity_maps()
+        return mask_ch, area
+
     @Slot(dict)
     def _run_cell_positivity(self, params):
         if not self._image: return
-        mask_idx = params["mask_index"]
-        original_mask_ch = self._channel_model.channel(mask_idx)
-        labels = original_mask_ch.mask_data
-        if labels is None:
-            self._ops_panel.stop_loading()
+        started = self._start_positivity(params)
+        if started is None:
             return
+        original_mask_ch, area = started
+        self._ops_panel._thresh_tab._clear_computed()   # its slider drove the maps just removed
+        labels = original_mask_ch.mask_data
 
         def _run():
+            shm_blocks = []      # shared-memory blocks handed to the worker
+            markers = shared_labels = None
             try:
                 from queue import Empty
 
@@ -3040,28 +3150,75 @@ class MainWindow(QMainWindow):
 
                 S = len(target_channels)
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
-                markers = np.zeros((h, w, S), dtype=np.float32)
-                for z, ch in enumerate(target_channels):
-                    data = self._image.get_full_channel_data(ch.index, level=0).astype(np.float32)
 
-                    dh, dw = data.shape[:2]
-                    copy_h = min(h, dh)
-                    copy_w = min(w, dw)
-                    markers[:copy_h, :copy_w, z] = data[:copy_h, :copy_w]
+                # Only the cells in the chosen area are classified. The worker
+                # gets the box around them plus a margin wider than the model's
+                # crop, so every cell sees the same surroundings as in a
+                # full-image run; cells outside the area stay unclassified.
+                area_ids, box = cells_in_area(labels, area["mode"],
+                                              area["viewport"], area["polygons"])
+                if box is None:
+                    raise ValueError(f"No cells of {original_mask_ch.name} are in "
+                                     f"{self._AREA_NAMES.get(area['mode'], 'the area')}.")
+                margin = 128
+                lh, lw = min(h, labels.shape[0]), min(w, labels.shape[1])
+                y0, y1 = max(0, box[0] - margin), min(lh, box[1] + margin)
+                x0, x1 = max(0, box[2] - margin), min(lw, box[3] + margin)
+                if area["mode"] != "full":
+                    params["cell_ids"] = area_ids.astype(np.int32)
+                print(f"[AI] {len(area_ids)} cells in {self._AREA_NAMES.get(area['mode'])}, "
+                      f"box y[{y0}:{y1}] x[{x0}:{x1}]")
+                h, w = y1 - y0, x1 - x0
+
+                # The marker stack and label map go to the worker through shared
+                # memory: pickling them through the spawn pipe fails on Windows
+                # for large images (50 channels of a whole slide is tens of GB).
+                # Markers keep the image's own integer type when it has one (the
+                # worker casts each crop to float32, so the values are unchanged)
+                # instead of doubling the stack to float32 up front.
+                from multiprocessing import shared_memory
+                img_dtype = np.dtype(self._image.dtype)
+                marker_dtype = (img_dtype if img_dtype.kind in "ui" and img_dtype.itemsize <= 2
+                                else np.dtype(np.float32))
+
+                def _shared_array(shape, dtype):
+                    dtype = np.dtype(dtype)
+                    # math.prod, not np.prod: numpy's default int is 32-bit on
+                    # Windows and overflows for a whole-slide stack.
+                    nbytes = max(1, math.prod(int(s) for s in shape) * dtype.itemsize)
+                    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+                    shm_blocks.append(shm)
+                    arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+                    ref = {"name": shm.name, "shape": list(shape), "dtype": dtype.str}
+                    return arr, ref
+
+                markers, markers_ref = _shared_array((h, w, S), marker_dtype)
+                markers[...] = 0
+                for z, ch in enumerate(target_channels):
+                    data = self._image.get_full_channel_data(ch.index, level=0)
+                    if not np.can_cast(data.dtype, marker_dtype, casting="safe"):
+                        raise ValueError(
+                            f"Channel {ch.name} is {data.dtype}, expected {marker_dtype}")
+                    part = data[y0:y1, x0:x1]
+                    markers[:part.shape[0], :part.shape[1], z] = part
+                    data = part = None
+
+                shared_labels, labels_ref = _shared_array((h, w), np.int32)
+                shared_labels[...] = labels[y0:y1, x0:x1]
+                markers = shared_labels = None   # the worker reads its own views
 
                 # Run in worker process
                 ctx = multiprocessing.get_context("spawn")
                 queue = multiprocessing.Queue()
-                
-                proc = ctx.Process(target=run_positivity_task, args=(queue, params, {"labels": labels, "markers": markers}))
+
+                proc = ctx.Process(target=run_positivity_task,
+                                   args=(queue, params, {"labels": labels_ref, "markers": markers_ref}))
                 proc.start()
 
                 # Outlines are built only when shown (_ensure_contours); reuse
                 # them if this mask already has some.
                 contour_data = self._cached_contours(labels)
                 max_id = int(np.max(labels))
-                mask_active = labels > 0
-                active_ids = labels[mask_active]
 
                 self.operationProgress.emit(0, S)
 
@@ -3095,10 +3252,12 @@ class MainWindow(QMainWindow):
                         z_idx = msg["z"]
                         ch = target_channels[z_idx]
 
-                        # AI returns slice_out (0/1/2 map). Convert to pos_lut (ID -> state)
+                        # The worker returns the call per label ID (0 = background,
+                        # 1 = negative, 2 = positive), sized to the largest ID.
                         pos_lut = np.zeros(max_id + 1, dtype=np.int16)
-                        if active_ids.size:
-                            pos_lut[active_ids] = msg["slice"][mask_active]
+                        lut = msg["lut"]
+                        n = min(len(lut), len(pos_lut))
+                        pos_lut[:n] = lut[:n]
 
                         self.segmentationResultReady.emit(
                             labels, ch.name, True, ch.color, contour_data,
@@ -3122,6 +3281,14 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.segmentationError.emit(str(e))
+            finally:
+                markers = shared_labels = None   # views must go before close()
+                for shm in shm_blocks:
+                    try:
+                        shm.close()
+                        shm.unlink()
+                    except Exception:
+                        pass
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3136,13 +3303,13 @@ class MainWindow(QMainWindow):
             self._ops_panel.stop_loading()
             return
 
-        mask_idx = params["mask_index"]
         method = params.get("method", "otsu")
-        mask_ch = self._channel_model.channel(mask_idx)
-        labels = mask_ch.mask_data
-        if labels is None:
-            self._ops_panel.stop_loading()
+        started = self._start_positivity(params)
+        if started is None:
             return
+        mask_ch, area = started
+        mask_idx = self._channel_model._channels.index(mask_ch)   # rows moved when maps were removed
+        labels = mask_ch.mask_data
 
         def _run():
             try:
@@ -3170,14 +3337,26 @@ class MainWindow(QMainWindow):
                     from skimage.measure import label
                     working_labels = label(labels).astype(np.int32)
 
-                cell_ids = np.unique(working_labels)
-                cell_ids = cell_ids[cell_ids > 0]
-                if len(cell_ids) == 0:
-                    self.segmentationError.emit("No cells found in the selected mask.")
-                    return
-
                 max_label = int(working_labels.max())
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
+
+                # Only the cells in the chosen area are measured, classified and
+                # used to find the automatic threshold; the means are reduced
+                # over the box holding all their pixels.
+                lh, lw = working_labels.shape[:2]
+                crop_h, crop_w = min(h, lh), min(w, lw)
+                cell_ids, box = cells_in_area(working_labels[:crop_h, :crop_w], area["mode"],
+                                              area["viewport"], area["polygons"])
+                if box is None:
+                    self.segmentationError.emit(
+                        f"No cells of {mask_ch.name} are in "
+                        f"{self._AREA_NAMES.get(area['mode'], 'the area')}.")
+                    return
+                y0, y1, x0, x1 = box
+                in_area = np.zeros(max_label + 1, dtype=bool)
+                in_area[cell_ids] = True
+                print(f"[Thresholds] {len(cell_ids)} cells in "
+                      f"{self._AREA_NAMES.get(area['mode'])}, box y[{y0}:{y1}] x[{x0}:{x1}]")
 
                 # Collect the ORIGINAL image channels to process. Skip masks,
                 # regions, and derived/filtered channels (e.g. CLAHE output or a
@@ -3202,9 +3381,7 @@ class MainWindow(QMainWindow):
                 #    cores (np.bincount releases the GIL and each strip writes its
                 #    own partial histogram — no contention, no single-threaded gather,
                 #    and the foreground mask is never recomputed per channel). ───────
-                lh, lw = working_labels.shape[:2]
-                crop_h, crop_w = min(h, lh), min(w, lw)
-                flat_lbl = np.ascontiguousarray(working_labels[:crop_h, :crop_w]).ravel()
+                flat_lbl = np.ascontiguousarray(working_labels[y0:y1, x0:x1]).ravel()
                 N = flat_lbl.size
 
                 n_threads = max(1, (os.cpu_count() or 4))
@@ -3255,19 +3432,22 @@ class MainWindow(QMainWindow):
                         ch = channels_snapshot[ci]
                         data = _read_channel(ch)               # load whole channel
                         dh, dw = data.shape[:2]
-                        ch_h, ch_w = min(crop_h, dh), min(crop_w, dw)
 
-                        if (ch_h, ch_w) == (crop_h, crop_w):
-                            flat_dat = np.ascontiguousarray(data[:crop_h, :crop_w]).ravel()
+                        if dh >= y1 and dw >= x1:
+                            flat_dat = np.ascontiguousarray(data[y0:y1, x0:x1]).ravel()
                             means_lut = _cell_means(flat_dat, pool)
                         else:
-                            # Rare: channel smaller than the shared crop — self-contained.
-                            fl = np.ascontiguousarray(working_labels[:ch_h, :ch_w]).ravel()
-                            fd = np.ascontiguousarray(data[:ch_h, :ch_w]).ravel().astype(np.float64)
+                            # Rare: channel smaller than the box — self-contained.
+                            cy1, cx1 = min(y1, dh), min(x1, dw)
+                            fl = np.ascontiguousarray(working_labels[y0:cy1, x0:cx1]).ravel()
+                            fd = np.ascontiguousarray(data[y0:cy1, x0:cx1]).ravel().astype(np.float64)
                             s = np.bincount(fl, weights=fd, minlength=max_label + 1)
                             c = np.bincount(fl, minlength=max_label + 1)
                             with np.errstate(invalid="ignore"):
                                 means_lut = np.where(c > 0, s / np.where(c > 0, c, 1), 0.0).astype(np.float32)
+                        # Cells outside the area have no mean (the box can hold
+                        # parts of them), so nothing downstream reads a partial one.
+                        means_lut[~in_area] = 0.0
 
                         valid_means = means_lut[cell_ids]
                         valid_means = valid_means[valid_means > 0]

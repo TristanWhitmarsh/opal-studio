@@ -256,7 +256,7 @@ Use the **Regions** tab in the left panel to draw analysis regions:
 1. Click the draw button.
 2. Drag on the Image tab to trace a polygon.
 3. Release to create a region layer.
-4. Select the region layer before running segmentation in **Selected region** mode.
+4. Select the region layer before running segmentation in **Region** mode, or use **Regions** mode to segment inside every region at once.
 
 The simplification control reduces polygon point density. Existing region vertices can be dragged while draw mode is active.
 
@@ -317,9 +317,10 @@ Open **Segmentation** in the right panel. Choose a region mode, a target mode, a
 
 ### Region Modes
 
-- **Full image**: segment the entire image.
-- **Visible region**: segment only the current canvas viewport, useful for fast parameter testing.
-- **Selected region**: segment inside the selected polygon region. Only detections whose centroids fall inside the polygon are kept.
+- **Full**: segment the entire image.
+- **Visible**: segment only the current canvas viewport, useful for fast parameter testing.
+- **Region**: segment inside the selected polygon region. Only detections whose centroids fall inside the polygon are kept.
+- **Regions**: segment inside all regions at once, in a single run over the area that contains them. Only detections whose centroids fall inside one of the regions are kept; no region needs to be selected.
 
 ### Target Modes
 
@@ -355,6 +356,15 @@ Expanded binary masks keep their internal label map so threshold positivity and 
 
 Open **Cell positivity** in the right panel after creating or importing a cell mask.
 
+Choose the area to work on, for both the AI and threshold methods:
+
+- **Full**: every cell in the image.
+- **Visible**: cells whose centroid is in the current canvas viewport.
+- **Region**: cells whose centroid is inside the selected region.
+- **Regions**: cells whose centroid is inside any region; no region needs to be selected.
+
+Cells outside the area are left unclassified, and automatic thresholds are computed from the cells inside it. Running **Detect Cell Positivity** or **Get Thresholds** first removes all existing positivity layers, so the layers that appear afterwards are the ones from that run.
+
 ### AI Positivity
 
 The **AI** tab runs the packaged marker-positivity model against every non-mask image channel. For each channel it creates a Positivity layer that stores positive/negative calls per cell while preserving the original cell label IDs and contours.
@@ -369,7 +379,7 @@ The **Thresholds** tab computes per-cell mean intensity for every image channel:
 4. Positivity layers are created immediately for all channels.
 5. Use the channel dropdown, numeric threshold field, or threshold slider to adjust a channel interactively.
 
-The count label shows positive cells over total signal-bearing cells for the selected marker.
+The count label shows positive cells over total signal-bearing cells in the chosen area for the selected marker.
 
 ## Phenotyping And Cell Identification
 
@@ -409,7 +419,7 @@ Cluster names can be edited in the Heatmap tab. Type mask color changes in the l
 
 For IMC datasets, start with models trained or tuned for IMC when available. If no custom model is available, a practical workflow is:
 
-1. Test quickly with **Watershed** or **Visible region** mode.
+1. Test quickly with **Watershed** or **Visible** mode.
 2. Try **InstanSeg** or **StarDist** for nuclei-rich marker channels.
 3. Use **Mesmer** when nuclear and membrane/cytoplasm channels are available.
 4. Use **Cellpose** or **Omnipose** when object morphology differs from round nuclei.
@@ -436,9 +446,9 @@ Treat this as a starting point rather than a rule.
 
 ## Tips
 
-- Use **Visible region** segmentation to tune parameters before running a full image.
+- Use **Visible** segmentation to tune parameters before running a full image.
 - Use **Overwrite selected mask** when iterating on a segmentation to avoid clutter.
-- Draw and select a region before using **Selected region** mode.
+- Draw and select a region before using **Region** mode; **Regions** mode uses all regions without selecting one.
 - Use processed channels as segmentation inputs when raw channels are noisy or low contrast.
 - Keep one clean cell label mask for downstream positivity, phenotyping, and clustering.
 - Save masks/cells before closing if you want to reuse generated label maps in another session.

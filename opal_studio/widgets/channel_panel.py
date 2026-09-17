@@ -15,6 +15,12 @@ from PySide6.QtWidgets import (
     QTabWidget, QLineEdit, QApplication
 )
 
+# Overall brightness slider: a logarithmic scale from BRIGHTNESS_MIN to
+# BRIGHTNESS_MAX, over BRIGHTNESS_STEPS positions, with 1x in the middle.
+BRIGHTNESS_MIN = 0.01
+BRIGHTNESS_MAX = 100.0
+BRIGHTNESS_STEPS = 1000
+
 
 class ElidedLabel(QLabel):
     """A QLabel that elides text in the *middle* when it doesn't fit.
@@ -119,8 +125,13 @@ class ChannelPanel(QWidget):
         bright_layout.addWidget(bright_label)
 
         self._bright_slider = QSlider(Qt.Orientation.Horizontal)
-        self._bright_slider.setRange(1, 1000)  # 0.01 to 4.0
-        self._bright_slider.setValue(100)     # 1.0 initial
+        # Logarithmic: BRIGHTNESS_MIN at the left, 1x in the middle, BRIGHTNESS_MAX
+        # at the right, so dim IMC channels can be pushed well past 1x while the
+        # range around 1x keeps fine control.
+        self._bright_slider.setRange(0, BRIGHTNESS_STEPS)
+        self._bright_slider.setValue(BRIGHTNESS_STEPS // 2)   # 1.0 initial
+        self._bright_slider.setToolTip(
+            f"Brightness of all channels, from {BRIGHTNESS_MIN:g}x to {BRIGHTNESS_MAX:g}x (1x in the middle).")
         self._bright_slider.valueChanged.connect(self._on_brightness_changed)
         bright_layout.addWidget(self._bright_slider)
         header_layout.addLayout(bright_layout)
@@ -752,7 +763,8 @@ class ChannelPanel(QWidget):
             swatch.setIcon(QIcon(pixmap))
 
     def _on_brightness_changed(self, val: int):
-        self._model.brightness = val / 100.0
+        frac = val / BRIGHTNESS_STEPS                          # 0..1, 0.5 = 1x
+        self._model.brightness = BRIGHTNESS_MIN * (BRIGHTNESS_MAX / BRIGHTNESS_MIN) ** frac
 
     def _on_header_alpha_changed(self, val: int):
         ch = self._model.selected_channel()

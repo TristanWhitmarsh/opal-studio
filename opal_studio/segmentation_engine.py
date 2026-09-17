@@ -498,12 +498,25 @@ def run_positivity_task(queue, params, data):
     the target channel with N_SIDE neighbouring metal channels on each side,
     the binary mask of the target cell and the binary mask of the other cells.
     """
+    shared = []
     try:
         import tensorflow as tf
         from scipy import ndimage
 
-        labels = data["labels"]
-        markers = data["markers"]
+        def _attach(key):
+            # Large inputs arrive as shared-memory blocks: pickling them through
+            # the spawn pipe fails on Windows once they pass a few GB (a 50-channel
+            # whole-slide stack is tens of GB).
+            ref = data[key]
+            if isinstance(ref, np.ndarray):
+                return ref
+            from multiprocessing import shared_memory
+            shm = shared_memory.SharedMemory(name=ref["name"])
+            shared.append(shm)
+            return np.ndarray(tuple(ref["shape"]), dtype=np.dtype(ref["dtype"]), buffer=shm.buf)
+
+        labels = _attach("labels")
+        markers = _attach("markers")
 
         # Take the GPU as it is needed rather than reserving all of it up front,
         # so a card shared with the rest of the application still works.
@@ -549,12 +562,16 @@ def run_positivity_task(queue, params, data):
 
         cell_ids = np.unique(cells)
         cell_ids = cell_ids[cell_ids > 0]
+        # The caller can limit the run to some cells (an area of the image). The
+        # others still count as surrounding cells in each crop.
+        if params.get("cell_ids") is not None:
+            cell_ids = np.intersect1d(cell_ids, np.asarray(params["cell_ids"]))
         n_cells = cell_ids.size
 
         if n_cells == 0:
             for z in range(S):
                 queue.put({"type": "channel", "z": z, "positive": 0.0,
-                           "slice": np.zeros_like(cells, dtype=np.int16)})
+                           "lut": np.zeros(1, dtype=np.int16)})
             queue.put({"type": "done"})
             return
 
@@ -633,10 +650,20 @@ def run_positivity_task(queue, params, data):
 
             # Sent as it is finished rather than all at the end, so the caller
             # can show progress and neither side has to hold every channel.
+            # The per-cell call (indexed by label ID) is all the caller needs;
+            # a full-size image per channel would be hundreds of MB each.
             queue.put({"type": "channel", "z": z,
                        "positive": float((probability >= threshold).mean()),
-                       "slice": call[cells][:orig_h, :orig_w].copy()})
+                       "lut": call.copy()})
 
         queue.put({"type": "done"})
     except Exception as e:
         queue.put({"type": "error", "error": str(e), "traceback": traceback.format_exc()})
+    finally:
+        # Views onto the shared blocks must go before the blocks can close.
+        labels = markers = cells = None
+        for shm in shared:
+            try:
+                shm.close()
+            except BufferError:
+                pass

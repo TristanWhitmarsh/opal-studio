@@ -1574,6 +1574,63 @@ class CellSamplerTab(QWidget):
         self._run_btn.setEnabled(enabled)
 
 
+class AreaSelector(QWidget):
+    """Full · Visible · Region · Regions: the part of the image an operation covers.
+
+    ``area_params`` gives the run's ``region_mode`` (see opal_studio.cell_area),
+    with ``region_channel_index`` for the selected region, after checking that the
+    chosen area can be used.
+    """
+
+    MODES = (("full", "Full"), ("visible", "Visible"),
+             ("selected_region", "Region"), ("regions", "Regions"))
+
+    def __init__(self, channel_model, tooltips: dict, parent=None):
+        super().__init__(parent)
+        self._channel_model = channel_model
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._group = QButtonGroup(self)
+        self.buttons: dict[str, QRadioButton] = {}
+        for mode, text in self.MODES:
+            rb = QRadioButton(text)
+            rb.setToolTip(tooltips.get(mode, ""))
+            self._group.addButton(rb)
+            lay.addWidget(rb)
+            self.buttons[mode] = rb
+        lay.addStretch()
+        self.buttons["full"].setChecked(True)
+
+    def mode(self) -> str:
+        return next(m for m, rb in self.buttons.items() if rb.isChecked())
+
+    def reset(self):
+        self.buttons["full"].setChecked(True)
+
+    def area_params(self, action: str):
+        """{"region_mode", ["region_channel_index"]}, or None after warning the user."""
+        mode = self.mode()
+        params = {"region_mode": mode}
+        if mode == "selected_region":
+            for i, ch in enumerate(self._channel_model._channels):
+                if ch.selected and getattr(ch, "is_region", False):
+                    params["region_channel_index"] = i
+                    break
+            else:
+                QMessageBox.warning(
+                    self, "No region selected",
+                    f"Please select a region channel (drawn polygon) before running {action} in 'Region' mode.")
+                return None
+        elif mode == "regions":
+            if not any(getattr(ch, "is_region", False) and ch.contour_data
+                       for ch in self._channel_model._channels):
+                QMessageBox.warning(
+                    self, "No regions",
+                    f"Draw or import at least one region before running {action} in 'Regions' mode.")
+                return None
+        return params
+
+
 class ThresholdPositivityTab(QWidget):
     """
     Threshold-based cell positivity tab.
@@ -1797,6 +1854,13 @@ class ThresholdPositivityTab(QWidget):
                 return ch_idx
         return None
 
+    def _area_means(self, means: np.ndarray) -> np.ndarray:
+        """The means of the cells the thresholds were computed for (the chosen area)."""
+        if self._cell_ids is None:
+            return means[1:]                      # means[0] = background
+        ids = np.asarray(self._cell_ids)
+        return means[ids[ids < len(means)]]
+
     def _on_model_data_changed(self, top_left, bottom_right, roles):
         """Sync slider when the selected channel changes in the Positivity tab."""
         from opal_studio.channel_model import ChannelListModel
@@ -1808,8 +1872,7 @@ class ThresholdPositivityTab(QWidget):
         ch_idx = self._get_active_ch_idx()
         if ch_idx is None or ch_idx not in self._cell_means:
             return
-        means = self._cell_means[ch_idx]
-        valid = means[1:]  # means[0] = background
+        valid = self._area_means(self._cell_means[ch_idx])
         if valid.size == 0:
             return
         self._means_min = float(np.min(valid))
@@ -1844,8 +1907,9 @@ class ThresholdPositivityTab(QWidget):
                 ch_idx = self._get_active_ch_idx()
                 means = self._cell_means.get(ch_idx)
                 if means is not None:
-                    n_pos = int(np.sum(means[1:] >= val))
-                    n_total = int(np.sum(means[1:] > 0))
+                    valid = self._area_means(means)
+                    n_pos = int(np.sum(valid >= val))
+                    n_total = int(np.sum(valid > 0))
                     self._pos_count_label.setText(f"{n_pos}/{n_total}")
                 self._emit_apply()
         except ValueError:
@@ -1858,8 +1922,9 @@ class ThresholdPositivityTab(QWidget):
         ch_idx = self._get_active_ch_idx()
         means = self._cell_means.get(ch_idx)
         if means is not None:
-            n_pos = int(np.sum(means[1:] >= thresh))
-            n_total = int(np.sum(means[1:] > 0))
+            valid = self._area_means(means)
+            n_pos = int(np.sum(valid >= thresh))
+            n_total = int(np.sum(valid > 0))
             self._pos_count_label.setText(f"{n_pos}/{n_total}")
         self._thresh_input.blockSignals(True)
         self._thresh_input.setText(f"{thresh:.4g}")
@@ -2450,9 +2515,9 @@ class OperationsPanel(QWidget):
     def reset(self):
         """Restore all operations panel settings to defaults."""
         self.stop_loading()
-        self._radio_full.setChecked(True)
+        self._seg_area.reset()
+        self._pos_area.reset()
         self._radio_new_mask.setChecked(True)
-        self._radio_selected_region.setChecked(False)
         
         # Optionally: Collapse all sections to start fresh
         # (Though some users might prefer them staying open, defaults are usually best)
@@ -2484,27 +2549,18 @@ class OperationsPanel(QWidget):
         panel = CollapsiblePanel("Segmentation", collapsed=True)
         self._container_layout.addWidget(panel)
 
-        # Region mode toggle
-        region_lay = QHBoxLayout()
-        self._radio_full = QRadioButton("Full image")
-        self._radio_visible = QRadioButton("Visible region")
-        self._radio_selected_region = QRadioButton("Selected region")
-        self._radio_full.setChecked(True)
-        self._radio_selected_region.setToolTip(
-            "Run segmentation inside the bounding box of the currently selected region polygon.\n"
-            "Only cells fully contained within the region polygon will be added to the mask."
-        )
-
-        self._region_group = QButtonGroup(self)
-        self._region_group.addButton(self._radio_full)
-        self._region_group.addButton(self._radio_visible)
-        self._region_group.addButton(self._radio_selected_region)
-
-        region_lay.addWidget(self._radio_full)
-        region_lay.addWidget(self._radio_visible)
-        region_lay.addWidget(self._radio_selected_region)
-        region_lay.addStretch()
-        panel.addLayout(region_lay)
+        # Area toggle
+        self._seg_area = AreaSelector(self._channel_model, {
+            "full": "Segment the whole image.",
+            "visible": ("Segment only the part of the image currently shown in the viewer.\n"
+                        "Quick for trying out parameters. Cells cut by the edge of the view are left out."),
+            "selected_region": ("Segment inside the selected region.\n"
+                                "Only cells whose centre lies inside the region's outline are kept."),
+            "regions": ("Segment inside all regions at once, in a single run.\n"
+                        "Only cells whose centre lies inside one of the regions are kept;\n"
+                        "nothing is selected first."),
+        })
+        panel.addWidget(self._seg_area)
 
         # Target mask toggle
         target_lay = QHBoxLayout()
@@ -2573,6 +2629,21 @@ class OperationsPanel(QWidget):
     def _setup_cell_positivity_section(self):
         panel = CollapsiblePanel("Cell positivity", collapsed=True)
         self._container_layout.addWidget(panel)
+
+        # Area toggle, shared by the AI and threshold methods
+        note = ("\n\nCells outside the area are left unclassified, and the automatic\n"
+                "thresholds are computed from the cells inside it. Running removes\n"
+                "the existing positivity maps first.")
+        self._pos_area = AreaSelector(self._channel_model, {
+            "full": "Determine positivity for every cell in the image." + note,
+            "visible": ("Determine positivity only for cells whose centre is in the part\n"
+                        "of the image currently shown in the viewer." + note),
+            "selected_region": ("Determine positivity only for cells whose centre lies inside\n"
+                                "the selected region." + note),
+            "regions": ("Determine positivity only for cells whose centre lies inside\n"
+                        "any of the regions; nothing is selected first." + note),
+        })
+        panel.addWidget(self._pos_area)
 
         self._pos_tabs = OperationsTabWidget()
         self._pos_tabs.setIconSize(QSize(1, 24))
@@ -2667,28 +2738,11 @@ class OperationsPanel(QWidget):
 
     def _on_run_segmentation(self, params):
         target_mode = "new" if self._radio_new_mask.isChecked() else "overwrite"
-        if self._radio_full.isChecked():
-            params["region_mode"] = "full"
-        elif self._radio_visible.isChecked():
-            params["region_mode"] = "visible"
-        else:
-            params["region_mode"] = "selected_region"
+        area = self._seg_area.area_params("segmentation")
+        if area is None:
+            return
+        params.update(area)
         params["target_mode"] = target_mode
-
-        # Validate selected region mode — find any selected region channel
-        if params["region_mode"] == "selected_region":
-            region_ch = None
-            for i, ch in enumerate(self._channel_model._channels):
-                if ch.selected and getattr(ch, 'is_region', False):
-                    region_ch = ch
-                    params["region_channel_index"] = i
-                    break
-            if region_ch is None:
-                QMessageBox.warning(
-                    self, "No region selected",
-                    "Please select a region channel (drawn polygon) before running segmentation in 'Selected region' mode."
-                )
-                return
 
         # Validate overwrite mode
         if target_mode == "overwrite":
@@ -2733,13 +2787,22 @@ class OperationsPanel(QWidget):
     def _on_run_cell_positivity(self):
         if self._pos_mask_combo.currentIndex() < 0:
             return
+        area = self._pos_area.area_params("cell positivity")
+        if area is None:
+            return
         self._pos_run_btn.setEnabled(False)
         self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
         self.runCellPositivityRequested.emit({
-            "mask_index": self._pos_mask_combo.currentData()
+            "mask_index": self._pos_mask_combo.currentData(), **area
         })
 
     def _on_run_threshold_compute(self, params):
+        area = self._pos_area.area_params("thresholding")
+        if area is None:
+            self._thresh_tab._get_btn.setEnabled(True)
+            self._thresh_tab._controls.setVisible(self._thresh_tab._labels is not None)
+            return
+        params.update(area)
         self._thresh_tab.setEnabled(False)
         self._progress_widget.setVisible(True)
         self._progress.setRange(0, 0)
