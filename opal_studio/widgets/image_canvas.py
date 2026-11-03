@@ -733,13 +733,14 @@ class ImageCanvas(QWidget):
                     pen.setWidth(3)
                     pen.setCosmetic(True)
                     vpt = self._viewport
+                    region_col = self._model.region_color(ch) if is_r else None
                     for lid, data in ch.contour_data.items():
                         bbox = data["bbox"]
                         if (bbox[2] < vpt.top()    or bbox[0] > vpt.bottom() or
                                 bbox[3] < vpt.left() or bbox[1] > vpt.right()):
                             continue
                         if is_r:
-                            col = ch.color
+                            col = region_col
                         elif ch.is_mask:
                             if ch.random_contour_colors:
                                 rng.seed(int(lid))
@@ -763,12 +764,13 @@ class ImageCanvas(QWidget):
             if getattr(self, "_draw_mode", False):
                 for ch in self._model.visible_channels():
                     if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
+                        col = self._model.region_color(ch)
                         for lid, data in ch.contour_data.items():
                             for poly in data["polygons"]:
                                 for pt in poly:
                                     # Solid circle filled with region color (no white outline)
-                                    p.setPen(ch.color)
-                                    p.setBrush(ch.color)
+                                    p.setPen(col)
+                                    p.setBrush(col)
                                     p.drawEllipse(pt, 4.0 / spp, 4.0 / spp)
 
             p.restore()

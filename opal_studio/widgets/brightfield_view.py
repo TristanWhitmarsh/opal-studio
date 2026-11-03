@@ -431,9 +431,10 @@ class BrightfieldView(QWidget):
             pen = QPen()
             pen.setWidth(3)
             pen.setCosmetic(True)
+            region_col = self._model.region_color(ch) if is_r else None
             for lid, data in ch.contour_data.items():
                 if is_r:
-                    col = ch.color
+                    col = region_col
                 elif ch.is_mask:
                     if ch.random_contour_colors:
                         rng.seed(int(lid))
@@ -455,11 +456,12 @@ class BrightfieldView(QWidget):
         if self._draw_mode:
             for ch in self._model.visible_channels():
                 if getattr(ch, "is_region", False) and ch.visible and ch.contour_data:
+                    col = self._model.region_color(ch)
                     for lid, data in ch.contour_data.items():
                         for poly in data["polygons"]:
                             for pt in poly:
-                                p.setPen(ch.color)
-                                p.setBrush(ch.color)
+                                p.setPen(col)
+                                p.setBrush(col)
                                 p.drawEllipse(pt, 4.0 / spp, 4.0 / spp)
 
         p.restore()

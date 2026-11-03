@@ -71,7 +71,9 @@ _AUX_SINGLE_CHUNK = 64_000_000
 # Threads used to read and decode array chunks.
 _IO_WORKERS = min(32, (os.cpu_count() or 4) * 2)
 
-PROJECT_SCHEMA_VERSION = 2
+# 3: layers that share a label map share its labels element, and name their aux
+# arrays (pos_lut, auxlabels) themselves. Older readers would mix up the LUTs.
+PROJECT_SCHEMA_VERSION = 3
 
 # ── SpatialData / NGFF format version strings (match spatialdata v0.7.x) ───────
 SPATIALDATA_CONTAINER_VERSION = "0.2"

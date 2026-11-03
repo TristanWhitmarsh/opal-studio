@@ -4,6 +4,7 @@ colour swatch, name, and dual-handle range slider.
 """
 
 from __future__ import annotations
+import math
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, Signal, QTimer, QObject, QEvent
@@ -12,7 +13,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSizePolicy, QColorDialog, QFrame, QSlider,
-    QTabWidget, QLineEdit, QApplication
+    QTabWidget, QLineEdit, QApplication, QCheckBox
 )
 
 # Overall brightness slider: a logarithmic scale from BRIGHTNESS_MIN to
@@ -71,7 +72,7 @@ class ChannelPanel(QWidget):
     Scrollable panel showing one row per channel.
 
     Each row contains:
-      [eye toggle] [colour swatch] [name label] [range slider]
+      [active checkbox] [eye toggle] [colour swatch] [name label] [range slider]
     """
 
     def __init__(self, model: ChannelListModel, parent=None):
@@ -504,12 +505,28 @@ class ChannelPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        # Top line: eye | colour | name
+        # Top line: active | eye | colour | name
         top = QHBoxLayout()
         top.setSpacing(6)
 
+        # Active checkbox (for the image channels positivity can run on)
+        if ch.can_be_active:
+            active_box = QCheckBox()
+            active_box.setChecked(ch.active)
+            active_box.setToolTip(
+                "Active: positivity detection runs on this channel, and it counts "
+                "as a neighbour of other channels.\n"
+                + ("Inactive: it is skipped and gets no positivity layer."
+                   if ch.is_processed else
+                   "Inactive: it is skipped, also as a neighbour of other channels, "
+                   "and all its cells are set negative."))
+            active_box.clicked.connect(lambda checked=False, r=row, box=active_box: self._toggle_active(r, box.isChecked()))
+            top.addWidget(active_box)
+            frame.active_box = active_box
+
         # Eye toggle
         eye_btn = QPushButton()
+        frame.eye_btn = eye_btn
         eye_btn.setFixedSize(24, 24)
         eye_btn.setCheckable(True)
         eye_btn.setChecked(ch.visible)
@@ -528,6 +545,7 @@ class ChannelPanel(QWidget):
         # Contour toggle (only for masks)
         if (ch.is_mask or ch.is_cell_mask) and not getattr(ch, 'is_region', False):
             contour_btn = QPushButton()
+            frame.contour_btn = contour_btn
             contour_btn.setFixedSize(24, 24)
             contour_btn.setCheckable(True)
             contour_btn.setChecked(ch.contour_visible)
@@ -695,7 +713,14 @@ class ChannelPanel(QWidget):
 
     def _on_data_changed(self, top_left, bottom_right, roles):
         row = top_left.row()
-        if not roles or ChannelListModel.NameRole in roles or ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles or ChannelListModel.SelectedRole in roles:
+        # The limits move when a channel's intensity range is widened.
+        if ChannelListModel.RangeMinRole in roles and 0 <= row < self._model.rowCount():
+            ch = self._model.channel(row)
+            if ch.selected and not (ch.is_mask or ch.is_cell_mask or ch.is_type_mask):
+                self._limits_slider.blockSignals(True)
+                self._limits_slider.set_range(ch.range_min, ch.range_max)
+                self._limits_slider.blockSignals(False)
+        if not roles or ChannelListModel.NameRole in roles or ChannelListModel.VisibleRole in roles or ChannelListModel.ContourVisibleRole in roles or ChannelListModel.SelectedRole in roles or ChannelListModel.ActiveRole in roles:
             if 0 <= row < len(self._row_widgets):
                 ch = self._model.channel(row)
                 frame = self._row_widgets[row]
@@ -719,8 +744,13 @@ class ChannelPanel(QWidget):
                                 w.setToolTip(ch.name)
                                 break
                     
+                    # 0. Update Active Checkbox
+                    active_box = getattr(frame, 'active_box', None)
+                    if active_box is not None:
+                        active_box.setChecked(ch.active)
+
                     # 1. Update Eye Toggle
-                    eye_btn = top_layout.itemAt(0).widget()
+                    eye_btn = getattr(frame, 'eye_btn', None)
                     if isinstance(eye_btn, QPushButton):
                         eye_btn.setChecked(ch.visible)
                         if getattr(ch, 'is_region', False):
@@ -732,7 +762,7 @@ class ChannelPanel(QWidget):
                     
                     # 2. Update Contour Toggle
                     if ch.is_mask or ch.is_cell_mask:
-                        contour_btn = top_layout.itemAt(1).widget()
+                        contour_btn = getattr(frame, 'contour_btn', None)
                         if isinstance(contour_btn, QPushButton):
                             contour_btn.setChecked(ch.contour_visible)
                             contour_btn.setIcon(self._contour_open_icon if ch.contour_visible else self._contour_closed_icon)
@@ -742,6 +772,10 @@ class ChannelPanel(QWidget):
     def _toggle_vis(self, row: int, checked: bool):
         idx = self._model.index(row)
         self._model.setData(idx, checked, ChannelListModel.VisibleRole)
+
+    def _toggle_active(self, row: int, checked: bool):
+        idx = self._model.index(row)
+        self._model.setData(idx, checked, ChannelListModel.ActiveRole)
 
     def _toggle_contour_vis(self, row: int, checked: bool):
         idx = self._model.index(row)
@@ -765,6 +799,12 @@ class ChannelPanel(QWidget):
     def _on_brightness_changed(self, val: int):
         frac = val / BRIGHTNESS_STEPS                          # 0..1, 0.5 = 1x
         self._model.brightness = BRIGHTNESS_MIN * (BRIGHTNESS_MAX / BRIGHTNESS_MIN) ** frac
+
+    def set_brightness(self, value: float):
+        """Move the slider to *value* (e.g. from a project), which sets the model."""
+        value = min(max(float(value), BRIGHTNESS_MIN), BRIGHTNESS_MAX)
+        frac = math.log(value / BRIGHTNESS_MIN) / math.log(BRIGHTNESS_MAX / BRIGHTNESS_MIN)
+        self._bright_slider.setValue(round(frac * BRIGHTNESS_STEPS))
 
     def _on_header_alpha_changed(self, val: int):
         ch = self._model.selected_channel()

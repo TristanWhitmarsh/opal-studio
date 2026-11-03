@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import numpy as np
 import threading
-from PySide6.QtCore import Qt, Signal, Slot, QSize
+from PySide6.QtCore import Qt, Signal, Slot, QSize, QEvent
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QFrame, QSizePolicy,
     QComboBox, QLineEdit, QPushButton, QProgressBar,
@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QGridLayout, QScrollArea, QTabWidget, QToolButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QPlainTextEdit
 )
-from PySide6.QtGui import QDoubleValidator, QIntValidator, QPixmap, QIcon
+from PySide6.QtGui import (
+    QDoubleValidator, QIntValidator, QPixmap, QIcon, QStandardItem, QStandardItemModel,
+)
 
 from opal_studio.channel_model import ChannelListModel, Channel
 
@@ -678,18 +680,38 @@ class CellposeTab(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(4)
 
-        # Channel Selector
+        # Channel Selector (nuclei and custom models)
+        self._channel_label = QLabel("Channel:")
         self._channel_combo = QComboBox()
         self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._channel_combo.setMinimumWidth(50)
-        form.addRow("Channel:", self._channel_combo)
+        form.addRow(self._channel_label, self._channel_combo)
+
+        # Nuclear and membrane channels (cyto models)
+        self._nuclear_label = QLabel("Nuclear Channel:")
+        self._nuclear_combo = QComboBox()
+        self._nuclear_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._nuclear_combo.setMinimumWidth(50)
+        self._nuclear_combo.setToolTip("Optional nuclear channel, which helps the model separate touching cells.")
+        form.addRow(self._nuclear_label, self._nuclear_combo)
+
+        self._membrane_label = QLabel("Membrane Channel:")
+        self._membrane_combo = QComboBox()
+        self._membrane_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._membrane_combo.setMinimumWidth(50)
+        self._membrane_combo.setToolTip("Membrane or cytoplasm channel that outlines the cells.")
+        self._membrane_combo.currentIndexChanged.connect(self._on_membrane_changed)
+        form.addRow(self._membrane_label, self._membrane_combo)
 
         self._model_combo = QComboBox()
         self._model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._model_combo.setMinimumWidth(50)
         self._model_combo.addItems(["nuclei", "cyto", "cyto2", "cyto3"])
         self._scan_models()
-        self._model_combo.setToolTip("Pre-trained Cellpose models. 'nuclei' for nuclear staining, 'cyto' or 'cyto2' for cytoplasmic/cellular staining.")
+        self._model_combo.setToolTip(
+            "Pre-trained Cellpose models. 'nuclei' takes a nuclear channel; 'cyto', 'cyto2' "
+            "and 'cyto3' take a membrane or cytoplasm channel plus an optional nuclear channel.")
+        self._model_combo.currentIndexChanged.connect(self._on_model_changed)
         form.addRow("Model:", self._model_combo)
 
         self._diameter = QLineEdit("6.5")
@@ -722,21 +744,64 @@ class CellposeTab(QWidget):
         self._channel_model.modelReset.connect(self._refresh_channels)
         self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
+        self._on_model_changed()
+
+    #: Built-in models trained on a cytoplasm/membrane channel plus a nuclear one.
+    TWO_CHANNEL_MODELS = {"cyto", "cyto2", "cyto3"}
+
+    #: (diameter, cell probability threshold, flow threshold) for each built-in
+    #: model. The cyto models segment whole cells and take Cellpose's own default
+    #: diameter; a nuclear diameter magnifies the image so far they find no cells.
+    MODEL_DEFAULTS = {"nuclei": ("6.5", "0.0", "0.4"),
+                      **{name: ("30", "0.0", "0.4") for name in TWO_CHANNEL_MODELS}}
+
+    def _uses_two_channels(self) -> bool:
+        return (self._model_combo.currentText() in self.TWO_CHANNEL_MODELS
+                and self._model_combo.currentData() is None)
+
+    def _on_model_changed(self, *_):
+        """Show the nuclear and membrane selectors for the cyto models, one channel otherwise,
+        and reset the parameters to the model's defaults. A trained model keeps them."""
+        defaults = self.MODEL_DEFAULTS.get(self._model_combo.currentText())
+        if defaults and self._model_combo.currentData() is None:
+            for field, value in zip((self._diameter, self._cellprob_threshold,
+                                     self._flow_threshold), defaults):
+                field.setText(value)
+        two = self._uses_two_channels()
+        for widget in (self._nuclear_label, self._nuclear_combo,
+                       self._membrane_label, self._membrane_combo):
+            widget.setVisible(two)
+        self._channel_label.setVisible(not two)
+        self._channel_combo.setVisible(not two)
+
+    def _on_membrane_changed(self, *_):
+        # The RGB scan is a whole image of its own, with no separate nuclear channel.
+        self._nuclear_combo.setEnabled(self._membrane_combo.currentData() != -1)
 
     def _refresh_channels(self):
-        current = self._channel_combo.currentText()
-        self._channel_combo.clear()
+        brightfield = getattr(self._channel_model, "has_brightfield", False)
+        current = {combo: combo.currentText()
+                   for combo in (self._channel_combo, self._nuclear_combo, self._membrane_combo)}
+        for combo in current:
+            combo.blockSignals(True)
+            combo.clear()
+        self._nuclear_combo.addItem("None", -1)
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
             if (not ch.is_mask and not ch.is_cell_mask
                     and not ch.is_type_mask and not getattr(ch, "is_region", False)):
-                self._channel_combo.addItem(ch.name, i)
+                for combo in current:
+                    combo.addItem(ch.name, i)
         # A brightfield / H&E scan has no marker channels, so it is offered here
         # as index -1 rather than as a row in the channel list.
-        if getattr(self._channel_model, "has_brightfield", False):
+        if brightfield:
             self._channel_combo.addItem("Brightfield (RGB)", -1)
-        idx = self._channel_combo.findText(current)
-        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
+            self._membrane_combo.addItem("Brightfield (RGB)", -1)
+        for combo, text in current.items():
+            idx = combo.findText(text)
+            if idx >= 0: combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        self._on_membrane_changed()
 
     def _scan_models(self):
         """Opal Studio's Cellpose models, fetched on first use, plus local ones."""
@@ -748,7 +813,15 @@ class CellposeTab(QWidget):
                 self._model_combo.addItem(name, data)
 
     def _on_run(self):
-        if self._channel_combo.currentIndex() < 0: return
+        if self._uses_two_channels():
+            if self._membrane_combo.currentIndex() < 0: return
+            # Membrane first, then the optional nucleus: Cellpose's channels=[1, 2].
+            indices = [self._membrane_combo.currentData()]
+            if indices[0] != -1 and self._nuclear_combo.currentData() != -1:
+                indices.append(self._nuclear_combo.currentData())
+        else:
+            if self._channel_combo.currentIndex() < 0: return
+            indices = [self._channel_combo.currentData()]
         diam_text = self._diameter.text()
         if diam_text.lower() == "auto" or not diam_text:
             diam = None
@@ -757,13 +830,13 @@ class CellposeTab(QWidget):
                 diam = float(diam_text)
             except ValueError:
                 diam = None
-        
+
         cellprob_threshold = float(self._cellprob_threshold.text() or 0.0)
         flow_threshold = float(self._flow_threshold.text() or 0.4)
         
         self.runRequested.emit({
             "method": "cellpose",
-            "channel_indices": [self._channel_combo.currentData()],
+            "channel_indices": indices,
             "model_name": self._model_combo.currentText(),
             "model_path": self._model_combo.currentData(),
             "diameter": diam,
@@ -883,6 +956,107 @@ class OmniposeTab(QWidget):
             "flow_threshold": flow_threshold
         })
         
+class CheckableComboBox(QComboBox):
+    """A drop-down list whose items have checkboxes; the box shows the checked names.
+
+    Clicking an item toggles it and leaves the list open, so several can be
+    picked in one go.
+    """
+    checkedChanged = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._bulk = False   # set while set_checked changes several items at once
+        self.setModel(QStandardItemModel(self))
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().installEventFilter(self)
+        self.view().viewport().installEventFilter(self)
+        self.model().itemChanged.connect(self._on_item_changed)
+        # QComboBox writes the current item's name into the box; show the checked ones.
+        self.currentIndexChanged.connect(lambda *_: self._update_text())
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            if obj is self.lineEdit():
+                self.showPopup()
+                return True
+            if obj is self.view().viewport():
+                item = self.model().itemFromIndex(self.view().indexAt(event.position().toPoint()))
+                if item is not None:
+                    checked = item.checkState() == Qt.CheckState.Checked
+                    item.setCheckState(Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked)
+                return True
+        return super().eventFilter(obj, event)
+
+    def add_check_item(self, text: str, data, checked: bool = False) -> None:
+        item = QStandardItem(text)
+        item.setData(data, Qt.ItemDataRole.UserRole)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.model().appendRow(item)
+        self._update_text()
+
+    def _items(self):
+        return [self.model().item(row) for row in range(self.model().rowCount())]
+
+    def texts(self) -> list:
+        return [item.text() for item in self._items()]
+
+    def checked_texts(self) -> list:
+        return [item.text() for item in self._items() if item.checkState() == Qt.CheckState.Checked]
+
+    def checked_data(self) -> list:
+        return [item.data(Qt.ItemDataRole.UserRole) for item in self._items()
+                if item.checkState() == Qt.CheckState.Checked]
+
+    def set_checked(self, texts) -> None:
+        """Check exactly the items named in *texts*."""
+        texts = set(texts)
+        self._bulk = True
+        try:
+            for item in self._items():
+                item.setCheckState(Qt.CheckState.Checked if item.text() in texts else Qt.CheckState.Unchecked)
+        finally:
+            self._bulk = False
+        self._on_item_changed()
+
+    def clear(self) -> None:
+        super().clear()
+        self._update_text()
+
+    def _on_item_changed(self, *_):
+        if self._bulk:
+            return
+        self._update_text()
+        self.checkedChanged.emit()
+
+    def _update_text(self):
+        texts = self.checked_texts()
+        self.lineEdit().setText(", ".join(texts) if texts else "None")
+        self.lineEdit().setCursorPosition(0)
+        self.setToolTip("\n".join(texts))
+
+
+def _with_all_none(combo: CheckableComboBox, on_all, on_none) -> QWidget:
+    """*combo* with All and None buttons beside it, as one form field.
+
+    The buttons are the row's ``all_button`` and ``none_button``.
+    """
+    row = QWidget()
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+    lay.addWidget(combo, 1)
+    for text, width, slot in (("All", 34, on_all), ("None", 40, on_none)):
+        btn = QPushButton(text)
+        btn.setFixedWidth(width)
+        btn.clicked.connect(slot)
+        lay.addWidget(btn)
+        setattr(row, f"{text.lower()}_button", btn)
+    return row
+
+
 class InstanSegTab(QWidget):
     """Sub-widget for InstanSeg segmentation parameters."""
     runRequested = Signal(dict)
@@ -903,11 +1077,19 @@ class InstanSegTab(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(4)
 
-        # Channel Selector
-        self._channel_combo = QComboBox()
-        self._channel_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._channel_combo.setMinimumWidth(50)
-        form.addRow("Channel:", self._channel_combo)
+        # Channel Selector: the checked channels go to the model together.
+        self._channels_combo = CheckableComboBox()
+        self._channels_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channels_combo.setMinimumWidth(50)
+        self._checked = []
+        # All means every channel: the RGB scan is never combined with them.
+        channels_row = _with_all_none(
+            self._channels_combo,
+            lambda: self._channels_combo.set_checked(
+                [t for t in self._channels_combo.texts() if t != self.BRIGHTFIELD]),
+            lambda: self._channels_combo.set_checked([]))
+        self._all_btn = channels_row.all_button
+        form.addRow("Channels:", channels_row)
 
         # Model Selector
         self._model_combo = QComboBox()
@@ -916,10 +1098,14 @@ class InstanSegTab(QWidget):
         self._model_combo.setEditable(True)
         self._model_catalog = self._build_model_catalog()
         self._refresh_models()
-        self._channel_combo.currentIndexChanged.connect(self._refresh_models)
+        self._channels_combo.checkedChanged.connect(self._on_channels_checked)
+        self._model_combo.currentTextChanged.connect(self._on_model_changed)
         self._model_combo.setToolTip(
             "InstanSeg models for single-channel nuclei, multi-channel "
-            "fluorescence (nuclei and cells), or brightfield / H&E RGB.")
+            "fluorescence (nuclei and cells), or brightfield / H&E RGB. "
+            "fluorescence_nuclei_and_cells takes any number of channels: "
+            "check a nuclear and a membrane channel for cell outlines. "
+            "The other models take one channel.")
         form.addRow("Model:", self._model_combo)
 
         # Pixel Size
@@ -951,23 +1137,68 @@ class InstanSegTab(QWidget):
         self._channel_model.rowsInserted.connect(lambda: self._refresh_channels())
         self._channel_model.rowsRemoved.connect(lambda: self._refresh_channels())
 
+    BRIGHTFIELD = "Brightfield (RGB)"
+
     def _refresh_channels(self):
-        current = self._channel_combo.currentText()
-        self._channel_combo.clear()
+        current = self._channels_combo.checked_texts()
+        combo = self._channels_combo
+        combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
             if (not ch.is_mask and not ch.is_cell_mask
                     and not ch.is_type_mask and not getattr(ch, "is_region", False)):
-                self._channel_combo.addItem(ch.name, i)
+                combo.add_check_item(ch.name, i)
         # A brightfield / H&E scan has no marker channels, so it is offered here
         # as index -1 rather than as a row in the channel list.
         if getattr(self._channel_model, "has_brightfield", False):
-            self._channel_combo.addItem("Brightfield (RGB)", -1)
-        idx = self._channel_combo.findText(current)
-        if idx >= 0: self._channel_combo.setCurrentIndex(idx)
+            combo.add_check_item(self.BRIGHTFIELD, -1)
+        names = [combo.itemText(row) for row in range(combo.count())]
+        keep = [name for name in current if name in names]
+        # Start with the first channel, as a single-channel selector would.
+        combo.set_checked(keep or names[:1])
+
+    def _on_channels_checked(self):
+        """The RGB scan is a whole image of its own, so it is never combined with channels."""
+        checked = self._channels_combo.checked_texts()
+        added = [name for name in checked if name not in self._checked]
+        if self.BRIGHTFIELD in checked and len(checked) > 1:
+            keep = [self.BRIGHTFIELD] if self.BRIGHTFIELD in added else [
+                name for name in checked if name != self.BRIGHTFIELD]
+            self._checked = keep
+            self._channels_combo.set_checked(keep)
+            return
+        # A single-channel model takes the channel checked last.
+        if self._single_channel() and len(checked) > 1:
+            keep = added[-1:] or checked[:1]
+            self._checked = keep
+            self._channels_combo.set_checked(keep)
+            return
+        self._checked = checked
+        self._refresh_models()
 
     #: The brightfield model takes an RGB image; the others take channels.
     RGB_MODELS = {"brightfield_nuclei"}
+
+    #: Models that take any number of channels; the other channel models take one.
+    MULTICHANNEL_MODELS = {"fluorescence_nuclei_and_cells"}
+
+    def _single_channel(self) -> bool:
+        model = self._model_combo.currentText()
+        return model not in self.MULTICHANNEL_MODELS and model not in self.RGB_MODELS
+
+    def _on_model_changed(self, *_):
+        """A single-channel model keeps one checked channel: the one shown in the viewer."""
+        single = self._single_channel()
+        self._all_btn.setEnabled(not single)
+        checked = [i for i in self._channels_combo.checked_data() if i is not None and i >= 0]
+        if not single or len(checked) <= 1:
+            return
+        rows = [self._channels_combo.itemData(r) for r in range(self._channels_combo.count())]
+        shown = [i for i in rows if i is not None and i >= 0 and self._channel_model.channel(i).visible]
+        keep = next((i for i in checked if i in shown), None)
+        if keep is None:
+            keep = shown[0] if shown else checked[0]
+        self._channels_combo.set_checked([self._channels_combo.itemText(rows.index(keep))])
 
     def _build_model_catalog(self):
         """Every model on offer.
@@ -985,8 +1216,8 @@ class InstanSegTab(QWidget):
         return _dedupe(catalog)
 
     def _refresh_models(self):
-        """Offer only the models that match the selected channel."""
-        rgb = self._channel_combo.currentData() == -1
+        """Offer only the models that match the selected channels."""
+        rgb = -1 in self._channels_combo.checked_data()
         current = self._model_combo.currentText()
         self._model_combo.blockSignals(True)
         self._model_combo.clear()
@@ -997,12 +1228,17 @@ class InstanSegTab(QWidget):
         if idx >= 0:
             self._model_combo.setCurrentIndex(idx)
         self._model_combo.blockSignals(False)
+        # The list may have changed the model without a signal.
+        self._on_model_changed()
 
     def _on_run(self):
-        if self._channel_combo.currentIndex() < 0: return
+        indices = self._channels_combo.checked_data()
+        if not indices:
+            QMessageBox.information(self, "InstanSeg", "Check at least one channel.")
+            return
         self.runRequested.emit({
             "method": "instanseg",
-            "channel_indices": [self._channel_combo.currentData()],
+            "channel_indices": indices,
             "model_name": self._model_combo.currentText(),
             "model_path": self._model_combo.currentData(),
             "pixel_size": float(self._pixel_size.text() or 1.0),
@@ -1805,7 +2041,7 @@ class ThresholdPositivityTab(QWidget):
         self.runThresholdComputeRequested.emit({"mask_index": mask_idx, "method": method})
 
     def receive_means(self, labels, cell_means: dict, thresholds: dict,
-                      mask_model_index: int, cell_ids=None):
+                      mask_model_index: int, cell_ids=None, inactive=()):
         """
         Called from MainWindow (main thread via signal) when per-cell
         means are ready.
@@ -1819,6 +2055,9 @@ class ThresholdPositivityTab(QWidget):
         cell_ids          : label IDs of the real cells. Kept so thresholding can
                             classify every cell — including cells whose mean is 0
                             in a given channel, which must still be marked negative.
+        inactive          : ch_model_idx of the inactive channels. They have no means
+                            or threshold, so the slider leaves them alone; each gets
+                            a layer in which every cell is negative.
         """
         self._labels = labels
         self._cell_means = cell_means
@@ -1828,11 +2067,12 @@ class ThresholdPositivityTab(QWidget):
         self._generated_ch_indices = {}
 
         # Apply computed thresholds for ALL channels immediately
-        for ch_idx, thresh in self._thresholds.items():
+        for ch_idx in sorted({*self._thresholds, *inactive}):
             ch = self._channel_model.channel(ch_idx)
             self.applyThresholdRequested.emit({
                 "ch_model_index":   ch_idx,
-                "threshold":        thresh,
+                "threshold":        self._thresholds.get(ch_idx),
+                "inactive":         ch_idx in inactive,
                 "mask_index":       self._mask_model_index,
                 "ch_name":          ch.name,
                 "ch_color":         ch.color,
@@ -1975,28 +2215,6 @@ class ClusteringTab(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
 
-        # ── Channel selector ───────────────────────────────────────────────
-        ch_header = QHBoxLayout()
-        ch_header.setSpacing(4)
-        ch_header.addWidget(QLabel("Channels:"))
-        ch_header.addStretch()
-        self._ch_all_btn = QPushButton("All")
-        self._ch_all_btn.setFixedWidth(34)
-        self._ch_none_btn = QPushButton("None")
-        self._ch_none_btn.setFixedWidth(40)
-        ch_header.addWidget(self._ch_all_btn)
-        ch_header.addWidget(self._ch_none_btn)
-        layout.addLayout(ch_header)
-
-        self._channel_list = QListWidget()
-        self._channel_list.setFixedHeight(120)
-        self._channel_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self._channel_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        layout.addWidget(self._channel_list)
-
-        self._ch_all_btn.clicked.connect(lambda: self._set_all_channels(True))
-        self._ch_none_btn.clicked.connect(lambda: self._set_all_channels(False))
-
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
@@ -2004,6 +2222,15 @@ class ClusteringTab(QWidget):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(4)
+
+        # ── Channel selector ───────────────────────────────────────────────
+        self._channels_combo = CheckableComboBox()
+        self._channels_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._channels_combo.setMinimumWidth(50)
+        form.addRow("Channels:", _with_all_none(
+            self._channels_combo,
+            lambda: self._channels_combo.set_checked(self._channels_combo.texts()),
+            lambda: self._channels_combo.set_checked([])))
 
         # Mask selector
         self._mask_combo = QComboBox()
@@ -2322,29 +2549,15 @@ class ClusteringTab(QWidget):
         self._channel_model.dataChanged.connect(lambda *_: self._refresh_channels())
 
     def _refresh_channels(self):
-        checked_names = set()
-        first_populate = self._channel_list.count() == 0
-        if not first_populate:
-            for i in range(self._channel_list.count()):
-                item = self._channel_list.item(i)
-                if item.checkState() == Qt.CheckState.Checked:
-                    checked_names.add(item.text())
-        self._channel_list.clear()
+        combo = self._channels_combo
+        first_populate = combo.count() == 0
+        checked_names = set(combo.checked_texts())
+        combo.clear()
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
             if ch.is_mask or ch.is_cell_mask or ch.is_type_mask or getattr(ch, 'is_region', False):
                 continue
-            item = QListWidgetItem(ch.name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            checked = True if first_populate else ch.name in checked_names
-            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-            item.setData(Qt.ItemDataRole.UserRole, i)
-            self._channel_list.addItem(item)
-
-    def _set_all_channels(self, checked: bool):
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        for i in range(self._channel_list.count()):
-            self._channel_list.item(i).setCheckState(state)
+            combo.add_check_item(ch.name, i, checked=first_populate or ch.name in checked_names)
 
     def _refresh_masks(self):
         current = self._mask_combo.currentText()
@@ -2385,11 +2598,7 @@ class ClusteringTab(QWidget):
             return
         method = self._method_combo.currentText().lower()
         norm = self._norm_combo.currentData()
-        selected_channels = []
-        for i in range(self._channel_list.count()):
-            item = self._channel_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                selected_channels.append(item.data(Qt.ItemDataRole.UserRole))
+        selected_channels = self._channels_combo.checked_data()
         params = {
             "mask_index": self._mask_combo.currentData(),
             "method": method,
@@ -2499,7 +2708,8 @@ class OperationsPanel(QWidget):
         progress_row.setContentsMargins(0, 0, 0, 0)
         progress_row.setSpacing(4)
         self._progress = QProgressBar()
-        self._progress.setTextVisible(False)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("%p%")
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setFixedWidth(60)
         self._cancel_btn.setVisible(False)
@@ -2791,7 +3001,8 @@ class OperationsPanel(QWidget):
         if area is None:
             return
         self._pos_run_btn.setEnabled(False)
-        self._progress_widget.setVisible(True); self._progress.setRange(0, 0)
+        self._progress_widget.setVisible(True)
+        self.set_progress_info(0, 100)
         self.runCellPositivityRequested.emit({
             "mask_index": self._pos_mask_combo.currentData(), **area
         })

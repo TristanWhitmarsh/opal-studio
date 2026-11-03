@@ -132,9 +132,16 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                 model = models.Cellpose(model_type=params["model_name"], gpu=use_gpu)
             
             x = input_channels_data[0]
-            res = model.eval([x], 
-                             diameter=params.get("diameter"), 
-                             channels=[[0, 0]], 
+            # Membrane (or cytoplasm) and nucleus, for the cyto models: Cellpose
+            # numbers them from 1 along the last axis; [0, 0] is one greyscale image.
+            channels = [0, 0]
+            if len(input_channels_data) > 1:
+                x = np.stack(input_channels_data[:2], axis=-1)
+                channels = [1, 2]
+            res = model.eval([x],
+                             diameter=params.get("diameter"),
+                             channels=[channels],
+                             channel_axis=-1 if x.ndim == 3 else None,
                              batch_size=64,
                              cellprob_threshold=params.get("cellprob_threshold", 0.0),
                              flow_threshold=params.get("flow_threshold", 0.4))
@@ -182,7 +189,12 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
 
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             x = input_channels_data[0]
-            
+            # Several checked channels are one multi-channel image (C, H, W).
+            multichannel = len(input_channels_data) > 1
+            if multichannel:
+                x = np.stack(input_channels_data, axis=0)
+                print(f"[InstanSeg] {x.shape[0]} channels stacked.", flush=True)
+
             if model_path and os.path.exists(model_path):
                 from instanseg.utils.loss.instanseg_loss import InstanSeg as InstanSegPostProcessor
                 from instanseg.utils.model_loader import load_model
@@ -208,6 +220,10 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                         break
 
                 raw = x
+                if multichannel and raw.shape[0] != n_in:
+                    raise ValueError(
+                        f"This model takes {n_in} channel{'s' if n_in != 1 else ''}, "
+                        f"but {raw.shape[0]} are checked.")
                 if raw.ndim == 2 and n_in > 1:
                     raw_input = np.stack([raw] * n_in, axis=0)
                 elif raw.ndim == 2:
@@ -310,6 +326,10 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                 from instanseg import InstanSeg
                 # Either a folder the main process resolved, or the name of a model
                 # InstanSeg fetches and caches for itself.
+                if multichannel and "single_channel" in params["model_name"]:
+                    raise ValueError(
+                        f"{params['model_name']} takes one channel, but {x.shape[0]} are "
+                        f"checked. Check one, or use fluorescence_nuclei_and_cells.")
                 if zoo_dir:
                     model_name = zoo_dir
 
@@ -319,14 +339,16 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                 if "brightfield" in params["model_name"].lower() and x.ndim == 2:
                     x_input = np.stack([x]*3, axis=-1)
                 
-                if max(x.shape[0], x.shape[1]) > 512:
+                # A stacked image is (C, H, W); a single channel or an RGB is (H, W[, 3]).
+                h, w = x.shape[-2:] if multichannel else x.shape[:2]
+                if max(h, w) > 512:
                     print(f"[InstanSeg] Running '{model_name}' on a "
-                          f"{x.shape[0]}×{x.shape[1]} image (tiled, no per-tile "
+                          f"{h}×{w} image (tiled, no per-tile "
                           f"progress)… this may take a while.", flush=True)
                     out, _ = model.eval_medium_image(x_input, params.get("pixel_size", 1.0), tile_size=512, batch_size=16)
                 else:
                     print(f"[InstanSeg] Running '{model_name}' on a "
-                          f"{x.shape[0]}×{x.shape[1]} image…", flush=True)
+                          f"{h}×{w} image…", flush=True)
                     out, _ = model.eval_small_image(x_input, params.get("pixel_size", 1.0))
                 print("[InstanSeg] Inference complete. Building result…", flush=True)
                 
@@ -493,10 +515,15 @@ def run_positivity_task(queue, params, data):
     """
     Worker function for AI cell positivity detection.
 
-    Mirrors Inference.ipynb of CellMarkerPositivity: for every cell and every
-    marker channel the model is handed a 64x64 crop centred on the cell holding
-    the target channel with N_SIDE neighbouring metal channels on each side,
-    the binary mask of the target cell and the binary mask of the other cells.
+    Mirrors Inferenceometiff.ipynb of CellMarkerPositivity: for every cell and
+    every marker channel the model is handed a 64x64 crop centred on the cell
+    holding the target channel with N_SIDE neighbouring metal channels on each
+    side, the binary mask of the target cell and the binary mask of the other
+    cells. Markers are hot-pixel-filtered once, as in training, and otherwise stay
+    in raw counts (float32), without normalisation or clipping.
+
+    ``markers`` holds the active channels only, so neighbours skip the inactive
+    ones, as they skip excluded channels in the notebook. It is filtered in place.
     """
     shared = []
     try:
@@ -536,7 +563,8 @@ def run_positivity_task(queue, params, data):
                     "automatically when positivity is run, or from File > Download "
                     "All Models.")
             model_path = str(model_store.entrypoint("cellpos", found))
-        model = tf.keras.models.load_model(model_path, compile=False)
+        from opal_studio.positivity import load_positivity_model, remove_hot_pixels
+        model = load_positivity_model(tf, model_path)
 
         # The checkpoint records how it was trained. The marker channels are an
         # odd number, so the channel count alone says whether the mask of the
@@ -549,7 +577,7 @@ def run_positivity_task(queue, params, data):
         half = crop // 2
 
         threshold = float(params.get("threshold", 0.5))
-        batch_size = int(params.get("batch_size", 512))
+        batch_size = max(1, int(params.get("batch_size", 512)))
 
         S = markers.shape[2]
 
@@ -575,6 +603,15 @@ def run_positivity_task(queue, params, data):
             queue.put({"type": "done"})
             return
 
+        total_predictions = int(n_cells) * S
+        queue.put({"type": "progress", "completed": 0, "total": total_predictions})
+
+        # Before any padding, so image borders are mirrored as in training. A
+        # crop never reaches the edge of a box cut from a larger image: the box
+        # has a margin wider than the crop.
+        for z in range(S):
+            markers[..., z] = remove_hot_pixels(markers[..., z])
+
         # Every crop is taken whole, so an image smaller than the crop is padded.
         orig_h, orig_w = cells.shape
         pad_y = max(0, crop - orig_h)
@@ -587,46 +624,41 @@ def run_positivity_task(queue, params, data):
         centres = np.asarray(ndimage.center_of_mass(
             cells > 0, cells, cell_ids)).astype(np.int32)
 
-        def make_sample(z, cell_id, centre_y, centre_x):
-            """The same crop the model was trained on."""
-            y = min(max(int(centre_y) - half, 0), height - crop)
-            x = min(max(int(centre_x) - half, 0), width - crop)
+        from concurrent.futures import ThreadPoolExecutor
+        from opal_studio.positivity import make_positivity_batch
 
-            # Channels beyond either end of the stack do not exist and stay empty.
-            wanted = np.arange(z - n_side, z + n_side + 1)
-            exists = (wanted >= 0) & (wanted < S)
+        # Reuse crop coordinates for every marker instead of recomputing them
+        # once per cell per channel.
+        origins = np.clip(centres - half, 0,
+                          np.array([height - crop, width - crop]))
 
-            planes = np.zeros((crop, crop, n_markers), dtype=np.float32)
-            planes[..., exists] = markers[y:y + crop, x:x + crop, wanted[exists]]
+        # One graph accepts full and partial batches, including smaller batches
+        # after an out-of-memory retry. This avoids eager dispatch of each layer
+        # and does not create a tf.data pipeline for every prediction.
+        @tf.function(input_signature=[
+            tf.TensorSpec((None, crop, crop, n_channels), tf.float32)])
+        def infer(batch):
+            return model(batch, training=False)
 
-            patch = cells[y:y + crop, x:x + crop]
-            stack = [planes, (patch == cell_id)[..., None]]
-            if use_other_cells:
-                stack.append(((patch > 0) & (patch != cell_id))[..., None])
-
-            return np.concatenate(stack, axis=-1).astype(np.float32)
-
-        def predict(batch):
-            """Probabilities for one batch of crops.
-
-            Keras' predict() uploads each batch through a tf.data pipeline whose
-            tensors it never lets go of, so calling it once per batch fills the
-            card after a few dozen batches. Calling the model keeps one batch on
-            the device at a time. A card smaller than the batch still asks for
-            too much at once, so the batch is halved until it fits.
-            """
+        def predict(batch, completed):
+            """Predict bounded batches, reducing GPU use when a batch won't fit."""
             nonlocal batch_size
-            while True:
+            probability = np.empty(len(batch), dtype=np.float32)
+            start = 0
+            while start < len(batch):
+                stop = min(start + batch_size, len(batch))
                 try:
-                    return np.concatenate([
-                        np.asarray(model(batch[i:i + batch_size], training=False)).ravel()
-                        for i in range(0, len(batch), batch_size)])
+                    probability[start:stop] = np.asarray(infer(batch[start:stop])).ravel()
+                    start = stop
+                    queue.put({"type": "progress", "completed": completed + stop,
+                               "total": total_predictions})
                 except tf.errors.ResourceExhaustedError:
                     if batch_size <= 16:
                         raise
-                    batch_size //= 2
+                    batch_size = max(16, batch_size // 2)
                     print(f"[AI] GPU out of memory, retrying with batch {batch_size}",
                           flush=True)
+            return probability
 
         call = np.zeros(int(cell_ids.max()) + 1, dtype=np.int16)
 
@@ -634,27 +666,39 @@ def run_positivity_task(queue, params, data):
         # boundaries and leave cells out.
         chunk = batch_size
 
-        for z in range(S):
-            probability = np.empty(n_cells, dtype=np.float32)
+        # One preparation thread overlaps CPU gathering with GPU inference.
+        # At most the current and next batch are staged, never the whole image.
+        with ThreadPoolExecutor(max_workers=1) as preparation:
+            for z in range(S):
+                probability = np.empty(n_cells, dtype=np.float32)
 
-            for start in range(0, n_cells, chunk):
-                rows = np.arange(start, min(start + chunk, n_cells))
-                batch = np.stack([make_sample(z, cell_ids[i], *centres[i])
-                                  for i in rows])
-                probability[rows] = predict(batch)
+                def prepare(start, stop):
+                    return make_positivity_batch(
+                        markers, cells, cell_ids[start:stop], origins[start:stop],
+                        z, crop, n_side, use_other_cells)
 
-            # 0 stays background, 1 is negative and 2 is positive, as in the
-            # training masks.
-            call[:] = 0
-            call[cell_ids] = np.where(probability >= threshold, 2, 1)
+                future = preparation.submit(prepare, 0, min(chunk, n_cells))
+                for start in range(0, n_cells, chunk):
+                    stop = min(start + chunk, n_cells)
+                    batch = future.result()
+                    if stop < n_cells:
+                        future = preparation.submit(
+                            prepare, stop, min(stop + chunk, n_cells))
+                    probability[start:stop] = predict(batch, z * int(n_cells) + start)
+                    del batch
 
-            # Sent as it is finished rather than all at the end, so the caller
-            # can show progress and neither side has to hold every channel.
-            # The per-cell call (indexed by label ID) is all the caller needs;
-            # a full-size image per channel would be hundreds of MB each.
-            queue.put({"type": "channel", "z": z,
-                       "positive": float((probability >= threshold).mean()),
-                       "lut": call.copy()})
+                # 0 stays background, 1 is negative and 2 is positive, as in the
+                # training masks.
+                call[:] = 0
+                call[cell_ids] = np.where(probability >= threshold, 2, 1)
+
+                # Sent as it is finished rather than all at the end, so the caller
+                # can show progress and neither side has to hold every channel.
+                # The per-cell call (indexed by label ID) is all the caller needs;
+                # a full-size image per channel would be hundreds of MB each.
+                queue.put({"type": "channel", "z": z,
+                           "positive": float((probability >= threshold).mean()),
+                           "lut": call.copy()})
 
         queue.put({"type": "done"})
     except Exception as e:

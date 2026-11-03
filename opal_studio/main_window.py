@@ -85,37 +85,68 @@ DECONVOLUTION_DISPLAY_MAX = 0.25
 # above this the run stops and points at the region modes instead.
 BRIGHTFIELD_MAX_MEGAPIXELS = 120.0
 
-# A channel's display range runs between these intensity percentiles. IMC
-# channels are mostly zero or near it and carry saturated hot pixels, so the
-# maximum (a hot pixel) renders almost black and a low percentile renders every
-# cell at full brightness; the 99.9th percentile clips only the brightest pixels.
+# A channel's limits start at these intensity percentiles. IMC channels are
+# mostly zero or near it and carry saturated hot pixels, so the maximum (a hot
+# pixel) renders almost black and a low percentile renders every cell at full
+# brightness; the 99.9th percentile clips only the brightest pixels.
 DISPLAY_PERCENTILES = (1.0, 99.9)
 
 # Pixels a pyramid level needs before its percentiles are used for the range.
 DISPLAY_RANGE_MIN_PIXELS = 2_000_000
 
 
-def display_range(data: np.ndarray) -> tuple[float, float]:
-    """(data_min, data_max) for rendering a channel: its DISPLAY_PERCENTILES.
-
-    Very large arrays are subsampled first. When almost every pixel is at the
-    lower value (a near-empty channel), the upper end comes from the pixels
-    above it, so its few signal pixels still show.
-    """
-    values = np.asarray(data)
-    if values.size > 4 * DISPLAY_RANGE_MIN_PIXELS and values.ndim >= 2:
-        step = int(np.ceil(np.sqrt(values.size / (4 * DISPLAY_RANGE_MIN_PIXELS))))
-        values = values[::step, ::step]
-    values = values.ravel()
+def _finite_values(data: np.ndarray) -> np.ndarray:
+    values = np.asarray(data).ravel()
     if np.issubdtype(values.dtype, np.floating):
         values = values[np.isfinite(values)]
+    return values
+
+
+def display_range(data: np.ndarray) -> tuple[float, float, float, float]:
+    """(data_min, data_max, range_min, range_max) for rendering a channel.
+
+    The data range is the full intensity range, so the limits slider reaches
+    every value; the limits start at the DISPLAY_PERCENTILES, as fractions of
+    it. Very large arrays are subsampled for the percentiles. When almost every
+    pixel is at the lower percentile (a near-empty channel), the upper one comes
+    from the pixels above it, so its few signal pixels still show.
+    """
+    values = _finite_values(data)
     if values.size == 0:
-        return 0.0, 1.0
-    low, high = (float(v) for v in np.percentile(values, DISPLAY_PERCENTILES))
+        return 0.0, 1.0, 0.0, 1.0
+    data_min, data_max = float(values.min()), float(values.max())
+    if data_max <= data_min:
+        return data_min, data_min + 1.0, 0.0, 1.0
+    sample = np.asarray(data)
+    if sample.size > 4 * DISPLAY_RANGE_MIN_PIXELS and sample.ndim >= 2:
+        step = int(np.ceil(np.sqrt(sample.size / (4 * DISPLAY_RANGE_MIN_PIXELS))))
+        sample = sample[::step, ::step]
+    sample = _finite_values(sample)
+    low, high = (float(v) for v in np.percentile(sample, DISPLAY_PERCENTILES))
     if high <= low:
-        above = values[values > low]
-        high = float(np.percentile(above, DISPLAY_PERCENTILES[1])) if above.size else low + 1.0
-    return low, high
+        above = sample[sample > low]
+        high = float(np.percentile(above, DISPLAY_PERCENTILES[1])) if above.size else data_max
+    span = data_max - data_min
+    return data_min, data_max, (low - data_min) / span, (high - data_min) / span
+
+
+def restored_limits(entry: dict, ranges: tuple) -> tuple[float, float, float, float]:
+    """(data_min, data_max, range_min, range_max) for a channel loaded from a project.
+
+    *ranges* is the channel's display_range. The saved limits keep their
+    intensities, and a saved range wider than *ranges* (from full resolution) is
+    kept. Projects saved before the limits slider spanned the full intensity
+    range stored the limits as fractions of the percentile range; they are
+    converted so the channel looks as it did.
+    """
+    data_min, data_max, low, high = ranges
+    limits = (float(entry.get("range_min", 0.0)), float(entry.get("range_max", 1.0)))
+    if entry.get("range_basis") != "full":
+        return (data_min, data_max, *(low + f * (high - low) for f in limits))
+    saved_min, saved_max = float(entry["data_min"]), float(entry["data_max"])
+    values = [saved_min + f * (saved_max - saved_min) for f in limits]
+    data_min, data_max = min(data_min, saved_min), max(data_max, saved_max)
+    return (data_min, data_max, *((v - data_min) / (data_max - data_min) for v in values))
 
 
 def project_io_unique(existing: dict, name: str) -> str:
@@ -181,6 +212,26 @@ def expand_labels_labelmap(labels, expansion_pixels=6):
     return expand_labels(labels, distance=expansion_pixels)
 
 
+def instance_labels(mask_ch):
+    """The label map of a mask channel: one integer ID per cell.
+
+    An expanded mask keeps its IDs in processed_data, and a label map is its own
+    answer. Any other binary mask is separated into cells. That has to be
+    4-connected: the watershed line of expand_labels_watershed only separates cells
+    left/right and up/down, so neighbours can still meet at a corner, and counting
+    corners as connected merges them, until a whole image can become one cell. Each
+    expanded cell is itself 4-connected, so this does not split cells either.
+    """
+    if mask_ch.processed_data is not None:
+        return mask_ch.processed_data
+    labels = mask_ch.mask_data
+    foreground = labels > 0
+    if foreground.any() and labels.max() == labels[foreground].min():
+        from scipy import ndimage
+        return ndimage.label(foreground)[0].astype(np.int32)
+    return labels
+
+
 def _simple_merge_masks(masks: list[np.ndarray]) -> np.ndarray:
     """Overlay label masks in list order (top → bottom), later masks winning.
 
@@ -227,11 +278,13 @@ class MainWindow(QMainWindow):
     segmentationError = Signal(str)
     segmentationStatus = Signal(str)  # thread-safe status-bar text from worker reader
     segmentationTileReady = Signal(object)  # dict with tile info from child process
-    preprocessingResultReady = Signal(str, str, object, float, float) # original_name, suffix, data, min, max
+    preprocessingResultReady = Signal(str, str, object, object) # original_name, suffix, data, display_range
+    fullResolutionExtremesReady = Signal(object, object) # image, {channel index: (min, max)}
     preprocessingError = Signal(str)
     operationProgress = Signal(int, int)
     operationFinished = Signal(int)
-    thresholdMeansReady = Signal(object, object, object, int, object)  # labels, cell_means dict, all_thresholds dict, mask_model_idx, cell_ids
+    positivityFinished = Signal(str)  # message for the "finished" popup
+    thresholdMeansReady = Signal(object, object, object, int, object, object)  # labels, cell_means dict, all_thresholds dict, mask_model_idx, cell_ids, inactive channel rows
     contoursReady = Signal(object, object)  # label map, contour_data built from it
     clusteringHeatmapReady = Signal(object, object, object)  # cluster_ids, channel_names, heatmap_data
     clusteringDimReductionReady = Signal(object, object, object, object)  # tsne_coords, umap_coords, cluster_labels, cluster_colors
@@ -290,6 +343,7 @@ class MainWindow(QMainWindow):
         self.operationProgress.connect(self._ops_panel.set_progress_info)
         self.segmentationStatus.connect(lambda m: self._status.showMessage(m))
         self.operationFinished.connect(self._on_operation_complete)
+        self.positivityFinished.connect(self._on_positivity_finished)
         self.thresholdMeansReady.connect(self._on_threshold_means_ready)
         self.contoursReady.connect(self._on_contours_ready)
         self.clusteringHeatmapReady.connect(self._on_clustering_heatmap_ready)
@@ -304,6 +358,7 @@ class MainWindow(QMainWindow):
         self.segmentationTileReady.connect(self._on_segmentation_tile_ready)
         self._ops_panel.cancelSegmentationRequested.connect(self._cancel_segmentation)
         self.preprocessingResultReady.connect(self._on_preprocessing_complete)
+        self.fullResolutionExtremesReady.connect(self._on_full_resolution_extremes)
         self.preprocessingError.connect(self._on_segmentation_error)
         self._canvas.pixelHovered.connect(self._on_pixel_hovered)
         self._segmentation_proc = None
@@ -550,22 +605,24 @@ class MainWindow(QMainWindow):
             self._spatialdata_slice_index = 0
             self._pending_spatialdata_slice = 0
 
-            from opal_studio.channel_model import generate_spaced_colors
+            from opal_studio.channel_model import default_active, generate_spaced_colors
             palette = generate_spaced_colors(len(img.channel_names))
-            
+            active = default_active(img.channel_names)
+
             # Efficiently compute per-channel maxima from coarsest level once
             self._status.showMessage("Computing channel ranges...")
             maxima = spatialdata_channel_maxima(img)
-            
+
             channels = []
             for i, name in enumerate(img.channel_names):
                 rgb = palette[i]
                 channels.append(Channel(
                     name=name, color=QColor(*rgb),
-                    visible=True, 
-                    data_min=0.0, 
-                    data_max=float(maxima[i]), 
-                    index=i
+                    visible=True,
+                    data_min=0.0,
+                    data_max=float(maxima[i]),
+                    index=i,
+                    active=active[i],
                 ))
             self._channel_model.set_channels(channels)
 
@@ -626,8 +683,9 @@ class MainWindow(QMainWindow):
             self._image = img
             self._spatialdata_slice_index = index
 
-            from opal_studio.channel_model import generate_spaced_colors
+            from opal_studio.channel_model import default_active, generate_spaced_colors
             palette = generate_spaced_colors(len(img.channel_names))
+            active = default_active(img.channel_names)
             previous = [
                 self._channel_model.channel(i)
                 for i in range(min(self._channel_model.rowCount(), len(img.channel_names)))
@@ -650,6 +708,7 @@ class MainWindow(QMainWindow):
                         data_max=old.data_max,
                         index=i,
                         alpha=old.alpha,
+                        active=old.active,
                     ))
                 else:
                     channels.append(Channel(
@@ -659,6 +718,7 @@ class MainWindow(QMainWindow):
                         data_min=0.0,
                         data_max=1.0,
                         index=i,
+                        active=active[i],
                     ))
 
             self._channel_model.set_channels(channels)
@@ -739,22 +799,26 @@ class MainWindow(QMainWindow):
                 )])
                 self._show_brightfield_image(img)
             else:
-                from opal_studio.channel_model import generate_spaced_colors
+                from opal_studio.channel_model import default_active, generate_spaced_colors
                 palette = generate_spaced_colors(len(img.channel_names))
+                active = default_active(img.channel_names)
                 ranges = self._channel_display_ranges(img, range(len(img.channel_names)))
                 channels = []
                 for i, name in enumerate(img.channel_names):
-                    dmin, dmax = ranges[i]
+                    dmin, dmax, rmin, rmax = ranges[i]
                     rgb = palette[i]
                     channels.append(Channel(
                         name=name, color=QColor(*rgb),
-                        visible=True, data_min=float(dmin), data_max=float(dmax), index=i
+                        visible=True, data_min=float(dmin), data_max=float(dmax),
+                        range_min=float(rmin), range_max=float(rmax), index=i,
+                        active=active[i],
                     ))
                 # Clear the flag before the reset: set_channels emits modelReset,
                 # which is what makes the segmentation tabs rebuild their channel
                 # lists, and they read the flag as they do it.
                 self._channel_model.has_brightfield = False
                 self._channel_model.set_channels(channels)
+                self._widen_to_full_resolution(img, range(len(img.channel_names)))
                 self._canvas.set_image(img)
                 self._bf_canvas.force_rgb = False
                 self._bf_canvas.clear()
@@ -1310,28 +1374,78 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import Error", f"Could not load types: {e}")
 
     @staticmethod
-    def _quick_percentile_range(img: ImageData, channel: int) -> tuple[float, float]:
-        """Display range (data_min, data_max) of one image channel.
-
-        Read from the smallest pyramid level with enough pixels for the upper
-        percentile to be reliable (the levels are subsampled, so their intensity
-        distribution matches full resolution), falling back to the finest level.
-        """
-        if not img.levels:
-            return 0.0, 1.0
-        level = img.levels[0]
+    def _display_level(img: ImageData):
+        """The smallest pyramid level with enough pixels for the upper percentile
+        to be reliable, falling back to the finest level."""
         for candidate in reversed(img.levels):
             h, w = _get_yx(candidate.shape, img.axes, img.is_rgb)
             if h * w >= DISPLAY_RANGE_MIN_PIXELS:
-                level = candidate
-                break
+                return candidate
+        return img.levels[0]
+
+    @classmethod
+    def _quick_percentile_range(cls, img: ImageData, channel: int) -> tuple[float, float, float, float]:
+        """display_range (data_min, data_max, range_min, range_max) of one image channel.
+
+        Read from _display_level. Averaged (rather than subsampled) pyramid levels
+        miss the brightest pixels, which _widen_to_full_resolution adds later.
+        """
+        if not img.levels:
+            return 0.0, 1.0, 0.0, 1.0
+        level = cls._display_level(img)
         h, w = _get_yx(level.shape, img.axes, img.is_rgb)
         try:
             data = get_tile(img, level.index, channel, slice(0, h), slice(0, w))
             return display_range(data)
         except Exception:
             import traceback; traceback.print_exc()
-            return 0.0, 1.0
+            return 0.0, 1.0, 0.0, 1.0
+
+    @staticmethod
+    def _full_resolution_extremes(img: ImageData, channel: int) -> tuple[float, float] | None:
+        """(minimum, maximum) of a channel at full resolution, read in row strips."""
+        h, w = _get_yx(img.levels[0].shape, img.axes, img.is_rgb)
+        rows = max(1, 8 * DISPLAY_RANGE_MIN_PIXELS // max(w, 1))
+        low, high = np.inf, -np.inf
+        for start in range(0, h, rows):
+            values = _finite_values(get_tile(img, 0, channel, slice(start, min(start + rows, h)), slice(0, w)))
+            if values.size:
+                low, high = min(low, float(values.min())), max(high, float(values.max()))
+        return (low, high) if high >= low else None
+
+    def _widen_to_full_resolution(self, img: ImageData, channels) -> None:
+        """Extend the channels' intensity ranges to their full-resolution extremes.
+
+        Read in the background, as a full-resolution pass is too slow for loading;
+        the limits keep their intensities, so the image does not change.
+        """
+        channels = list(channels)
+        if not channels or not img.levels or self._display_level(img) is img.levels[0]:
+            return
+
+        def _run():
+            extremes = {}
+            for channel in channels:
+                if self._image is not img:
+                    return
+                try:
+                    found = self._full_resolution_extremes(img, channel)
+                except Exception:
+                    import traceback; traceback.print_exc()
+                    continue
+                if found is not None:
+                    extremes[channel] = found
+            self.fullResolutionExtremesReady.emit(img, extremes)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_full_resolution_extremes(self, img, extremes: dict) -> None:
+        if self._image is not img:
+            return
+        for row in range(self._channel_model.rowCount()):
+            ch = self._channel_model.channel(row)
+            if (ch.index in extremes and not (ch.is_mask or ch.is_cell_mask or ch.is_type_mask
+                                              or ch.is_processed or ch.is_region)):
+                self._channel_model.widen_data_range(row, *extremes[ch.index])
 
     @classmethod
     def _channel_display_ranges(cls, img: ImageData, channels) -> dict:
@@ -1462,23 +1576,21 @@ class MainWindow(QMainWindow):
                         # 4. Rescale back to original intensity range
                         x = x * diff + p_low_val
                 
-                # Same display range as an image channel; a full min-max range
-                # is set by the odd hot pixel and renders the result almost black.
-                data_min, data_max = display_range(x)
-                
-                self.preprocessingResultReady.emit(original_name, suffix, x, data_min, data_max)
+                # Same display range and starting limits as an image channel.
+                self.preprocessingResultReady.emit(original_name, suffix, x, display_range(x))
             except Exception as e:
                 import traceback; traceback.print_exc()
                 self.preprocessingError.emit(str(e))
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_preprocessing_complete(self, original_name, suffix, data, data_min, data_max):
+    def _on_preprocessing_complete(self, original_name, suffix, data, ranges):
         self._ops_panel.stop_loading()
         new_name = self._channel_model.get_unique_name(f"{original_name}{suffix}", always_suffix=True)
+        data_min, data_max, range_min, range_max = ranges
         new_ch = Channel(
             name=new_name, color=QColor(255, 255, 255), visible=True,
-            data_min=data_min, data_max=data_max,
-            is_processed=True, processed_data=data, index=-1
+            data_min=data_min, data_max=data_max, range_min=range_min, range_max=range_max,
+            is_processed=True, processed_data=data, index=-1, active=False
         )
         self._channel_model.add_channel(new_ch)
         self._status.showMessage(f"Generated: {new_name}", 3000)
@@ -1723,11 +1835,7 @@ class MainWindow(QMainWindow):
             for i in range(self._channel_model.rowCount()):
                 ch = self._channel_model.channel(i)
                 if ch.is_cell_mask and ch.mask_data is not None:
-                    lm = ch.mask_data
-                    if lm.max() <= 1:
-                        from skimage.measure import label as _label
-                        lm = _label(lm).astype(np.int32)
-                    working_labels = lm.astype(np.int32)
+                    working_labels = instance_labels(ch).astype(np.int32)
                     break
 
         if working_labels is None or working_labels.max() == 0:
@@ -1970,9 +2078,12 @@ class MainWindow(QMainWindow):
             "name": ch.name,
             "color": [c.red(), c.green(), c.blue()],
             "visible": bool(ch.visible),
+            "active": bool(ch.active),
             "selected": bool(ch.selected),
             "range_min": float(ch.range_min),
             "range_max": float(ch.range_max),
+            # The limits are fractions of the full intensity range (see restored_limits).
+            "range_basis": "full",
             "data_min": float(ch.data_min),
             "data_max": float(ch.data_max),
             "alpha": float(ch.alpha),
@@ -2051,6 +2162,10 @@ class MainWindow(QMainWindow):
         derived_arrays: list[np.ndarray] = []
         derived_labels: list[str] = []
         first_cell_mask_key: str | None = None
+        # Every positivity layer shares the label map of the mask it was made
+        # from, so each map is written once and the layers refer to it.
+        saved_maps: dict[int, str] = {}     # id(label map) -> its key in doc.labels
+        layer_keys: dict[str, bool] = {}    # names the per-layer aux arrays
 
         for i in range(self._channel_model.rowCount()):
             ch = self._channel_model.channel(i)
@@ -2067,16 +2182,25 @@ class MainWindow(QMainWindow):
                 entry["kind"] = ("type_mask" if ch.is_type_mask else
                                  "cell_mask" if ch.is_cell_mask else "mask")
                 if ch.mask_data is not None:
-                    key = project_io_unique(doc.labels, ch.name)
-                    doc.labels[key] = np.asarray(ch.mask_data)
+                    key = saved_maps.get(id(ch.mask_data))
+                    if key is None:
+                        key = project_io_unique(doc.labels, ch.name)
+                        doc.labels[key] = np.asarray(ch.mask_data)
+                        saved_maps[id(ch.mask_data)] = key
                     entry["data_ref"] = ["labels", key]
                     if ch.is_cell_mask and first_cell_mask_key is None:
                         first_cell_mask_key = key
+                    # Named after the layer, not the label map, which several
+                    # layers can share.
+                    layer = project_io_unique(layer_keys, ch.name)
+                    layer_keys[layer] = True
                     if ch.is_cell_mask and ch.pos_lut is not None:
-                        doc.aux[f"pos_lut__{key}"] = np.asarray(ch.pos_lut)
+                        entry["pos_lut_key"] = f"pos_lut__{layer}"
+                        doc.aux[entry["pos_lut_key"]] = np.asarray(ch.pos_lut)
                         entry["has_pos_lut"] = True
                     if ch.processed_data is not None:
-                        doc.aux[f"auxlabels__{key}"] = np.asarray(ch.processed_data)
+                        entry["aux_key"] = f"auxlabels__{layer}"
+                        doc.aux[entry["aux_key"]] = np.asarray(ch.processed_data)
                         entry["has_aux"] = True
             elif ch.is_processed and ch.processed_data is not None:
                 entry["kind"] = "derived"
@@ -2137,6 +2261,7 @@ class MainWindow(QMainWindow):
         # ── Session block ───────────────────────────────────────────────────
         doc.session = {
             "pixel_size": float(self._ops_panel.get_pixel_size()),
+            "brightness": float(self._channel_model.brightness),
             "channels": channel_entries,
             "clustering": clustering,
             "phenotyping": self._phenotyping_tab.export_state(),
@@ -2198,7 +2323,8 @@ class MainWindow(QMainWindow):
         # Display ranges are derived from the data, not chosen by the user (the
         # limits slider stores range_min/range_max), so they are recomputed rather
         # than trusting the saved ones — projects saved before the percentile
-        # range carry values that render IMC channels binary or black.
+        # range carry values that render IMC channels binary or black. Older
+        # saved limits are converted to the full range by restored_limits.
         # SpatialData keeps its own per-chunk ranges, as when it is opened.
         image_ranges = {}
         if backend != "spatialdata":
@@ -2216,6 +2342,7 @@ class MainWindow(QMainWindow):
                 name=entry.get("name", ""),
                 color=QColor(*entry.get("color", [255, 255, 255])),
                 visible=entry.get("visible", True),
+                active=entry.get("active", kind != "derived"),
                 selected=entry.get("selected", False),
                 range_min=entry.get("range_min", 0.0),
                 range_max=entry.get("range_max", 1.0),
@@ -2228,12 +2355,13 @@ class MainWindow(QMainWindow):
                 index=int(entry.get("index", -1)),
             )
 
+            limit_keys = ("data_min", "data_max", "range_min", "range_max")
             if kind == "original" and common["index"] in image_ranges:
-                common["data_min"], common["data_max"] = image_ranges[common["index"]]
+                common.update(zip(limit_keys, restored_limits(entry, image_ranges[common["index"]])))
             if kind == "derived" and derived is not None and ref_:
                 common["is_processed"] = True
                 common["processed_data"] = derived[int(ref_[1])]
-                common["data_min"], common["data_max"] = display_range(common["processed_data"])
+                common.update(zip(limit_keys, restored_limits(entry, display_range(common["processed_data"]))))
             elif kind in ("cell_mask", "mask", "type_mask") and ref_:
                 key = ref_[1]
                 mask = doc.labels.get(key)
@@ -2244,10 +2372,11 @@ class MainWindow(QMainWindow):
                 common["is_cell_mask"] = (kind == "cell_mask")
                 common["is_type_mask"] = (kind == "type_mask")
                 common["is_mask"] = (kind == "mask")
+                # Projects before schema 3 name these after the label map key.
                 if entry.get("has_pos_lut"):
-                    common["pos_lut"] = doc.aux.get(f"pos_lut__{key}")
+                    common["pos_lut"] = doc.aux.get(entry.get("pos_lut_key", f"pos_lut__{key}"))
                 if entry.get("has_aux"):
-                    common["processed_data"] = doc.aux.get(f"auxlabels__{key}")
+                    common["processed_data"] = doc.aux.get(entry.get("aux_key", f"auxlabels__{key}"))
             elif kind == "region" and ref_:
                 common["is_region"] = True
                 common["contour_data"] = self._rings_to_contour_data(
@@ -2260,6 +2389,7 @@ class MainWindow(QMainWindow):
             channels.append(Channel(**common))
 
         self._channel_model.set_channels(channels)
+        self._widen_to_full_resolution(img, image_ranges)
         self._canvas.set_image(img)
         for ch in channels:
             if ch.contour_visible:
@@ -2311,8 +2441,11 @@ class MainWindow(QMainWindow):
         return chosen or None
 
     def _restore_session_state(self, doc) -> None:
-        """Restore pixel size, clustering arrays and the heatmap tab."""
+        """Restore pixel size, brightness, clustering arrays and the heatmap tab."""
         session = doc.session or {}
+
+        # Overall brightness; projects saved before it was stored open at 1x.
+        self._channel_panel.set_brightness(session.get("brightness", 1.0))
 
         # Pixel size → segmentation tabs that expose a _pixel_size field
         ps = session.get("pixel_size")
@@ -2851,9 +2984,10 @@ class MainWindow(QMainWindow):
         self._channel_model.channels_changed.emit()
 
     def _on_segmentation_complete(self, labels, name, is_cell_mask, color, contour_data, source_marker, is_type_mask, target_idx, pos_lut=None, random_colors=True, aux_labels=None):
-        # Type masks arrive one-per-cluster/type while the background thread is still running.
-        # operationFinished handles stop_loading() for those batches.
-        if not is_type_mask:
+        # Type masks and positivity LUTs arrive incrementally while their
+        # operation is still running. Only operationFinished stops those runs;
+        # an ordinary segmentation result completes its operation here.
+        if not is_type_mask and pos_lut is None:
             self._ops_panel.stop_loading()
 
         # If a tile-progress preview channel was created, use it as the final target
@@ -3095,6 +3229,13 @@ class MainWindow(QMainWindow):
         if mask_ch is None or mask_ch.mask_data is None:
             self._ops_panel.stop_loading()
             return None
+        if not any(ch.can_be_active and ch.active for ch in self._channel_model._channels):
+            self._ops_panel.stop_loading()
+            QMessageBox.warning(
+                self, "Cell positivity",
+                "No channel is active. Tick the channels to detect positivity "
+                "for in the Channels tab.")
+            return None
         try:
             area = self._positivity_area(params)
         except ValueError as e:
@@ -3106,6 +3247,13 @@ class MainWindow(QMainWindow):
         self._clear_positivity_maps()
         return mask_ch, area
 
+    @staticmethod
+    def _inactive_note(n_inactive: int) -> str:
+        """The end of a positivity finished message: what happened to inactive channels."""
+        if not n_inactive:
+            return ""
+        return f" {n_inactive} inactive channel{'s' if n_inactive != 1 else ''} set negative."
+
     @Slot(dict)
     def _run_cell_positivity(self, params):
         if not self._image: return
@@ -3114,7 +3262,6 @@ class MainWindow(QMainWindow):
             return
         original_mask_ch, area = started
         self._ops_panel._thresh_tab._clear_computed()   # its slider drove the maps just removed
-        labels = original_mask_ch.mask_data
 
         def _run():
             shm_blocks = []      # shared-memory blocks handed to the worker
@@ -3128,27 +3275,36 @@ class MainWindow(QMainWindow):
 
                 params["model_path"] = model_store.resolve(
                     model_store.ref("cellpos"), self._model_download_progress("cellpos"))
-                
+
                 print(f"[AI] Starting cell positivity detection for mask: {original_mask_ch.name}")
-                
-                # The model was trained on RAW marker intensities (no
-                # normalisation). Only include genuine raw image channels, in
-                # channel order, and feed their raw pixel values. Processed /
-                # derived channels (CLAHE, background-subtracted, merges) have a
-                # different intensity distribution and no raw backing (index<0),
-                # so including them would corrupt the neighbouring-metal context
-                # the model reads around each target channel and shift
-                # predictions.
+
+                labels = instance_labels(original_mask_ch)
+
+                # Gather raw image channels in channel order. The worker keeps
+                # their raw counts without normalization or clipping, matching
+                # the current CellMarkerPositivity training notebook.
+                # Added channels (CLAHE, background-subtracted, merges) have a
+                # different intensity distribution and follow the original channels,
+                # so they shift the neighbouring-metal context the model reads, and
+                # take part only when ticked. Unticked, they get no layer.
+                # Inactive channels never reach the worker, so its neighbouring
+                # channels skip them. Each is listed under the number of active
+                # channels before it, to deliver the results in channel order.
                 target_channels = []
+                inactive_before = [[]]
                 for i in range(self._channel_model.rowCount()):
                     ch = self._channel_model.channel(i)
-                    if ch.is_mask or ch.is_cell_mask:
+                    if not ch.can_be_active:
                         continue
-                    if ch.is_processed or ch.index is None or ch.index < 0:
-                        continue
-                    target_channels.append(ch)
+                    if ch.active:
+                        target_channels.append(ch)
+                        inactive_before.append([])
+                    elif not ch.is_processed:
+                        inactive_before[-1].append(ch)
 
                 S = len(target_channels)
+                n_inactive = sum(len(chs) for chs in inactive_before)
+                print(f"[AI] {S} active channels, {n_inactive} inactive")
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
 
                 # Only the cells in the chosen area are classified. The worker
@@ -3179,6 +3335,7 @@ class MainWindow(QMainWindow):
                 from multiprocessing import shared_memory
                 img_dtype = np.dtype(self._image.dtype)
                 marker_dtype = (img_dtype if img_dtype.kind in "ui" and img_dtype.itemsize <= 2
+                                and not any(ch.is_processed for ch in target_channels)
                                 else np.dtype(np.float32))
 
                 def _shared_array(shape, dtype):
@@ -3195,10 +3352,13 @@ class MainWindow(QMainWindow):
                 markers, markers_ref = _shared_array((h, w, S), marker_dtype)
                 markers[...] = 0
                 for z, ch in enumerate(target_channels):
-                    data = self._image.get_full_channel_data(ch.index, level=0)
-                    if not np.can_cast(data.dtype, marker_dtype, casting="safe"):
-                        raise ValueError(
-                            f"Channel {ch.name} is {data.dtype}, expected {marker_dtype}")
+                    if ch.is_processed:
+                        data = ch.processed_data
+                    else:
+                        data = self._image.get_full_channel_data(ch.index, level=0)
+                        if not np.can_cast(data.dtype, marker_dtype, casting="safe"):
+                            raise ValueError(
+                                f"Channel {ch.name} is {data.dtype}, expected {marker_dtype}")
                     part = data[y0:y1, x0:x1]
                     markers[:part.shape[0], :part.shape[1], z] = part
                     data = part = None
@@ -3220,10 +3380,25 @@ class MainWindow(QMainWindow):
                 contour_data = self._cached_contours(labels)
                 max_id = int(np.max(labels))
 
-                self.operationProgress.emit(0, S)
+                def _deliver(ch, pos_lut):
+                    self.segmentationResultReady.emit(
+                        labels, ch.name, True, ch.color, contour_data,
+                        ch.name, False, -1, pos_lut, False, None
+                    )
 
-                # The worker sends one message per channel, so the progress bar
-                # and the log follow the run instead of jumping at the end.
+                # Inactive channels bypass the model: every cell in the area is
+                # negative. Cells outside the area stay unclassified, as for the
+                # active channels.
+                def _deliver_inactive(channels):
+                    for ch in channels:
+                        pos_lut = np.zeros(max_id + 1, dtype=np.int16)
+                        pos_lut[area_ids] = 1
+                        _deliver(ch, pos_lut)
+
+                self.operationProgress.emit(0, 10000)
+
+                # Batch progress updates the bar; channel messages deliver results.
+                # Scale large cell counts to fit Qt's signed 32-bit progress values.
                 done = 0
                 missing = 0
                 try:
@@ -3248,6 +3423,11 @@ class MainWindow(QMainWindow):
                             raise Exception(f"Worker Error: {msg.get('error')}\n{msg.get('traceback')}")
                         if kind == "done":
                             break
+                        if kind == "progress":
+                            total = max(1, int(msg["total"]))
+                            value = min(10000, max(0, int(msg["completed"]) * 10000 // total))
+                            self.operationProgress.emit(value, 10000)
+                            continue
 
                         z_idx = msg["z"]
                         ch = target_channels[z_idx]
@@ -3259,13 +3439,10 @@ class MainWindow(QMainWindow):
                         n = min(len(lut), len(pos_lut))
                         pos_lut[:n] = lut[:n]
 
-                        self.segmentationResultReady.emit(
-                            labels, ch.name, True, ch.color, contour_data,
-                            ch.name, False, -1, pos_lut, False, None
-                        )
+                        _deliver_inactive(inactive_before[z_idx])
+                        _deliver(ch, pos_lut)
 
                         done += 1
-                        self.operationProgress.emit(done, S)
                         print(f"[AI] channel {done}/{S} {ch.name}: "
                               f"{msg['positive']:.1%} positive", flush=True)
                 finally:
@@ -3275,8 +3452,14 @@ class MainWindow(QMainWindow):
                         proc.terminate()
                         proc.join(timeout=5)
 
+                _deliver_inactive(inactive_before[S])
+
+                self.operationProgress.emit(10000, 10000)
                 print("[AI] Cell positivity detection complete.")
-                self.operationFinished.emit(S)
+                self.operationFinished.emit(S + n_inactive)
+                self.positivityFinished.emit(
+                    f"AI cell positivity is finished: {S} markers, "
+                    f"{len(area_ids):,} cells.{self._inactive_note(n_inactive)}")
 
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -3330,12 +3513,7 @@ class MainWindow(QMainWindow):
                 thresh_fn = THRESH_METHODS.get(method, threshold_otsu)
 
                 # Handle binary masks (e.g. from Expansion) by using aux labels or re-labeling
-                working_labels = labels
-                if mask_ch.processed_data is not None:
-                    working_labels = mask_ch.processed_data
-                elif labels.max() == 1:
-                    from skimage.measure import label
-                    working_labels = label(labels).astype(np.int32)
+                working_labels = instance_labels(mask_ch)
 
                 max_label = int(working_labels.max())
                 h, w = _get_yx(self._image.base_shape, self._image.axes, self._image.is_rgb)
@@ -3358,18 +3536,14 @@ class MainWindow(QMainWindow):
                 print(f"[Thresholds] {len(cell_ids)} cells in "
                       f"{self._AREA_NAMES.get(area['mode'])}, box y[{y0}:{y1}] x[{x0}:{x1}]")
 
-                # Collect the ORIGINAL image channels to process. Skip masks,
-                # regions, and derived/filtered channels (e.g. CLAHE output or a
-                # merge of two channels — these carry is_processed/index == -1).
-                # Positivity should only be computed for the raw markers.
-                def _is_original_marker(ch):
-                    return not (ch.is_mask or ch.is_cell_mask or ch.is_type_mask
-                                or getattr(ch, "is_region", False)
-                                or ch.is_processed or ch.index < 0)
-                channel_indices = [
-                    i for i in range(self._channel_model.rowCount())
-                    if _is_original_marker(self._channel_model.channel(i))
-                ]
+                # Collect the image channels to process: the ticked ones. Of the
+                # others, the original channels are all negative, while added
+                # channels (a filter's output or a merge) get no layer.
+                rows = [i for i in range(self._channel_model.rowCount())
+                        if self._channel_model.channel(i).can_be_active]
+                channel_indices = [i for i in rows if self._channel_model.channel(i).active]
+                inactive = [i for i in rows if i not in channel_indices
+                            and not self._channel_model.channel(i).is_processed]
                 channels_snapshot = {i: self._channel_model.channel(i) for i in channel_indices}
 
                 # ── Precompute label geometry ONCE. The foreground (cell) pixels
@@ -3463,7 +3637,7 @@ class MainWindow(QMainWindow):
                         data = None                            # free before next read
                         self.operationProgress.emit(done, total)
 
-                self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx, cell_ids)
+                self.thresholdMeansReady.emit(working_labels, cell_means, thresholds, mask_idx, cell_ids, inactive)
 
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -3471,12 +3645,32 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
-    @Slot(object, object, object, int, object)
-    def _on_threshold_means_ready(self, labels, cell_means, thresholds, mask_model_idx, cell_ids=None):
+    @Slot(object, object, object, int, object, object)
+    def _on_threshold_means_ready(self, labels, cell_means, thresholds, mask_model_idx,
+                                  cell_ids=None, inactive=()):
         """Deliver computed means to the Thresholds tab (main thread)."""
         self._ops_panel.stop_loading()
         self._ops_panel._thresh_tab.receive_means(
-            labels, cell_means, thresholds, mask_model_idx, cell_ids)
+            labels, cell_means, thresholds, mask_model_idx, cell_ids, inactive)
+        # receive_means has created the positivity layers by now.
+        n_cells = f", {len(cell_ids):,} cells" if cell_ids is not None else ""
+        self._on_positivity_finished(
+            f"Threshold cell positivity is finished: {len(cell_means)} markers{n_cells}."
+            f"{self._inactive_note(len(inactive))}")
+
+    @Slot(str)
+    def _on_positivity_finished(self, message: str):
+        # Keep the completion notice visible even when the main window is
+        # minimised or another application is in front. An independent window
+        # avoids inheriting the main window's minimised state.
+        notice = QMessageBox(
+            QMessageBox.Information, "Cell positivity", message, QMessageBox.Ok)
+        notice.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        notice.setWindowModality(Qt.ApplicationModal)
+        notice.show()
+        notice.raise_()
+        notice.activateWindow()
+        notice.exec()
 
     @Slot(dict)
     def _apply_threshold_positivity(self, params: dict):
@@ -3503,16 +3697,15 @@ class MainWindow(QMainWindow):
             return
 
         # Source of truth for IDs: processed_data (if it's a label map) or connected components if binary
-        working_labels = labels
-        if mask_ch.processed_data is not None:
-            working_labels = mask_ch.processed_data
-        elif labels.max() == 1:
-            from skimage.measure import label
-            working_labels = label(labels).astype(np.int32)
+        working_labels = instance_labels(mask_ch)
         
         # Retrieve the per-cell means LUT that was already computed
         thresh_tab = self._ops_panel._thresh_tab
         means_lut  = thresh_tab._cell_means.get(ch_model_idx)
+        if params.get("inactive"):
+            # No means were measured: no threshold is reached, so all are negative.
+            means_lut = np.zeros(int(working_labels.max()) + 1, dtype=np.float32)
+            threshold = np.inf
         if means_lut is None:
             return
 
@@ -3850,14 +4043,7 @@ class MainWindow(QMainWindow):
                 from opal_studio.channel_model import generate_spaced_colors
 
                 # Resolve label map: use aux labels if available, or re-label binary
-                working_labels = labels
-                if mask_ch.processed_data is not None:
-                    working_labels = mask_ch.processed_data
-                elif labels.max() == 1:
-                    from skimage.measure import label
-                    working_labels = label(labels)
-                
-                working_labels = working_labels.astype(np.int32)
+                working_labels = instance_labels(mask_ch).astype(np.int32)
                 cell_ids = np.unique(working_labels)
                 cell_ids = cell_ids[cell_ids > 0]
                 if len(cell_ids) == 0:

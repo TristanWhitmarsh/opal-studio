@@ -46,6 +46,8 @@ python -m opal_studio --create-launcher
 
 On Windows this creates an `Opal Studio.lnk` shortcut on the desktop. On Linux it creates an `OpalStudio.desktop` launcher.
 
+The launcher runs Opal Studio in the environment that created it. On Windows it points to the first `opal-studio` program on your `PATH`, so activate the environment first (`conda activate opal-env`) rather than calling another environment's Python directly.
+
 ### University Server / Darkroom Setup
 
 On the server, Opal Studio is deployed as a source checkout installed into a conda env,
@@ -219,7 +221,7 @@ Notes:
 The main window has three working areas:
 
 - **Left panel**: layer management for Channels, Masks, Positivity, Types, and Regions.
-- **Center tabs**: Image, Phenotyping, Heatmap, t-SNE, and UMAP.
+- **Center tabs**: Multiplex, Brightfield, Phenotyping, Heatmap, t-SNE, and UMAP.
 - **Right panel**: collapsible operation sections for Pre-processing, Segmentation, Mask Processing, Cell positivity, and Cell identification.
 
 The status bar shows cursor position and the selected channel value while hovering over the image.
@@ -232,7 +234,7 @@ The status bar shows cursor position and the selected channel value while hoveri
 - Pyramid-aware zooming so low-resolution levels are used when zoomed out.
 - Background rendering with cached tiles to keep panning and zooming responsive.
 - Mouse wheel zoom and left/middle mouse drag panning.
-- Multi-channel compositing with per-channel color, alpha, and display limits.
+- Multi-channel compositing with per-channel color, alpha, and display limits. The limits slider spans each channel's full intensity range and starts at the 1st and 99.9th percentiles, so hot pixels do not set the brightness but the brightest pixels can still be reached. For a pyramidal image the range is first read from a lower-resolution level; the full-resolution minimum and maximum are then found in the background and extend the slider, keeping the limits at the same intensities.
 - Global brightness control.
 - Mask overlays with opacity and optional vector contours.
 - Per-cell positivity overlays and phenotype/cluster type overlays.
@@ -241,7 +243,7 @@ The status bar shows cursor position and the selected channel value while hoveri
 
 The left panel separates generated and source layers:
 
-- **Channels**: raw and processed image channels. Toggle visibility, change color, adjust alpha, adjust intensity limits, and show/hide all source channels.
+- **Channels**: raw and processed image channels. Mark channels active or inactive for positivity detection with the checkbox at the left of each row, toggle visibility, change color, adjust alpha, adjust intensity limits, and show/hide all source channels.
 - **Masks**: segmentation masks. Toggle raster overlay and contour visibility, adjust mask opacity, and delete generated masks.
 - **Positivity**: marker positivity cell layers. Positive and negative cells share the same label map but use a positivity lookup table for display.
 - **Types**: phenotype or cluster masks. Adjust shared type opacity and show/hide all type layers.
@@ -254,7 +256,7 @@ Generated processed channels, masks, positivity layers, type masks, and regions 
 Use the **Regions** tab in the left panel to draw analysis regions:
 
 1. Click the draw button.
-2. Drag on the Image tab to trace a polygon.
+2. Drag on the Multiplex tab to trace a polygon.
 3. Release to create a region layer.
 4. Select the region layer before running segmentation in **Region** mode, or use **Regions** mode to segment inside every region at once.
 
@@ -332,11 +334,13 @@ Open **Segmentation** in the right panel. Choose a region mode, a target mode, a
 | Engine | Inputs and controls | Typical use |
 | --- | --- | --- |
 | **Watershed** | One channel, Voronoi or Gaussian labeller, spot sigma, outline sigma, threshold, minimum mean intensity. | Fast classical nuclei/cell segmentation and parameter testing. |
-| **InstanSeg** | One channel, model name, pixel size, optional hole filling and largest-component cleanup. | Fast learned nuclei/cell segmentation. |
+| **InstanSeg** | Channels chosen from a drop-down with checkboxes (**All** / **None**), model name, pixel size, optional hole filling and largest-component cleanup. `fluorescence_nuclei_and_cells` takes any number of channels as one multi-channel image and returns separate nuclei and cell layers; the other models take one channel, so checking another unchecks the previous one. | Fast learned nuclei/cell segmentation. |
 | **Mesmer** | Nuclear channel, optional membrane channel, DeepCell/default or local `.keras` model, nuclear or whole-cell compartment, pixel size, watershed post-processing. | Nuclear or whole-cell segmentation for multiplexed imaging. |
 | **StarDist** | One channel, pretrained or local model, probability threshold, NMS threshold. | Nuclear segmentation with star-convex objects. |
-| **Cellpose** | One channel, nuclei/cyto/cyto2 or local model, diameter, cell probability threshold, flow threshold. | Flexible cell or nuclei segmentation. |
+| **Cellpose** | nuclei/cyto/cyto2/cyto3 or local model, diameter, cell probability threshold, flow threshold. `nuclei` and local models take one channel; `cyto`, `cyto2` and `cyto3` take a membrane (or cytoplasm) channel and an optional nuclear channel. Changing the model resets the parameters to its defaults (diameter 6.5 for `nuclei`, 30 for the cyto models). | Flexible cell or nuclei segmentation. |
 | **Omnipose** | One channel, specialized Omnipose/custom model, diameter, mask threshold, flow threshold. | Bacteria, elongated objects, plant cells, worms, and other non-round shapes. |
+
+Nuclei and cell layers from the same run are segmented independently: a cell can contain no nucleus or several, and a nucleus and a cell with the same label number are not related.
 
 Deep-learning engines run in a separate worker process to reduce TensorFlow/PyTorch conflicts. Models are downloaded on first use (see [Models](#models)); your own model folders are auto-discovered under `<models>/<engine>/`.
 
@@ -365,19 +369,22 @@ Choose the area to work on, for both the AI and threshold methods:
 
 Cells outside the area are left unclassified, and automatic thresholds are computed from the cells inside it. Running **Detect Cell Positivity** or **Get Thresholds** first removes all existing positivity layers, so the layers that appear afterwards are the ones from that run.
 
+Both methods work on the channels ticked as active in the **Channels** tab. An inactive original channel is not analysed, and its layer has every cell in the area set to negative. When an image names its channels `<metal>_<marker>`, channels without a marker name or with the marker `Empty` start inactive; otherwise all original channels start active. Channels you add, such as a filter's output or a merge, start inactive and get no layer unless ticked. The choice is saved with the project.
+
 ### AI Positivity
 
-The **AI** tab runs the packaged marker-positivity model against every non-mask image channel. For each channel it creates a Positivity layer that stores positive/negative calls per cell while preserving the original cell label IDs and contours.
+The **AI** tab runs the packaged marker-positivity model against the active raw image channels in their original channel order; the neighbouring channels the model sees skip inactive ones. Each channel is hot-pixel-filtered once (Bodenmiller's filter at 50 counts), and marker intensities are otherwise passed as raw float32 counts, without normalisation or clipping, matching the current `CellMarkerPositivity` training notebook. The checkpoint must have been trained with that same preprocessing. A ticked added channel is analysed too, but it was not what the model was trained on and it sits after the original channels, so it also becomes a neighbour of the last active original channels and can shift their results. Inference uses batches of up to 512 cells, prepares the next batch while the current batch runs, and automatically reduces the prediction batch size if GPU memory is insufficient. For each channel it creates a Positivity layer that stores positive/negative calls per cell while preserving the original cell label IDs and contours.
 
 ### Threshold Positivity
 
-The **Thresholds** tab computes per-cell mean intensity for every image channel:
+The **Thresholds** tab computes per-cell mean intensity for the active channels:
 
 1. Select a mask.
-2. Click **Get Thresholds**.
-3. Opal Studio computes per-cell means and an Otsu threshold for each channel.
-4. Positivity layers are created immediately for all channels.
-5. Use the channel dropdown, numeric threshold field, or threshold slider to adjust a channel interactively.
+2. Choose the threshold method: Otsu (the default), Triangle, Li, Yen, or IsoData.
+3. Click **Get Thresholds**.
+4. Opal Studio computes per-cell means and an automatic threshold for each channel.
+5. Positivity layers are created immediately for all channels.
+6. Use the channel dropdown, numeric threshold field, or threshold slider to adjust a channel interactively.
 
 The count label shows positive cells over total signal-bearing cells in the chosen area for the selected marker.
 
@@ -401,7 +408,7 @@ Open **Cell identification > Clustering** for unsupervised population discovery.
 Inputs and options:
 
 - Select the mask that defines individual cells.
-- Choose which image or processed channels to include.
+- Choose which image or processed channels to include, from the **Channels** drop-down with checkboxes (**All** / **None**). All channels start checked.
 - Choose a normalization method: Yeo-Johnson, arcsinh, log-z, z-score, min-max, or none.
 - Optionally enable PCA. If the PCA component count is blank, Opal Studio uses parallel analysis; DBSCAN uses PCA automatically.
 - Choose a clustering method: Leiden, Louvain, PhenoGraph, FlowSOM, KMeans, Hierarchical, or DBSCAN.
@@ -421,7 +428,7 @@ For IMC datasets, start with models trained or tuned for IMC when available. If 
 
 1. Test quickly with **Watershed** or **Visible** mode.
 2. Try **InstanSeg** or **StarDist** for nuclei-rich marker channels.
-3. Use **Mesmer** when nuclear and membrane/cytoplasm channels are available.
+3. Use **Mesmer**, **Cellpose** (`cyto3`), or **InstanSeg** (`fluorescence_nuclei_and_cells`) when nuclear and membrane/cytoplasm channels are available. The membrane channel should outline every cell; a marker present in only some cells finds only those cells.
 4. Use **Cellpose** or **Omnipose** when object morphology differs from round nuclei.
 5. Refine with size filtering, CellSampler, and expansion before positivity or clustering.
 

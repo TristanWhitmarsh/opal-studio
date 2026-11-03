@@ -87,7 +87,7 @@ MODELS: dict[str, ModelSpec] = {m.key: m for m in [
 ]}
 
 #: The positivity CNN inside the ``cellpos`` model.
-POSITIVITY_WEIGHTS = "marker_cnn_epoch_200.h5"
+POSITIVITY_WEIGHTS = "marker_cnn-v2.h5"
 
 #: Pretrained models each library fetches and caches for itself. Listed so that
 #: "Download all models" can fetch them ahead of time for offline use.
@@ -321,7 +321,12 @@ def entrypoint(key: str, path: Path) -> Path:
     """
     method = key.split("/", 1)[0]
     if key == "cellpos":
-        return path / POSITIVITY_WEIGHTS if path.is_dir() else path
+        if not path.is_dir():
+            return path
+        weights = path / POSITIVITY_WEIGHTS
+        if not weights.is_file():
+            raise DownloadError(f"no {POSITIVITY_WEIGHTS} in {path}")
+        return weights
     if method == "mesmer" and path.is_dir():
         keras = sorted(path.glob("*.keras"))
         if not keras:

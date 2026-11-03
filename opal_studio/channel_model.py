@@ -86,6 +86,22 @@ def generate_spaced_colors(target_count=100, min_dist=75):
     return colors_rgb
 
 
+def default_active(names: List[str]) -> List[bool]:
+    """Which channels start active, from their names, as the positivity notebook.
+
+    A channel holds a marker when it is named <metal>_<marker> and the marker is
+    not "Empty". An image with no such names at all does not use this convention,
+    so all its channels start active. The checkbox on each row can overrule this.
+    """
+    def has_marker(name):
+        _, separator, marker = str(name).partition("_")
+        return bool(separator and marker.strip()
+                    and marker.strip().casefold() != "empty")
+
+    flags = [has_marker(name) for name in names]
+    return flags if any(flags) else [True] * len(flags)
+
+
 @dataclass
 class Channel:
     """One image channel's display state."""
@@ -115,6 +131,17 @@ class Channel:
     # "hematoxylin". Such a channel has no pixels of its own — it is computed
     # from the RGB on demand, so it costs nothing on a whole-slide scan.
     deconvolution: str = ""
+    # Positivity detection runs on active channels only, and the model's neighbouring
+    # channels skip inactive ones. The cells of an inactive original channel are all
+    # negative; an inactive added channel (filter, merge) gets no positivity layer.
+    active: bool = True
+
+    @property
+    def can_be_active(self) -> bool:
+        """An original or added image channel: what positivity can be detected for."""
+        if self.is_mask or self.is_cell_mask or self.is_type_mask or self.is_region:
+            return False
+        return self.is_processed or (self.index is not None and self.index >= 0)
 
 
 class ChannelListModel(QAbstractListModel):
@@ -137,6 +164,7 @@ class ChannelListModel(QAbstractListModel):
     AlphaRole = Qt.UserRole + 7
     ContourVisibleRole = Qt.UserRole + 8
     TypeRole = Qt.UserRole + 9
+    ActiveRole = Qt.UserRole + 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -224,6 +252,20 @@ class ChannelListModel(QAbstractListModel):
                 self.dataChanged.emit(idx, idx, [self.VisibleRole])
         self.channels_changed.emit()
 
+    def widen_data_range(self, row: int, data_min: float, data_max: float) -> None:
+        """Extend a channel's intensity range, keeping its limits at the same intensities."""
+        ch = self._channels[row]
+        data_min, data_max = min(data_min, ch.data_min), max(data_max, ch.data_max)
+        if (data_min, data_max) == (ch.data_min, ch.data_max):
+            return
+        old_span, span = ch.data_max - ch.data_min, data_max - data_min
+        ch.range_min, ch.range_max = (
+            (ch.data_min + f * old_span - data_min) / span for f in (ch.range_min, ch.range_max))
+        ch.data_min, ch.data_max = data_min, data_max
+        idx = self.index(row)
+        self.dataChanged.emit(idx, idx, [self.RangeMinRole, self.RangeMaxRole])
+        self.channels_changed.emit()
+
     def channel(self, row: int) -> Channel:
         return self._channels[row]
 
@@ -235,6 +277,13 @@ class ChannelListModel(QAbstractListModel):
             if c.selected:
                 return c
         return None
+
+    def region_color(self, ch: Channel) -> QColor:
+        """A region's outline colour: darkened while another region is selected."""
+        sel = self.selected_channel()
+        if sel is not None and sel is not ch and getattr(sel, "is_region", False):
+            return ch.color.darker(160)
+        return ch.color
 
     def add_channel(self, channel: Channel):
         if channel.is_cell_mask:
@@ -307,6 +356,8 @@ class ChannelListModel(QAbstractListModel):
             return ch.alpha
         if role == self.ContourVisibleRole:
             return ch.contour_visible
+        if role == self.ActiveRole:
+            return ch.active
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
@@ -341,6 +392,11 @@ class ChannelListModel(QAbstractListModel):
             ch.alpha = float(value)
         elif role == self.ContourVisibleRole:
             ch.contour_visible = bool(value)
+        elif role == self.ActiveRole:
+            # Nothing on screen depends on it, so the image is not redrawn.
+            ch.active = bool(value)
+            self.dataChanged.emit(index, index, [role])
+            return True
         elif role == self.NameRole:
             new_name = str(value).strip()
             if not new_name or new_name == ch.name:
@@ -371,4 +427,5 @@ class ChannelListModel(QAbstractListModel):
             self.SelectedRole: b"selected",
             self.AlphaRole: b"alpha",
             self.ContourVisibleRole: b"contourVisible",
+            self.ActiveRole: b"active",
         }
