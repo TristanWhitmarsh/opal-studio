@@ -5,6 +5,8 @@ import numpy as np
 from pathlib import Path
 import importlib.util
 
+from opal_studio import preload_conda_cuda11
+
 def ensure_peakdetect_scipy_compat():
     spec = importlib.util.find_spec("peakdetect")
     if spec is None or not spec.origin:
@@ -90,6 +92,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
         results = []
 
         if method == "stardist":
+            preload_conda_cuda11()
             from stardist.models import StarDist2D
             model_folder = params.get("model_folder") or params["model_name"]
             # The main process has already resolved Opal Studio's own models to a
@@ -389,6 +392,7 @@ def run_segmentation_task_pipe(conn, params, input_channels_data, stop_event=Non
                     results.append((labels_tensor, "InstanSeg", False))
 
         elif method == "mesmer":
+            preload_conda_cuda11()
             import tensorflow as tf
             from deepcell.applications import Mesmer
             
@@ -527,6 +531,7 @@ def run_positivity_task(queue, params, data):
     """
     shared = []
     try:
+        preload_conda_cuda11()
         import tensorflow as tf
         from scipy import ndimage
 

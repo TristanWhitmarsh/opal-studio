@@ -15,33 +15,11 @@ def _add_conda_library_path() -> None:
     import os
     import sys
 
+    if os.name != "nt":
+        return
     prefix = sys.prefix
     if not os.path.isdir(os.path.join(prefix, "conda-meta")):
         return  # not a conda env
-    if sys.platform.startswith("linux"):
-        # Conda never puts its lib/ on LD_LIBRARY_PATH, so the env's CUDA 11 libs
-        # (cudatoolkit, cudnn) are invisible to TensorFlow, which dlopens them by
-        # soname. Preloading them globally satisfies those lookups -- and keeps
-        # working when the system CUDA is a different version (e.g. 12).
-        import ctypes
-        lib = os.path.join(prefix, "lib")
-        # Dependencies first: cublas needs cublasLt, cudnn needs its sub-libraries.
-        for soname in (
-                "libcudart.so.11.0", "libcublasLt.so.11", "libcublas.so.11",
-                "libcufft.so.10", "libcurand.so.10", "libcusolver.so.11",
-                "libcusparse.so.11", "libcudnn_ops_infer.so.8",
-                "libcudnn_ops_train.so.8", "libcudnn_cnn_infer.so.8",
-                "libcudnn_cnn_train.so.8", "libcudnn_adv_infer.so.8",
-                "libcudnn_adv_train.so.8", "libcudnn.so.8"):
-            path = os.path.join(lib, soname)
-            if os.path.exists(path):
-                try:
-                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-                except OSError:
-                    pass
-        return
-    if os.name != "nt":
-        return
     # The same directories, in the same order, that `conda activate` prepends.
     wanted = [os.path.join(prefix, *parts) for parts in (
         (), ("Library", "mingw-w64", "bin"), ("Library", "usr", "bin"),
@@ -55,3 +33,38 @@ def _add_conda_library_path() -> None:
 
 
 _add_conda_library_path()
+
+
+def preload_conda_cuda11() -> None:
+    """Make the conda env's CUDA 11 libraries visible to TensorFlow (Linux).
+
+    Conda never puts its lib/ on LD_LIBRARY_PATH, so the env's cudatoolkit and
+    cudnn are invisible to TensorFlow, which dlopens them by soname. Loading
+    them globally satisfies those lookups, and keeps working when the system
+    CUDA is a different version (e.g. 12).
+
+    Call this only in processes that run TensorFlow, before importing it. The
+    env's cuDNN 8.1 shares the soname libcudnn.so.8 with the cuDNN 8.9 that
+    PyTorch bundles, so loading it into a PyTorch process breaks its convolutions.
+    """
+    import ctypes
+    import os
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    lib = os.path.join(sys.prefix, "lib")
+    # Dependencies first: cublas needs cublasLt, cudnn needs its sub-libraries.
+    for soname in (
+            "libcudart.so.11.0", "libcublasLt.so.11", "libcublas.so.11",
+            "libcufft.so.10", "libcurand.so.10", "libcusolver.so.11",
+            "libcusparse.so.11", "libcudnn_ops_infer.so.8",
+            "libcudnn_ops_train.so.8", "libcudnn_cnn_infer.so.8",
+            "libcudnn_cnn_train.so.8", "libcudnn_adv_infer.so.8",
+            "libcudnn_adv_train.so.8", "libcudnn.so.8"):
+        path = os.path.join(lib, soname)
+        if os.path.exists(path):
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
