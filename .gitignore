@@ -60,10 +60,16 @@ opal_studio/models/
 *.zip
 *.gz
 
-# Gemini AI assistant files
+# AI assistant files
 .gemini/
+.agents/
+
+# Reference articles and manuscript drafts (copyrighted or unpublished)
+articles/
+*.pdf
 
 # Project specific
+tests/
 requirements2.txt
 scratch/
 Projects/
