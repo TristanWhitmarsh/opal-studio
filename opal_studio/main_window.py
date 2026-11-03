@@ -51,23 +51,13 @@ from skimage.morphology import white_tophat, opening, closing, disk
 def _app_version() -> str:
     """Return the app version for the title bar.
 
-    Prefers the version in ``pyproject.toml`` (source / editable checkouts, where
-    it is always current even if the package hasn't been reinstalled), and falls
-    back to the installed package metadata for wheel installs.
+    Reads ``opal_studio.__version__`` -- the single source of the version -- so a
+    source checkout shows the current version even when stale install metadata
+    (e.g. an old ``opal_studio.egg-info``) is lying around.
     """
     try:
-        import re
-        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
-        if pyproject.exists():
-            m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']',
-                          pyproject.read_text(encoding="utf-8"))
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
-    try:
-        import importlib.metadata as _md
-        return _md.version("opal-studio")
+        from opal_studio import __version__
+        return __version__
     except Exception:
         return ""
 
